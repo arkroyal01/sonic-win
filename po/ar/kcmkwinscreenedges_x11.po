@@ -1,13 +1,13 @@
 # Copyright (C) YEAR This_file_is_part_of_KDE
 # This file is distributed under the same license as the PACKAGE package.
-# SPDX-FileCopyrightText: 2009, 2021, 2022, 2024, 2025 Zayed Al-Saidi <zayed.alsaidi@gmail.com>
+# SPDX-FileCopyrightText: 2009, 2021, 2022, 2024 Zayed Al-Saidi <zayed.alsaidi@gmail.com>
 # Safa Alfulaij <safa1996alfulaij@gmail.com>, 2016.
 msgid ""
 msgstr ""
 "Project-Id-Version: kcmkwinscreenedges\n"
 "Report-Msgid-Bugs-To: https://bugs.kde.org\n"
-"POT-Creation-Date: 2025-06-24 02:36+0000\n"
-"PO-Revision-Date: 2025-08-04 21:01+0400\n"
+"POT-Creation-Date: 2025-06-24 00:44+0000\n"
+"PO-Revision-Date: 2024-09-05 09:53+0400\n"
 "Last-Translator: Zayed Al-Saidi <zayed.alsaidi@gmail.com>\n"
 "Language-Team: ar\n"
 "Language: ar\n"
@@ -15,7 +15,7 @@ msgstr ""
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=6; plural=n==0 ? 0 : n==1 ? 1 : n==2 ? 2 : n%100>=3 "
-"&& n%100<=10 ? 3 : n%100>=11 ? 4 : 5;\n"
+"&& n%100<=10 ? 3 : n%100>=11 && n%100<=99 ? 4 : 5;\n"
 "X-Generator: Lokalize 23.08.5\n"
 
 #: main.cpp:152 touch.cpp:118
@@ -187,7 +187,7 @@ msgstr "عند تحريك النّوافذ فقط"
 #: main.ui:198
 #, kde-format
 msgid "Always enabled"
-msgstr "ممكّن دائمًا"
+msgstr "مفعّل دائمًا"
 
 #. i18n: ectx: property (toolTip), widget (QLabel, activationDelayLabel)
 #: main.ui:206
@@ -242,8 +242,8 @@ msgid ""
 "screens."
 msgstr ""
 "هنا يمكنك تمكين أو تعطيل حاجز الزاوية الافتراضي بين الشاشات.يمنع الحاجز "
-"المؤشر من الانتقال إلى شاشة أخرى عندما يلمس أحد أركان الشاشة فعلًا. وهذا يجعل "
-"من السهل تشغيل عناصر واجهة المستخدم مثل أزرار إغلاق النوافذ المكبرة عند "
+"المؤشر من الانتقال إلى شاشة أخرى عندما يلمس أحد أركان الشاشة بالفعل. وهذا "
+"يجعل من السهل تشغيل عناصر واجهة المستخدم مثل أزرار إغلاق النوافذ المكبرة عند "
 "استخدام شاشات متعددة."
 
 #. i18n: ectx: property (toolTip), widget (QCheckBox, kcfg_CornerBarrier)
