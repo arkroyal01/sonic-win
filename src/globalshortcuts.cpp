@@ -174,7 +174,7 @@ void GlobalShortcutsManager::forceRegisterTouchscreenSwipe(SwipeDirection direct
     m_shortcuts.push_back(std::move(shortcut));
 }
 
-bool GlobalShortcutsManager::processKey(Qt::KeyboardModifiers mods, int keyQt)
+bool GlobalShortcutsManager::processKey(Qt::KeyboardModifiers mods, int keyQt, KeyboardKeyState state)
 {
     return false;
 }
