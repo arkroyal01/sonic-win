@@ -24,7 +24,7 @@ Here are the reasons:
 
 7. Screen recording for remote desktop applications such as Team Viewer are broken.
     
-8. The inability for an application to know which screen is the primary screen.
+8. The inability for an application to know which screen is the primary screen ([very annoying for games](https://www.youtube.com/watch?v=pLzxP4WFe5U)).
 
 9. After that there are minor annoyances (unreliable thumbnails in Plasma, among them), but which still make the overall experience disappointing.
 
