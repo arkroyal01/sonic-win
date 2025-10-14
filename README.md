@@ -10,21 +10,23 @@ With each release of a new version of Plasma many of us try to make the switch t
 
 Here are the reasons:
 
-1. The first is perhaps personal and concerns the Locally Integrated Menu. I use the [material decoration](https://github.com/guiodic/material-decoration) that implements it and it doesn't work on Wayland. I saw that KDE devs are working on an upstream implementation, but it won't work for GTK apps. They say that a special Wayland protocol is needed, as usual. So in all likelihood it will never be solved, unless KDE rewrites the GTK plugin to use KDE's (private) protocol.
+1. The first is perhaps personal and concerns the Locally Integrated Menu. I use the [material decoration](https://github.com/guiodic/material-decoration) that implements LIM. I saw that KDE devs are working on an upstream implementation, but both implementations won't work for GTK apps. They say that a [special Wayland protocol](https://gitlab.freedesktop.org/wayland/wayland-protocols/-/merge_requests/52) is needed, as usual. So in all likelihood it will never be solved, unless KDE rewrites the GTK plugin to use KDE's (private) protocol.
 
 2. The second concerns the lack of inertial scrolling. Xorg allows this at the server level, with Synaptics driver, while in Wayland each application has to do it on its own. Again, this will take many years. It will probably never happen for applications under Wine, which I depend on for work, as Linux has no decent PDF editor. But apart from that, using Okular without inertial scrolling is painful. Recently, KDE developers said they had implemented inertial scrolling for QtQuick apps, but it does not actually work.
 
-3. Libreoffice+QT (or KF5/6) on Wayland has had a bug for years that makes scrolling slow and jerky to an intolerable level.
+3. Libreoffice+QT (or KF5/6) on Wayland has had a bug for years that makes scrolling slow and jerky to an intolerable level. This is partly due to the fact that the Qt backend for Wayland is [much slower](https://bugreports.qt.io/browse/QTBUG-139231) than the one for X11.
 
-4. Chromium still has numerous problems under Wayland such as drag&drop not always working.
+4. Chromium still has numerous problems under Wayland such as drag&drop not always working. This is also due to the different interpretations of the same protocol among different compositors (such as Mutter in GNOME and Kwin in KDE).
 
 5. Of course, one cannot forget the problem of restoring windows in the position in which they were closed the last time, especially between different sessions, which will probably take many more years to solve. A very basic feature still lacking in Wayland.
 
 6. Global hotkey support breaks things like push to talk in various applications such as Telegram or recording toggle in OBS Studio.
 
 7. Screen recording for remote desktop applications such as Team Viewer are broken.
+    
+8. The inability for an application to know which screen is the primary screen.
 
-8. After that there are minor annoyances (unreliable thumbnails in Plasma, among them), but which still make the overall experience disappointing.
+9. After that there are minor annoyances (unreliable thumbnails in Plasma, among them), but which still make the overall experience disappointing.
 
 These, and other minor other deficiencies, severely impact people's work.
 
