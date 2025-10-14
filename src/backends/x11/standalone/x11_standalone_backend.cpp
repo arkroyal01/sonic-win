@@ -47,8 +47,6 @@
 #include <QThread>
 #include <private/qtx11extras_p.h>
 
-#include <QString>
-
 #include <span>
 
 namespace KWin
@@ -291,8 +289,6 @@ void X11StandaloneBackend::doUpdateOutputs()
     if (Xcb::Extensions::self()->isRandrAvailable()) {
         T resources(rootWindow());
         if (!resources.isNull()) {
-            
-            QString currentConfig;            
 
             std::span crtcs(resources.crtcs(), resources->num_crtcs);
             for (auto crtc : crtcs) {
@@ -302,14 +298,6 @@ void X11StandaloneBackend::doUpdateOutputs()
                 if (!geometry.isValid()) {
                     continue;
                 }
-                
-                //save current config
-                currentConfig += QString::number(geometry.x()) + "," +
-                     QString::number(geometry.y()) + "," +
-                     QString::number(geometry.width()) + "," +
-                     QString::number(geometry.height()) + "," +
-                     QString::number(info->mode) + "," +
-                     QString::number(info->rotation) + ";";
 
                 float refreshRate = -1.0f;
 
@@ -400,12 +388,6 @@ void X11StandaloneBackend::doUpdateOutputs()
                     break;
                 }
             }
-            
-            if (currentConfig == m_lastOutputConfigString) {
-                  qCDebug(KWIN_X11STANDALONE) << "Skipping updateOutputs() because configuration is unchanged";
-                  return;
-            }
-            m_lastOutputConfigString = currentConfig;
         }
     }
 
