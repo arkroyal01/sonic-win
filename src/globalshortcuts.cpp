@@ -179,11 +179,6 @@ bool GlobalShortcutsManager::processKey(Qt::KeyboardModifiers mods, int keyQt, K
     return false;
 }
 
-bool GlobalShortcutsManager::processKeyRelease(Qt::KeyboardModifiers mods, int keyQt)
-{
-    return false;
-}
-
 template<typename ShortcutKind, typename... Args>
 bool match(QList<GlobalShortcut> &shortcuts, Args... args)
 {
