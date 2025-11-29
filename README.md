@@ -2,7 +2,7 @@
 
 This is a fork of [guiodic](https://github.com/guiodic/kwin-x11-improved)'s repository with the full git tree mirrored instead of using patches.
 
-KWin/X11 is an X11 window manager and a compositing manager. Its primary usage is in conjunction with a Desktop Shell (e.g. KDE Plasma Desktop). KWin/X11 is designed to go out of the way; users should not notice that they use a window manager at all. Nevertheless KWin/X11 provides a steep learning curve for advanced features, which are available, if they do not conflict with the primary mission. KWin does not have a dedicated targeted user group, but follows the targeted user group of the Desktop Shell using KWin/X11 as it's window manager.
+KWin/X11 is an X11 window manager and a compositing manager. Its primary usage is in conjunction with a Desktop Shell (e.g. KDE Plasma Desktop). KWin/X11 is designed to stay out of the way; users should not notice that they use a window manager at all. Nevertheless KWin/X11 provides a steep learning curve for advanced features, which are available, if they do not conflict with the primary mission. KWin does not have a dedicated targeted user group, but follows the targeted user group of the Desktop Shell using KWin/X11 as it's window manager.
 
 ## Why still on X11?
 
