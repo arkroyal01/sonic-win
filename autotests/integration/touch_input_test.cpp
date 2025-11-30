@@ -43,7 +43,6 @@ private Q_SLOTS:
     void testTouchMouseAction();
     void testTouchPointCount();
     void testUpdateFocusOnDecorationDestroy();
-    void testGestureDetection();
 
 private:
     struct WindowHandle
@@ -368,77 +367,6 @@ void TouchInputTest::testUpdateFocusOnDecorationDestroy()
     // Destroy the window.
     shellSurface.reset();
     QVERIFY(Test::waitForWindowClosed(window));
-}
-
-void TouchInputTest::testGestureDetection()
-{
-#if !KWIN_BUILD_GLOBALSHORTCUTS
-    QSKIP("Can't test shortcuts without shortcuts");
-    return;
-#endif
-
-    bool callbackTriggered = false;
-    const auto callback = [&callbackTriggered](float progress) {
-        callbackTriggered = true;
-        qWarning() << "progress callback!" << progress;
-    };
-    QAction action;
-    input()->forceRegisterTouchscreenSwipeShortcut(SwipeDirection::Right, 3, &action, callback);
-
-    // verify that gestures are detected
-
-    quint32 timestamp = 1;
-    Test::touchDown(0, QPointF(500, 125), timestamp++);
-    Test::touchDown(1, QPointF(500, 125), timestamp++);
-    Test::touchDown(2, QPointF(500, 125), timestamp++);
-
-    Test::touchMotion(0, QPointF(100, 125), timestamp++);
-    QVERIFY(callbackTriggered);
-
-    // verify that gestures are canceled properly
-    QSignalSpy gestureCancelled(&action, &QAction::triggered);
-    Test::touchUp(0, timestamp++);
-    QVERIFY(gestureCancelled.wait());
-
-    Test::touchUp(1, timestamp++);
-    Test::touchUp(2, timestamp++);
-
-    callbackTriggered = false;
-
-    // verify that touch points too far apart don't trigger a gesture
-    Test::touchDown(0, QPointF(125, 125), timestamp++);
-    Test::touchDown(1, QPointF(10000, 125), timestamp++);
-    Test::touchDown(2, QPointF(125, 125), timestamp++);
-    QVERIFY(!callbackTriggered);
-
-    Test::touchUp(0, timestamp++);
-    Test::touchUp(1, timestamp++);
-    Test::touchUp(2, timestamp++);
-
-    // verify that touch points triggered too slow don't trigger a gesture
-    Test::touchDown(0, QPointF(125, 125), timestamp++);
-    timestamp += 1000;
-    Test::touchDown(1, QPointF(125, 125), timestamp++);
-    Test::touchDown(2, QPointF(125, 125), timestamp++);
-    QVERIFY(!callbackTriggered);
-
-    Test::touchUp(0, timestamp++);
-    Test::touchUp(1, timestamp++);
-    Test::touchUp(2, timestamp++);
-
-    // verify that after a gesture has been canceled but never initiated, gestures still work
-    Test::touchDown(0, QPointF(500, 125), timestamp++);
-    Test::touchDown(1, QPointF(500, 125), timestamp++);
-    Test::touchDown(2, QPointF(500, 125), timestamp++);
-
-    Test::touchMotion(0, QPointF(100, 125), timestamp++);
-    Test::touchMotion(1, QPointF(100, 125), timestamp++);
-    Test::touchMotion(2, QPointF(100, 125), timestamp++);
-    QVERIFY(callbackTriggered);
-
-    Test::touchUp(0, timestamp++);
-    Test::touchUp(1, timestamp++);
-    Test::touchUp(2, timestamp++);
 }
 }
 

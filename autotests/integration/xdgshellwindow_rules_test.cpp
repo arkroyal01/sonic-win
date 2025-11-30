@@ -115,11 +115,8 @@ private Q_SLOTS:
     void testKeepBelowApplyNow();
     void testKeepBelowForceTemporarily();
 
-    void testShortcutDontAffect();
-    void testShortcutApply();
     void testShortcutRemember();
     void testShortcutForce();
-    void testShortcutApplyNow();
     void testShortcutForceTemporarily();
 
     void testDesktopFileDontAffect();
@@ -2262,96 +2259,6 @@ void TestXdgShellWindowRules::testKeepBelowForceTemporarily()
     destroyTestWindow();
 }
 
-void TestXdgShellWindowRules::testShortcutDontAffect()
-{
-#if !KWIN_BUILD_GLOBALSHORTCUTS
-    QSKIP("Can't test shortcuts without shortcuts");
-    return;
-#endif
-
-    setWindowRule("shortcut", "Ctrl+Alt+1", int(Rules::DontAffect));
-
-    createTestWindow();
-    QCOMPARE(m_window->shortcut(), QKeySequence());
-    m_window->setMinimized(true);
-    QVERIFY(m_window->isMinimized());
-
-    // If we press the window shortcut, nothing should happen.
-    QSignalSpy minimizedChangedSpy(m_window, &Window::minimizedChanged);
-    quint32 timestamp = 1;
-    Test::keyboardKeyPressed(KEY_LEFTCTRL, timestamp++);
-    Test::keyboardKeyPressed(KEY_LEFTALT, timestamp++);
-    Test::keyboardKeyPressed(KEY_1, timestamp++);
-    Test::keyboardKeyReleased(KEY_1, timestamp++);
-    Test::keyboardKeyReleased(KEY_LEFTALT, timestamp++);
-    Test::keyboardKeyReleased(KEY_LEFTCTRL, timestamp++);
-    QVERIFY(!minimizedChangedSpy.wait(100));
-    QVERIFY(m_window->isMinimized());
-
-    destroyTestWindow();
-}
-
-void TestXdgShellWindowRules::testShortcutApply()
-{
-#if !KWIN_BUILD_GLOBALSHORTCUTS
-    QSKIP("Can't test shortcuts without shortcuts");
-    return;
-#endif
-    setWindowRule("shortcut", "Ctrl+Alt+1", int(Rules::Apply));
-
-    createTestWindow();
-
-    // If we press the window shortcut, the window should be brought back to user.
-    QSignalSpy minimizedChangedSpy(m_window, &Window::minimizedChanged);
-    quint32 timestamp = 1;
-    QCOMPARE(m_window->shortcut(), (QKeySequence{Qt::CTRL | Qt::ALT | Qt::Key_1}));
-    m_window->setMinimized(true);
-    QVERIFY(m_window->isMinimized());
-    Test::keyboardKeyPressed(KEY_LEFTCTRL, timestamp++);
-    Test::keyboardKeyPressed(KEY_LEFTALT, timestamp++);
-    Test::keyboardKeyPressed(KEY_1, timestamp++);
-    Test::keyboardKeyReleased(KEY_1, timestamp++);
-    Test::keyboardKeyReleased(KEY_LEFTALT, timestamp++);
-    Test::keyboardKeyReleased(KEY_LEFTCTRL, timestamp++);
-    QVERIFY(minimizedChangedSpy.wait());
-    QVERIFY(!m_window->isMinimized());
-
-    // One can also change the shortcut.
-    m_window->setShortcut(QStringLiteral("Ctrl+Alt+2"));
-    QCOMPARE(m_window->shortcut(), (QKeySequence{Qt::CTRL | Qt::ALT | Qt::Key_2}));
-    m_window->setMinimized(true);
-    QVERIFY(m_window->isMinimized());
-    Test::keyboardKeyPressed(KEY_LEFTCTRL, timestamp++);
-    Test::keyboardKeyPressed(KEY_LEFTALT, timestamp++);
-    Test::keyboardKeyPressed(KEY_2, timestamp++);
-    Test::keyboardKeyReleased(KEY_2, timestamp++);
-    Test::keyboardKeyReleased(KEY_LEFTALT, timestamp++);
-    Test::keyboardKeyReleased(KEY_LEFTCTRL, timestamp++);
-    QVERIFY(minimizedChangedSpy.wait());
-    QVERIFY(!m_window->isMinimized());
-
-    // The old shortcut should do nothing.
-    m_window->setMinimized(true);
-    QVERIFY(m_window->isMinimized());
-    Test::keyboardKeyPressed(KEY_LEFTCTRL, timestamp++);
-    Test::keyboardKeyPressed(KEY_LEFTALT, timestamp++);
-    Test::keyboardKeyPressed(KEY_1, timestamp++);
-    Test::keyboardKeyReleased(KEY_1, timestamp++);
-    Test::keyboardKeyReleased(KEY_LEFTALT, timestamp++);
-    Test::keyboardKeyReleased(KEY_LEFTCTRL, timestamp++);
-    QVERIFY(!minimizedChangedSpy.wait(100));
-    QVERIFY(m_window->isMinimized());
-
-    // Reopen the window.
-    destroyTestWindow();
-    createTestWindow();
-
-    // The window shortcut should be set back to Ctrl+Alt+1.
-    QCOMPARE(m_window->shortcut(), (QKeySequence{Qt::CTRL | Qt::ALT | Qt::Key_1}));
-
-    destroyTestWindow();
-}
-
 void TestXdgShellWindowRules::testShortcutRemember()
 {
     QSKIP("KWin core doesn't try to save the last used window shortcut");
@@ -2442,54 +2349,6 @@ void TestXdgShellWindowRules::testShortcutForce()
 
     // The window shortcut should still be forced.
     QCOMPARE(m_window->shortcut(), (QKeySequence{Qt::CTRL | Qt::ALT | Qt::Key_1}));
-
-    destroyTestWindow();
-}
-
-void TestXdgShellWindowRules::testShortcutApplyNow()
-{
-#if !KWIN_BUILD_GLOBALSHORTCUTS
-    QSKIP("Can't test shortcuts without shortcuts");
-    return;
-#endif
-
-    createTestWindow();
-    QVERIFY(m_window->shortcut().isEmpty());
-
-    setWindowRule("shortcut", "Ctrl+Alt+1", int(Rules::ApplyNow));
-
-    // The window should now have a window shortcut assigned.
-    QCOMPARE(m_window->shortcut(), (QKeySequence{Qt::CTRL | Qt::ALT | Qt::Key_1}));
-    QSignalSpy minimizedChangedSpy(m_window, &Window::minimizedChanged);
-    quint32 timestamp = 1;
-    m_window->setMinimized(true);
-    QVERIFY(m_window->isMinimized());
-    Test::keyboardKeyPressed(KEY_LEFTCTRL, timestamp++);
-    Test::keyboardKeyPressed(KEY_LEFTALT, timestamp++);
-    Test::keyboardKeyPressed(KEY_1, timestamp++);
-    Test::keyboardKeyReleased(KEY_1, timestamp++);
-    Test::keyboardKeyReleased(KEY_LEFTALT, timestamp++);
-    Test::keyboardKeyReleased(KEY_LEFTCTRL, timestamp++);
-    QVERIFY(minimizedChangedSpy.wait());
-    QVERIFY(!m_window->isMinimized());
-
-    // Assign a different shortcut.
-    m_window->setShortcut(QStringLiteral("Ctrl+Alt+2"));
-    QCOMPARE(m_window->shortcut(), (QKeySequence{Qt::CTRL | Qt::ALT | Qt::Key_2}));
-    m_window->setMinimized(true);
-    QVERIFY(m_window->isMinimized());
-    Test::keyboardKeyPressed(KEY_LEFTCTRL, timestamp++);
-    Test::keyboardKeyPressed(KEY_LEFTALT, timestamp++);
-    Test::keyboardKeyPressed(KEY_2, timestamp++);
-    Test::keyboardKeyReleased(KEY_2, timestamp++);
-    Test::keyboardKeyReleased(KEY_LEFTALT, timestamp++);
-    Test::keyboardKeyReleased(KEY_LEFTCTRL, timestamp++);
-    QVERIFY(minimizedChangedSpy.wait());
-    QVERIFY(!m_window->isMinimized());
-
-    // The rule should not be applied again.
-    m_window->evaluateWindowRules();
-    QCOMPARE(m_window->shortcut(), (QKeySequence{Qt::CTRL | Qt::ALT | Qt::Key_2}));
 
     destroyTestWindow();
 }

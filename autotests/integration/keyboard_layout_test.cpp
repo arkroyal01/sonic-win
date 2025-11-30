@@ -57,7 +57,6 @@ private Q_SLOTS:
 
     void testReconfigure();
     void testChangeLayoutThroughDBus();
-    void testPerLayoutShortcut();
     void testVirtualDesktopPolicy();
     void testWindowPolicy();
     void testApplicationPolicy();
@@ -249,59 +248,6 @@ void KeyboardLayoutTest::testChangeLayoutThroughDBus()
     QCOMPARE(reply.reply().arguments().first().toBool(), true);
     QCOMPARE(xkb->layoutName(), QStringLiteral("German"));
     QVERIFY(!layoutChangedSpy.wait(1000));
-}
-
-void KeyboardLayoutTest::testPerLayoutShortcut()
-{
-#if !KWIN_BUILD_GLOBALSHORTCUTS
-    QSKIP("Can't test shortcuts without shortcuts");
-    return;
-#endif
-
-    // this test verifies that per-layout global shortcuts are working correctly.
-    // first configure layouts
-    layoutGroup.writeEntry("LayoutList", QStringLiteral("us,de,de(neo)"));
-    layoutGroup.sync();
-
-    // and create the global shortcuts
-    const QString componentName = QStringLiteral("KDE Keyboard Layout Switcher");
-    QAction *a = new QAction(this);
-    a->setObjectName(QStringLiteral("Switch keyboard layout to English (US)"));
-    a->setProperty("componentName", componentName);
-    KGlobalAccel::self()->setShortcut(a, QList<QKeySequence>{Qt::CTRL | Qt::ALT | Qt::Key_1}, KGlobalAccel::NoAutoloading);
-    delete a;
-    a = new QAction(this);
-    a->setObjectName(QStringLiteral("Switch keyboard layout to German"));
-    a->setProperty("componentName", componentName);
-    KGlobalAccel::self()->setShortcut(a, QList<QKeySequence>{Qt::CTRL | Qt::ALT | Qt::Key_2}, KGlobalAccel::NoAutoloading);
-    delete a;
-
-    // now we should have three layouts
-    auto xkb = input()->keyboard()->xkb();
-    reconfigureLayouts();
-    QCOMPARE(xkb->numberOfLayouts(), 3u);
-    // default layout is English
-    xkb->switchToLayout(0);
-    QCOMPARE(xkb->layoutName(), QStringLiteral("English (US)"));
-
-    // now switch to English through the global shortcut
-    quint32 timestamp = 1;
-    Test::keyboardKeyPressed(KEY_LEFTCTRL, timestamp++);
-    Test::keyboardKeyPressed(KEY_LEFTALT, timestamp++);
-    Test::keyboardKeyPressed(KEY_2, timestamp++);
-    QVERIFY(layoutChangedSpy.wait());
-    // now layout should be German
-    QCOMPARE(xkb->layoutName(), QStringLiteral("German"));
-    // release keys again
-    Test::keyboardKeyReleased(KEY_2, timestamp++);
-    // switch back to English
-    Test::keyboardKeyPressed(KEY_1, timestamp++);
-    QVERIFY(layoutChangedSpy.wait());
-    QCOMPARE(xkb->layoutName(), QStringLiteral("English (US)"));
-    // release keys again
-    Test::keyboardKeyReleased(KEY_1, timestamp++);
-    Test::keyboardKeyReleased(KEY_LEFTALT, timestamp++);
-    Test::keyboardKeyReleased(KEY_LEFTCTRL, timestamp++);
 }
 
 void KeyboardLayoutTest::testVirtualDesktopPolicy()

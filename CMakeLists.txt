@@ -55,7 +55,6 @@ option(KWIN_BUILD_SCREENLOCKER "Enable building of KWin lockscreen functionality
 option(KWIN_BUILD_TABBOX "Enable building of KWin Tabbox functionality" ON)
 option(KWIN_BUILD_X11 "Enable building X11 common code and Xwayland support" ON)
 option(KWIN_BUILD_X11_BACKEND "Enable building kwin_x11" ON)
-option(KWIN_BUILD_GLOBALSHORTCUTS "Enable building of KWin with global shortcuts support" ON)
 option(KWIN_BUILD_RUNNERS "Enable building of KWin with krunner support" ON)
 
 find_package(Qt6 ${QT_MIN_VERSION} CONFIG REQUIRED COMPONENTS
@@ -383,10 +382,6 @@ set(HAVE_ACCESSIBILITY ${QAccessibilityClient6_FOUND})
 
 pkg_check_modules(libsystemd IMPORTED_TARGET libsystemd)
 add_feature_info(libsystemd libsystemd_FOUND "Required for setting up the service watchdog")
-
-if(KWIN_BUILD_GLOBALSHORTCUTS)
-    find_package(KGlobalAccelD REQUIRED)
-endif()
 
 pkg_check_modules(libdisplayinfo REQUIRED IMPORTED_TARGET libdisplay-info>=0.2.0)
 add_feature_info(libdisplayinfo libdisplayinfo_FOUND "EDID and DisplayID library: https://gitlab.freedesktop.org/emersion/libdisplay-info")

@@ -44,7 +44,6 @@ private Q_SLOTS:
 
     void testEffectsHandler();
     void testEffectsContext();
-    void testShortcuts();
     void testAnimations_data();
     void testAnimations();
     void testScreenEdge();
@@ -216,26 +215,6 @@ void ScriptedEffectsTest::testEffectsContext()
     QCOMPARE(effectOutputSpy[1].first(), "100");
     QCOMPARE(effectOutputSpy[2].first(), "2");
     QCOMPARE(effectOutputSpy[3].first(), "0");
-}
-
-void ScriptedEffectsTest::testShortcuts()
-{
-#if !KWIN_BUILD_GLOBALSHORTCUTS
-    QSKIP("Can't test shortcuts without shortcuts");
-    return;
-#endif
-
-    // this tests method registerShortcut
-    auto *effect = new ScriptedEffectWithDebugSpy; // cleaned up in ::clean
-    QSignalSpy effectOutputSpy(effect, &ScriptedEffectWithDebugSpy::testOutput);
-    QVERIFY(effect->load("shortcutsTest"));
-    QCOMPARE(effect->actions().count(), 1);
-    auto action = effect->actions()[0];
-    QCOMPARE(action->objectName(), "testShortcut");
-    QCOMPARE(action->text(), "Test Shortcut");
-    QCOMPARE(KGlobalAccel::self()->shortcut(action).first(), QKeySequence("Meta+Shift+Y"));
-    action->trigger();
-    QCOMPARE(effectOutputSpy[0].first(), "shortcutTriggered");
 }
 
 void ScriptedEffectsTest::testAnimations_data()

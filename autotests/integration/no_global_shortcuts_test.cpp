@@ -41,7 +41,6 @@ private Q_SLOTS:
     void cleanup();
 
     void testKGlobalAccel();
-    void testPointerShortcut();
     void testAxisShortcut_data();
     void testAxisShortcut();
     void testScreenEdge();
@@ -126,25 +125,6 @@ void NoGlobalShortcutsTest::testKGlobalAccel()
 
     QVERIFY(!triggeredSpy.wait(100));
     QCOMPARE(triggeredSpy.count(), 0);
-}
-
-void NoGlobalShortcutsTest::testPointerShortcut()
-{
-    // based on LockScreenTest::testPointerShortcut
-    std::unique_ptr<QAction> action(new QAction(nullptr));
-    QSignalSpy actionSpy(action.get(), &QAction::triggered);
-    input()->registerPointerShortcut(Qt::MetaModifier, Qt::LeftButton, action.get());
-
-    // try to trigger the shortcut
-    quint32 timestamp = 1;
-    Test::keyboardKeyPressed(KEY_LEFTMETA, timestamp++);
-    Test::pointerButtonPressed(BTN_LEFT, timestamp++);
-    QCoreApplication::instance()->processEvents();
-    QCOMPARE(actionSpy.count(), 0);
-    Test::pointerButtonReleased(BTN_LEFT, timestamp++);
-    Test::keyboardKeyReleased(KEY_LEFTMETA, timestamp++);
-    QCoreApplication::instance()->processEvents();
-    QCOMPARE(actionSpy.count(), 0);
 }
 
 void NoGlobalShortcutsTest::testAxisShortcut_data()

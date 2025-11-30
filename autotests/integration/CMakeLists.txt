@@ -145,10 +145,6 @@ endif()
 qt_add_dbus_interfaces(DBUS_SRCS ${CMAKE_BINARY_DIR}/src/org.kde.kwin.VirtualKeyboard.xml)
 integrationTest(NAME testVirtualKeyboardDBus SRCS test_virtualkeyboard_dbus.cpp ${DBUS_SRCS})
 
-if (KWIN_BUILD_GLOBALSHORTCUTS)
-integrationTest(NAME testKWinBindings SRCS kwinbindings_test.cpp LIBS KF6::I18n)
-endif()
-
 if (KWIN_BUILD_ACTIVITIES)
     integrationTest(NAME testActivities SRCS activities_test.cpp LIBS XCB::ICCCM Plasma::Activities)
 endif()

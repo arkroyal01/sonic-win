@@ -68,7 +68,6 @@ private Q_SLOTS:
     void testX11QuickTilingAfterVertMaximize_data();
     void testX11QuickTilingAfterVertMaximize();
     void testShortcut_data();
-    void testShortcut();
     void testScript_data();
     void testScript();
     void testDontCrashWithMaximizeWindowRule();
@@ -722,87 +721,6 @@ void QuickTilingTest::testShortcut_data()
                 << oldMode << shortcut << newMode << geometry;
         }
     }
-}
-
-void QuickTilingTest::testShortcut()
-{
-#if !KWIN_BUILD_GLOBALSHORTCUTS
-    QSKIP("Can't test shortcuts without shortcuts");
-    return;
-#endif
-
-    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
-    QVERIFY(surface != nullptr);
-    std::unique_ptr<Test::XdgToplevel> shellSurface(Test::createXdgToplevelSurface(surface.get()));
-    QVERIFY(shellSurface != nullptr);
-
-    // Map the window.
-    const auto initialGeometry = QRect(0, 0, 100, 50);
-    auto window = Test::renderAndWaitForShown(surface.get(), initialGeometry.size(), Qt::blue);
-    QVERIFY(window);
-    QCOMPARE(workspace()->activeWindow(), window);
-    QCOMPARE(window->frameGeometry(), initialGeometry);
-    QCOMPARE(window->quickTileMode(), QuickTileMode(QuickTileFlag::None));
-
-    // We have to receive a configure event when the window becomes active.
-    QSignalSpy toplevelConfigureRequestedSpy(shellSurface.get(), &Test::XdgToplevel::configureRequested);
-    QSignalSpy surfaceConfigureRequestedSpy(shellSurface->xdgSurface(), &Test::XdgSurface::configureRequested);
-    QVERIFY(surfaceConfigureRequestedSpy.wait());
-    QCOMPARE(surfaceConfigureRequestedSpy.count(), 1);
-
-    QFETCH(QuickTileMode, oldMode);
-    QFETCH(QString, shortcut);
-    QFETCH(QuickTileMode, expectedMode);
-    QFETCH(QRect, expectedGeometry);
-
-    if (expectedMode == QuickTileMode(QuickTileFlag::None)) {
-        expectedGeometry = initialGeometry;
-    }
-
-    QSignalSpy quickTileChangedSpy(window, &Window::quickTileModeChanged);
-    QSignalSpy frameGeometryChangedSpy(window, &Window::frameGeometryChanged);
-
-    int numberOfQuickTileActions = 1;
-
-    if (oldMode != QuickTileMode(QuickTileFlag::None)) {
-        window->handleQuickTileShortcut(oldMode);
-        QVERIFY(surfaceConfigureRequestedSpy.wait());
-        shellSurface->xdgSurface()->ack_configure(surfaceConfigureRequestedSpy.last().at(0).value<quint32>());
-        Test::render(surface.get(), toplevelConfigureRequestedSpy.last().at(0).toSize(), Qt::red);
-        QVERIFY(quickTileChangedSpy.wait());
-        ++numberOfQuickTileActions;
-    }
-
-    // invoke global shortcut through dbus
-    auto msg = QDBusMessage::createMethodCall(
-        QStringLiteral("org.kde.kglobalaccel"),
-        QStringLiteral("/component/kwin"),
-        QStringLiteral("org.kde.kglobalaccel.Component"),
-        QStringLiteral("invokeShortcut"));
-    msg.setArguments(QList<QVariant>{shortcut});
-    QDBusConnection::sessionBus().asyncCall(msg);
-
-    if (oldMode == expectedMode) {
-        QVERIFY(!surfaceConfigureRequestedSpy.wait(10));
-    } else {
-        QVERIFY(surfaceConfigureRequestedSpy.wait());
-        shellSurface->xdgSurface()->ack_configure(surfaceConfigureRequestedSpy.last().at(0).value<quint32>());
-        Test::render(surface.get(), toplevelConfigureRequestedSpy.last().at(0).toSize(), Qt::red);
-        QVERIFY(quickTileChangedSpy.wait());
-
-        QCOMPARE(surfaceConfigureRequestedSpy.count(), numberOfQuickTileActions + 1);
-        QCOMPARE(toplevelConfigureRequestedSpy.last().at(0).toSize(), expectedGeometry.size());
-        QCOMPARE(frameGeometryChangedSpy.count(), numberOfQuickTileActions);
-        QTRY_COMPARE(quickTileChangedSpy.count(), numberOfQuickTileActions);
-    }
-
-    // geometry already changed
-    QCOMPARE(window->frameGeometry(), expectedGeometry);
-    // quick tile mode already changed
-    QCOMPARE(window->quickTileMode(), expectedMode);
-
-    QEXPECT_FAIL("maximize", "Geometry changed called twice for maximize", Continue);
-    QCOMPARE(window->frameGeometry(), expectedGeometry);
 }
 
 void QuickTilingTest::testScript_data()
