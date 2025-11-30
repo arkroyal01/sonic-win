@@ -23,7 +23,7 @@ Here are the reasons:
 6. Global hotkey support breaks things like push to talk in various applications such as Telegram or recording toggle in OBS Studio.
 
 7. Screen recording for remote desktop applications such as Team Viewer are broken.
-    
+
 8. The inability for an application to know which screen is the primary screen ([very annoying for games](https://www.youtube.com/watch?v=pLzxP4WFe5U)).
 
 9. After that there are minor annoyances (unreliable thumbnails in Plasma, among them), but which still make the overall experience disappointing.
@@ -34,7 +34,7 @@ A few of these problems are solved by launching apps with Xwayland. At this poin
 
 Unfortunately, however, the KDE developers are abandoning X11. Improvements are rejected and bugs are not fixed.
 
-This is why I found myself forced to open this repository that is a patchset for kwin_x11. If you want to contribute, prepare an MR or write a bug report. Thank you in advance!
+This is why I found myself forced to open this repository that is a fork of kwin_x11. If you want to contribute, prepare an MR or write a bug report. Thank you in advance!
 
 If you want an improved experience with kwin_x11 check out [guiodic's guide](https://gist.github.com/guiodic/2bcc8f2f126d14b1f8a439f644fdc2c9).
 
@@ -51,7 +51,7 @@ For more on Wayland's problems [see also this](https://gist.github.com/probonopd
 
 Please refer to the [contributing document](CONTRIBUTING.md) for everything you need to know to get started contributing to KWin.
 
-## Contacting the Sonic DE development team
+## Contacting the SonicDE development team
 
 * IRC: #sonicde on irc.libera.chat
 * Telegram: (https://t.me/sonic_de)
@@ -64,7 +64,7 @@ If you are an application developer having questions regarding windowing systems
 
 ### End user
 
-Please contact the support channels of your Linux distribution for user support. The Sonic DE development team does not provide end user support.
+Please contact the support channels of your Linux distribution for user support. The SonicDE development team does not provide end user support.
 
 ## Reporting bugs
 
