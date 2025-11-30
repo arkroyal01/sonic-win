@@ -93,6 +93,19 @@ GlobalShortcutsManager::~GlobalShortcutsManager()
 
 void GlobalShortcutsManager::init()
 {
+#if KWIN_BUILD_GLOBALSHORTCUTS
+    if (kwinApp()->shouldUseWaylandForCompositing()) {
+        qputenv("KGLOBALACCELD_PLATFORM", QByteArrayLiteral("org.kde.kwin"));
+        m_kglobalAccel = std::make_unique<KGlobalAccelD>();
+        if (!m_kglobalAccel->init()) {
+            qCDebug(KWIN_CORE) << "Init of kglobalaccel failed";
+            m_kglobalAccel.reset();
+        } else {
+            m_kglobalAccelInterface = m_kglobalAccel->interface();
+            qCDebug(KWIN_CORE) << "KGlobalAcceld inited";
+        }
+    }
+#endif
 }
 
 void GlobalShortcutsManager::objectDeleted(QObject *object)
@@ -176,6 +189,37 @@ void GlobalShortcutsManager::forceRegisterTouchscreenSwipe(SwipeDirection direct
 
 bool GlobalShortcutsManager::processKey(Qt::KeyboardModifiers mods, int keyQt, KeyboardKeyState state)
 {
+#if KWIN_BUILD_GLOBALSHORTCUTS
+    if (m_kglobalAccelInterface) {
+        auto check = [this](Qt::KeyboardModifiers mods, int keyQt, KeyboardKeyState keyState) {
+            bool retVal = false;
+            QMetaObject::invokeMethod(m_kglobalAccelInterface,
+                                      "checkKeyPressed",
+                                      Qt::DirectConnection,
+                                      Q_RETURN_ARG(bool, retVal),
+                                      Q_ARG(int, int(mods) | keyQt),
+                                      Q_ARG(KeyboardKeyState, keyState));
+            return retVal;
+        };
+        if (check(mods, keyQt, state)) {
+            return true;
+        } else if (keyQt == Qt::Key_Backtab) {
+            // KGlobalAccel on X11 has some workaround for Backtab
+            // see kglobalaccel/src/runtime/plugins/xcb/kglobalccel_x11.cpp method x11KeyPress
+            // Apparently KKeySequenceWidget captures Shift+Tab instead of Backtab
+            // thus if the key is backtab we should adjust to add shift again and use tab
+            // in addition KWin registers the shortcut incorrectly as Alt+Shift+Backtab
+            // this should be changed to either Alt+Backtab or Alt+Shift+Tab to match KKeySequenceWidget
+            // trying the variants
+            if (check(mods | Qt::ShiftModifier, keyQt, state)) {
+                return true;
+            }
+            if (check(mods | Qt::ShiftModifier, Qt::Key_Tab, state)) {
+                return true;
+            }
+        }
+    }
+#endif
     return false;
 }
 

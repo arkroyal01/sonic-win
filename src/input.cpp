@@ -3431,10 +3431,6 @@ void InputRedirection::registerTouchpadPinchShortcut(PinchDirection direction, u
 #endif
 }
 
-void InputRedirection::registerGlobalAccel(KGlobalAccelInterface *interface)
-{
-}
-
 void InputRedirection::registerTouchscreenSwipeShortcut(SwipeDirection direction, uint fingerCount, QAction *action, std::function<void(qreal)> progressCallback)
 {
 #if KWIN_BUILD_GLOBALSHORTCUTS
