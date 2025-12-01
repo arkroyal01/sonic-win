@@ -54,7 +54,7 @@ Please refer to the [contributing document](CONTRIBUTING.md) for everything you 
 ## Contacting the SonicDE development team
 
 * IRC: #sonicde on irc.libera.chat
-* Telegram: (https://t.me/sonic_de)
+* Telegram: https://t.me/sonic_de
 
 ## Support
 
