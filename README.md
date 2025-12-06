@@ -40,31 +40,19 @@ If you want an improved experience with kwin_x11 check out [guiodic's guide](htt
 
 For more on Wayland's problems [see also this](https://gist.github.com/probonopd/9feb7c20257af5dd915e3a9f2d1f2277=).
 
-## KWin is not
+## KWin/X11 is not
 
 * a standalone window manager (c.f. openbox, i3) and does not provide any functionality belonging to a Desktop Shell.
 * a replacement for window managers designed for use with a specific Desktop Shell (e.g. GNOME Shell)
 * a minimalistic window manager
 * designed for use without compositing or for X11 network transparency, though both are possible.
 
-## Contributing to KWin
+## Contributing to KWin/X11
 
-Please refer to the [contributing document](CONTRIBUTING.md) for everything you need to know to get started contributing to KWin.
+We appreciate your interest in contributing! Please refer to the [CONTRIBUTING document](CONTRIBUTING.md) for everything you need to get started. To report a bug, please use the KWin/X11 bug tracker at [Issues · Sonic-DE/kwin-x11-sonic](https://github.com/Sonic-DE/kwin-x11-sonic/issues).
 
-## Contacting the SonicDE development team
+## Getting in contact
 
-<img src="https://raw.githubusercontent.com/Sonic-DE/.github/refs/heads/main/profile/icons//bluesky.svg">&nbsp;[Bluesky](https://bsky.app/profile/sonicdesktop.bsky.social)&nbsp; <img src="https://raw.githubusercontent.com/Sonic-DE/.github/refs/heads/main/profile/icons//discord.svg">&nbsp;[Discord](https://discord.gg/cNZMQ62u5S) &nbsp; <img src="https://raw.githubusercontent.com/Sonic-DE/.github/refs/heads/main/profile/icons//mastodon.svg">&nbsp;[Mastodon](https://mastodon.social/@sonicdesktop) &nbsp; <img src="https://raw.githubusercontent.com/Sonic-DE/.github/refs/heads/main/profile/icons//oftc.svg">&nbsp;[OFTC IRC](https://webchat.oftc.net/?channels=sonicde%2Csonicde-devel%2Csonicde-dist&uio=MT11bmRlZmluZWQb1) &nbsp; <img src="https://raw.githubusercontent.com/Sonic-DE/.github/refs/heads/main/profile/icons//matrix.svg">&nbsp;[Matrix](https://matrix.to/#/#sonicdesktop:matrix.org) &nbsp; <img src="https://raw.githubusercontent.com/Sonic-DE/.github/refs/heads/main/profile/icons//telegram.svg">&nbsp;[Telegram](https://t.me/sonic_de) &nbsp; <img src="https://raw.githubusercontent.com/Sonic-DE/.github/refs/heads/main/profile/icons//x.svg">&nbsp;[X (Twitter)](https://x.com/SonicDesktop)
+We'd love to hear from you on one of our channels. To get end-user support, please also check your distribution's chat or forum.
 
-## Support
-
-### Application Developer
-
-If you are an application developer having questions regarding windowing systems (X11) please do not hesitate to contact us. Preferably through our Telegram.
-
-### End user
-
-Please contact the support channels of your Linux distribution for user support. The SonicDE development team does not provide end user support.
-
-## Reporting bugs
-
-Please use [kwin-x11-sonic's issue tracker](https://github.com/Sonic-DE/kwin-x11-sonic/issues) and report your issue.
+<img src="./.github/icons/bluesky.svg">&nbsp;[Bluesky](https://bsky.app/profile/sonicdesktop.bsky.social)&nbsp; <img src="./.github/icons/discord.svg">&nbsp;[Discord](https://discord.gg/cNZMQ62u5S) &nbsp; <img src="./.github/icons/mastodon.svg">&nbsp;[Mastodon](https://mastodon.social/@sonicdesktop) &nbsp; <img src="./.github/icons/matrix.svg">&nbsp;[Matrix](https://matrix.to/#/#sonicdesktop:matrix.org) &nbsp; <img src="./.github/icons/oftc.svg">&nbsp;[OFTC #sonicde](https://www.oftc.net/) &nbsp; <img src="./.github/icons/telegram.svg">&nbsp;[Telegram](https://t.me/sonic_de) &nbsp; <img src="./.github/icons/x.svg">&nbsp;[X (Twitter)](https://x.com/SonicDesktop)
