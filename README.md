@@ -1,44 +1,14 @@
-# KWin/X11 with ports from kwin-wayland, bug fixes, and maybe other improvements
-
-This is a fork of [guiodic](https://github.com/guiodic/kwin-x11-improved)'s repository with the full git tree mirrored instead of using patches.
+# KWin/X11 with ports from KWin/Wayland, bug fixes, and other improvements
 
 KWin/X11 is an X11 window manager and a compositing manager. Its primary usage is in conjunction with a Desktop Shell (e.g. KDE Plasma Desktop). KWin/X11 is designed to stay out of the way; users should not notice that they use a window manager at all. Nevertheless KWin/X11 provides a steep learning curve for advanced features, which are available, if they do not conflict with the primary mission. KWin does not have a dedicated targeted user group, but follows the targeted user group of the Desktop Shell using KWin/X11 as it's window manager.
 
-## Why still on X11?
+## Why stay with X11?
 
-With each release of a new version of Plasma many of us try to make the switch to Wayland, only to quickly revert back to X11.
+On X11 there is [a working implementation](https://github.com/guiodic/material-decoration) for Locally Integrated Menus. Inertial scrolling works too, even under Wine. The scrolling in LibreOffice/Qt is more fluent, and some Chromium functionality, such as drag & drop, is more reliable than on Wayland. Global hotkeys are working for, e.g., push to talk in Telegram and the recording toggle in OBS Studio. Windows get restored at the positions they were closed, especially between different sessions. Applications like games know which screen is the primary one. You can also record your screen in remote desktop applications such as TeamViewer. There are some other minor aspects that just work and lead to an overall pleasant desktop experience.
 
-Here are the reasons:
+KWin for X11 was created and for a long time maintained by the [KDE](https://kde.org) developers. Unfortunately, however, the KDE developers decided to abandon X11. In the wake of these events, KWin/X11 has been patched in 2025 by [guiodic](https://github.com/guiodic) at [guiodic/kwin-x11-improved](https://github.com/guiodic/kwin-x11-improved). The SonicDE project is here to pick up the baton, fix bugs, and make improvements to KWin/X11.
 
-1. The first is perhaps personal and concerns the Locally Integrated Menu. I use the [material decoration](https://github.com/guiodic/material-decoration) that implements LIM. I saw that KDE devs are working on an upstream implementation, but both implementations won't work for GTK apps. They say that a [special Wayland protocol](https://gitlab.freedesktop.org/wayland/wayland-protocols/-/merge_requests/52) is needed, as usual. So in all likelihood it will never be solved, unless KDE rewrites the GTK plugin to use KDE's (private) protocol.
-
-2. The second concerns the lack of inertial scrolling. Xorg allows this at the server level, with Synaptics driver, while in Wayland each application has to do it on its own. Again, this will take many years. It will probably never happen for applications under Wine, which I depend on for work, as Linux has no decent PDF editor. But apart from that, using Okular without inertial scrolling is painful. Recently, KDE developers said they had implemented inertial scrolling for QtQuick apps, but it does not actually work.
-
-3. Libreoffice+QT (or KF5/6) on Wayland has had a bug for years that makes scrolling slow and jerky to an intolerable level. This is partly due to the fact that the Qt backend for Wayland is [much slower](https://bugreports.qt.io/browse/QTBUG-139231) than the one for X11.
-
-4. Chromium still has numerous problems under Wayland such as drag&drop not always working. This is also due to the different interpretations of the same protocol among different compositors (such as Mutter in GNOME and Kwin in KDE).
-
-5. Of course, one cannot forget the problem of restoring windows in the position in which they were closed the last time, especially between different sessions, which will probably take many more years to solve. A very basic feature still lacking in Wayland.
-
-6. Global hotkey support breaks things like push to talk in various applications such as Telegram or recording toggle in OBS Studio.
-
-7. Screen recording for remote desktop applications such as Team Viewer are broken.
-
-8. The inability for an application to know which screen is the primary screen ([very annoying for games](https://www.youtube.com/watch?v=pLzxP4WFe5U)).
-
-9. After that there are minor annoyances (unreliable thumbnails in Plasma, among them), but which still make the overall experience disappointing.
-
-These, and other minor other deficiencies, severely impact people's work.
-
-A few of these problems are solved by launching apps with Xwayland. At this point, you might as well use X11.
-
-Unfortunately, however, the KDE developers are abandoning X11. Improvements are rejected and bugs are not fixed.
-
-This is why I found myself forced to open this repository that is a fork of kwin_x11. If you want to contribute, prepare an MR or write a bug report. Thank you in advance!
-
-If you want an improved experience with kwin_x11 check out [guiodic's guide](https://gist.github.com/guiodic/2bcc8f2f126d14b1f8a439f644fdc2c9).
-
-For more on Wayland's problems [see also this](https://gist.github.com/probonopd/9feb7c20257af5dd915e3a9f2d1f2277=).
+You may want to check out [guiodic's Plasma X11 improved guide](https://gist.github.com/guiodic/2bcc8f2f126d14b1f8a439f644fdc2c9) to get a better Plasma X11 experience. There is also a [critical comparison of X11 and Wayland by probonopd](https://gist.github.com/probonopd/9feb7c20257af5dd915e3a9f2d1f2277).
 
 ## KWin/X11 is not
 
