@@ -46,7 +46,7 @@ Other scripting stuff is located in `src/scripting`.
 
 ### Coding Conventions
 
-We follow KWin's coding conventions which are located [here](doc/coding-conventions.md).
+We follow KWin's coding conventions which are located in the [coding-conventions](doc/coding-conventions.md) document.
 
 We additionally follow [KDE's Frameworks Coding Style](https://community.kde.org/Policies/Frameworks_Coding_Style).
 
@@ -54,7 +54,7 @@ We additionally follow [KDE's Frameworks Coding Style](https://community.kde.org
 
 We usually use this convention for commits in KWin:
 
-```
+```git
 component/subcomponent: Do a thing
 
 This is a body of the commit message,
@@ -85,6 +85,7 @@ People hacking on much KDE software may want to set up [kdesrc-build](https://in
 Once built, you can either install it over your system KWin (not recommended) or run it from the build directory directly.
 
 Running it from your build directory looks like this:
+
 ```bash
 # from the root of your build directory
 
@@ -106,6 +107,7 @@ kdesrc-build plasma-workspace
 # assuming the root directory for kdesrc-build is ~/kde
 bash ~/kde/build/plasma-workspace/login-sessions/install-sessions.sh
 ```
+
 Then you can select the develop session in the sddm login screen.
 
 You can look up the current boot kwin log via `journalctl --user-unit plasma-kwin_x11 --boot 0`.
