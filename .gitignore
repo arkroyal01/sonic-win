@@ -28,3 +28,5 @@ CMakeLists.txt.user*
 .cache
 .directory
 .trunk
+/.ccls-cache
+/.ccls
