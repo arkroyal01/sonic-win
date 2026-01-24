@@ -68,7 +68,6 @@ private:
     void setupAnimData(EffectWindow *w);
     void setupInternalWindowSlide(EffectWindow *w);
     void setupSlideData(EffectWindow *w);
-    void setupInputPanelSlide();
 
     static SlideManagerInterface *s_slideManager;
     static QTimer *s_slideManagerRemoveTimer;

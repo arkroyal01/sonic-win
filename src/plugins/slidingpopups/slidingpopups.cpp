@@ -401,24 +401,6 @@ void SlidingPopupsEffect::setupInternalWindowSlide(EffectWindow *w)
     setupAnimData(w);
 }
 
-void SlidingPopupsEffect::setupInputPanelSlide()
-{
-    auto w = effects->inputPanel();
-
-    if (!w || effects->isInputPanelOverlay()) {
-        return;
-    }
-
-    AnimationData &animData = m_animationsData[w];
-    animData.location = Location::Bottom;
-    animData.offset = 0;
-    animData.slideLength = 0;
-    animData.slideInDuration = m_slideInDuration;
-    animData.slideOutDuration = m_slideOutDuration;
-
-    setupAnimData(w);
-}
-
 bool SlidingPopupsEffect::eventFilter(QObject *watched, QEvent *event)
 {
     auto internal = qobject_cast<QWindow *>(watched);

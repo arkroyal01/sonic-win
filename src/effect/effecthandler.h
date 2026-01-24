@@ -153,8 +153,6 @@ class KWIN_EXPORT EffectsHandler : public QObject
      */
     Q_PROPERTY(KWin::SessionState sessionState READ sessionState NOTIFY sessionStateChanged)
 
-    Q_PROPERTY(KWin::EffectWindow *inputPanel READ inputPanel NOTIFY inputPanelChanged)
-
     friend class Effect;
 
 public:
@@ -718,9 +716,6 @@ public:
     Output *findScreen(const QString &name) const;
     Output *findScreen(int screenId) const;
 
-    KWin::EffectWindow *inputPanel() const;
-    bool isInputPanelOverlay() const;
-
     QQmlEngine *qmlEngine() const;
 
     /**
@@ -1041,8 +1036,6 @@ Q_SIGNALS:
     void startupAdded(const QString &id, const QIcon &icon);
     void startupChanged(const QString &id, const QIcon &icon);
     void startupRemoved(const QString &id);
-
-    void inputPanelChanged();
 
 public Q_SLOTS:
     // slots for D-Bus interface
