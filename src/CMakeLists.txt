@@ -102,7 +102,6 @@ target_sources(kwin PRIVATE
     gestures.cpp
     globalshortcuts.cpp
     hide_cursor_spy.cpp
-    idle_inhibition.cpp
     idledetector.cpp
     input.cpp
     input_event.cpp
@@ -423,7 +422,6 @@ install(FILES
     globalshortcuts.h
     group.h
     idledetector.h
-    idle_inhibition.h
     input_event.h
     input_event_spy.h
     input.h
