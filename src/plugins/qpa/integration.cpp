@@ -10,7 +10,6 @@
 
 #include "integration.h"
 #include "backingstore.h"
-#include "clipboard.h"
 #include "eglplatformcontext.h"
 #include "internalinputmethodcontext.h"
 #include "logging.h"
@@ -61,7 +60,6 @@ Integration::Integration()
 #else
     , m_services(new QGenericUnixServices())
 #endif
-    , m_clipboard(new Clipboard())
 {
     QWindowSystemInterface::setSynchronousWindowSystemEvents(true);
     QWindowSystemInterfacePrivate::TabletEvent::setPlatformSynthesizesMouse(false);
@@ -196,8 +194,6 @@ void Integration::handleWorkspaceCreated()
     for (Output *output : outputs) {
         handleOutputEnabled(output);
     }
-
-    m_clipboard->initialize();
 }
 
 void Integration::handleOutputEnabled(Output *output)
@@ -243,12 +239,6 @@ QPlatformServices *Integration::services() const
 {
     return m_services.get();
 }
-
-QPlatformClipboard *Integration::clipboard() const
-{
-    return m_clipboard.get();
-}
-
 }
 }
 
