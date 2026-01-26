@@ -254,8 +254,6 @@ void MouseClickEffect::drawCircle(const RenderViewport &viewport, const QColor &
 {
     if (effects->isOpenGLCompositing()) {
         drawCircleGl(viewport, color, cx, cy, r);
-    } else if (effects->compositingType() == QPainterCompositing) {
-        drawCircleQPainter(color, cx, cy, r);
     }
 }
 

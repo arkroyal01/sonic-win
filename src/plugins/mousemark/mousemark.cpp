@@ -144,17 +144,6 @@ void MouseMarkEffect::paintScreen(const RenderTarget &renderTarget, const Render
             glDisable(GL_LINE_SMOOTH);
             glDisable(GL_BLEND);
         }
-    } else if (effects->compositingType() == QPainterCompositing) {
-        QPainter *painter = effects->scenePainter();
-        painter->save();
-        QPen pen(color);
-        pen.setWidth(width);
-        painter->setPen(pen);
-        for (const Mark &mark : std::as_const(marks)) {
-            drawMark(painter, mark);
-        }
-        drawMark(painter, drawing);
-        painter->restore();
     }
 }
 

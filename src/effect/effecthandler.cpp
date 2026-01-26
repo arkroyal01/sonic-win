@@ -25,7 +25,6 @@
 #include "effectsadaptor.h"
 #include "input.h"
 #include "input_event.h"
-#include "inputmethod.h"
 #include "keyboard_input.h"
 #include "opengl/glshader.h"
 #include "opengl/glshadermanager.h"
@@ -1509,16 +1508,6 @@ void EffectsHandler::renderOffscreenQuickView(const RenderTarget &renderTarget, 
         }
 
         ShaderManager::instance()->popShader();
-    } else if (compositingType() == QPainterCompositing) {
-        QPainter *painter = effects->scenePainter();
-        const QImage buffer = w->bufferAsImage();
-        if (buffer.isNull()) {
-            return;
-        }
-        painter->save();
-        painter->setOpacity(w->opacity());
-        painter->drawImage(w->geometry(), buffer);
-        painter->restore();
     }
 }
 

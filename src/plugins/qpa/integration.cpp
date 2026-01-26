@@ -12,7 +12,6 @@
 #include "backingstore.h"
 #include "clipboard.h"
 #include "eglplatformcontext.h"
-#include "inputmethod.h"
 #include "internalinputmethodcontext.h"
 #include "logging.h"
 #include "offscreensurface.h"
@@ -236,10 +235,8 @@ QPlatformNativeInterface *Integration::nativeInterface() const
 
 QPlatformInputContext *Integration::inputContext() const
 {
-    if (!kwinApp()->inputMethod()) { // for some unit tests
-        return nullptr;
-    }
-    return kwinApp()->inputMethod()->internalContext();
+    // Input method functionality removed (was Wayland-only)
+    return nullptr;
 }
 
 QPlatformServices *Integration::services() const

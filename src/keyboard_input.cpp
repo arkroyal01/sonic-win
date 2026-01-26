@@ -12,7 +12,6 @@
 
 #include "input_event.h"
 #include "input_event_spy.h"
-#include "inputmethod.h"
 #include "keyboard_layout.h"
 #include "keyboard_repeat.h"
 #include "window.h"
@@ -254,9 +253,6 @@ void KeyboardInputRedirection::processKey(uint32_t key, KeyboardKeyState state, 
     }
 
     m_xkb->forwardModifiers();
-    if (auto *inputmethod = kwinApp()->inputMethod()) {
-        inputmethod->forwardModifiers(InputMethod::NoForce);
-    }
 
     if (event.modifiersRelevantForGlobalShortcuts == Qt::KeyboardModifier::NoModifier && state != KeyboardKeyState::Released) {
         m_keyboardLayout->checkLayoutChange(previousLayout);

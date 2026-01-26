@@ -21,7 +21,6 @@
 #include "cursorsource.h"
 #include "effect/effecthandler.h"
 #include "input.h"
-#include "inputmethod.h"
 #include "opengl/gltexture.h"
 #include "opengl/glutils.h"
 #include "options.h"
@@ -269,11 +268,6 @@ void Application::createColorManager()
     m_colorManager = std::make_unique<ColorManager>();
 }
 
-void Application::createInputMethod()
-{
-    m_inputMethod = std::make_unique<InputMethod>();
-}
-
 void Application::createTabletModeManager()
 {
     m_tabletModeManager = std::make_unique<TabletModeManager>();
@@ -317,11 +311,6 @@ void Application::destroyPlugins()
 void Application::destroyColorManager()
 {
     m_colorManager.reset();
-}
-
-void Application::destroyInputMethod()
-{
-    m_inputMethod.reset();
 }
 
 std::unique_ptr<Edge> Application::createScreenEdge(ScreenEdges *edges)
@@ -629,11 +618,6 @@ PluginManager *Application::pluginManager() const
     return m_pluginManager.get();
 }
 
-InputMethod *Application::inputMethod() const
-{
-    return m_inputMethod.get();
-}
-
 ColorManager *Application::colorManager() const
 {
     return m_colorManager.get();
@@ -717,8 +701,7 @@ PlatformCursorImage Application::cursorImage() const
     switch (effects->compositingType()) {
     case OpenGLCompositing:
         return grabCursorOpenGL();
-    case QPainterCompositing:
-        return grabCursorSoftware();
+    case NoCompositing:
     default:
         Q_UNREACHABLE();
     }

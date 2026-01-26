@@ -20,7 +20,6 @@
 #include "idledetector.h"
 #include "input_event.h"
 #include "input_event_spy.h"
-#include "inputmethod.h"
 #include "keyboard_input.h"
 #include "main.h"
 #include "mousebuttons.h"
@@ -231,10 +230,7 @@ bool InputEventFilter::tabletPadRingEvent(TabletPadRingEvent *event)
 
 bool InputEventFilter::passToInputMethod(KeyboardKeyEvent *event)
 {
-    if (!kwinApp()->inputMethod()) {
-        return false;
-    }
-    kwinApp()->inputMethod()->commitPendingText();
+    // Input method functionality removed (was Wayland-only)
     return false;
 }
 
@@ -1568,34 +1564,13 @@ public:
 
     bool pointerButton(PointerButtonEvent *event) override
     {
-        auto inputMethod = kwinApp()->inputMethod();
-        if (!inputMethod) {
-            return false;
-        }
-        if (event->state != PointerButtonState::Pressed) {
-            return false;
-        }
-
-        // clicking on an on screen keyboard shouldn't flush, check we're clicking on our target window
-        if (input()->pointer()->focus() != inputMethod->activeWindow()) {
-            return false;
-        }
-
-        inputMethod->commitPendingText();
+        // Input method functionality removed (was Wayland-only)
         return false;
     }
 
     bool touchDown(qint32 id, const QPointF &point, std::chrono::microseconds time) override
     {
-        auto inputMethod = kwinApp()->inputMethod();
-        if (!inputMethod) {
-            return false;
-        }
-        if (input()->findToplevel(point) != inputMethod->activeWindow()) {
-            return false;
-        }
-
-        inputMethod->commitPendingText();
+        // Input method functionality removed (was Wayland-only)
         return false;
     }
 

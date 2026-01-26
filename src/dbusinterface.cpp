@@ -267,8 +267,6 @@ QString CompositorDBusInterface::compositingType() const
         } else {
             return QStringLiteral("gl2");
         }
-    case QPainterCompositing:
-        return QStringLiteral("qpainter");
     case NoCompositing:
     default:
         return QStringLiteral("none");

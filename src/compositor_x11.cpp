@@ -310,9 +310,6 @@ void X11Compositor::start()
                 QQuickWindow::setGraphicsApi(QSGRendererInterface::OpenGL);
             }
             break;
-        case QPainterCompositing:
-            qCDebug(KWIN_CORE) << "QPainter compositing is unsupported on X11";
-            break;
         case NoCompositing:
             qCDebug(KWIN_CORE) << "Starting without compositing...";
             stop = true;

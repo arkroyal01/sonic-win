@@ -749,11 +749,11 @@ void Options::loadConfig()
     bool useCompositing = false;
     CompositingType compositingMode = NoCompositing;
     QString compositingBackend = config.readEntry("Backend", "OpenGL");
-    if (compositingBackend == "QPainter") {
-        compositingMode = QPainterCompositing;
-    } else {
-        compositingMode = OpenGLCompositing;
+    // Only OpenGL compositing is supported on X11
+    if (compositingBackend != "OpenGL") {
+        compositingBackend = "OpenGL";
     }
+    compositingMode = OpenGLCompositing;
 
     if (const char *c = getenv("KWIN_COMPOSE")) {
         switch (c[0]) {
@@ -763,8 +763,8 @@ void Options::loadConfig()
             useCompositing = true;
             break;
         case 'Q':
-            qCDebug(KWIN_CORE) << "Compositing forced to QPainter mode by environment variable";
-            compositingMode = QPainterCompositing;
+            qCDebug(KWIN_CORE) << "QPainter compositing is not supported on X11, using OpenGL";
+            compositingMode = OpenGLCompositing;
             useCompositing = true;
             break;
         case 'N':

@@ -40,8 +40,6 @@ void ShowPaintEffect::paintScreen(const RenderTarget &renderTarget, const Render
     effects->paintScreen(renderTarget, viewport, mask, region, screen);
     if (effects->isOpenGLCompositing()) {
         paintGL(renderTarget, viewport.projectionMatrix(), viewport.scale());
-    } else if (effects->compositingType() == QPainterCompositing) {
-        paintQPainter();
     }
     if (++m_colorIndex == s_colors.count()) {
         m_colorIndex = 0;

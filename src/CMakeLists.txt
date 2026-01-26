@@ -106,7 +106,6 @@ target_sources(kwin PRIVATE
     input.cpp
     input_event.cpp
     input_event_spy.cpp
-    inputmethod.cpp
     internalinputmethodcontext.cpp
     internalwindow.cpp
     keyboard_input.cpp
@@ -158,7 +157,6 @@ target_sources(kwin PRIVATE
     scene/borderoutline.cpp
     scene/borderradius.cpp
     scene/cursordelegate_opengl.cpp
-    scene/cursordelegate_qpainter.cpp
     scene/cursoritem.cpp
     scene/cursorscene.cpp
     scene/decorationitem.cpp
@@ -168,7 +166,6 @@ target_sources(kwin PRIVATE
     scene/itemgeometry.cpp
     scene/itemrenderer.cpp
     scene/itemrenderer_opengl.cpp
-    scene/itemrenderer_qpainter.cpp
     scene/outlinedborderitem.cpp
     scene/rootitem.cpp
     scene/scene.cpp
@@ -178,7 +175,6 @@ target_sources(kwin PRIVATE
     scene/windowitem.cpp
     scene/workspacescene.cpp
     scene/workspacescene_opengl.cpp
-    scene/workspacescene_qpainter.cpp
     screenedge.cpp
     scripting/dbuscall.cpp
     scripting/desktopbackgrounditem.cpp
@@ -425,7 +421,6 @@ install(FILES
     input_event.h
     input_event_spy.h
     input.h
-    inputmethod.h
     internalwindow.h
     keyboard_input.h
     keyboard_layout.h
@@ -567,7 +562,6 @@ install(FILES
     scene/borderoutline.h
     scene/borderradius.h
     scene/cursordelegate_opengl.h
-    scene/cursordelegate_qpainter.h
     scene/cursoritem.h
     scene/cursorscene.h
     scene/decorationitem.h
@@ -577,7 +571,6 @@ install(FILES
     scene/item.h
     scene/itemrenderer.h
     scene/itemrenderer_opengl.h
-    scene/itemrenderer_qpainter.h
     scene/outlinedborderitem.h
     scene/rootitem.h
     scene/scene.h
@@ -588,7 +581,6 @@ install(FILES
     scene/windowitem.h
     scene/workspacescene.h
     scene/workspacescene_opengl.h
-    scene/workspacescene_qpainter.h
     DESTINATION ${KDE_INSTALL_INCLUDEDIR}/kwin-x11/scene COMPONENT Devel
 )
 

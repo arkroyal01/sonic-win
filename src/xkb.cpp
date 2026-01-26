@@ -8,7 +8,6 @@
 */
 #include "xkb.h"
 #include "dbusproperties_interface.h"
-#include "inputmethod.h"
 #include "utils/c_ptr.h"
 #include "utils/common.h"
 // frameworks
@@ -708,9 +707,6 @@ void Xkb::updateKeymap(xkb_keymap *keymap)
 
     createKeymapFile();
     forwardModifiers();
-    if (auto *inputmethod = kwinApp()->inputMethod()) {
-        inputmethod->forwardModifiers(InputMethod::Force);
-    }
     updateModifiers();
 }
 

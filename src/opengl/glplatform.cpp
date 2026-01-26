@@ -945,13 +945,13 @@ GLPlatform::GLPlatform(OpenGLPlatformInterface platformInterface, QByteArrayView
     }
 
     if (isVideoCore4()) {
-        // OpenGL works, but is much slower than QPainter
-        m_recommendedCompositor = QPainterCompositing;
+        // OpenGL works, but may be slower (QPainter not available on X11)
+        m_recommendedCompositor = OpenGLCompositing;
     }
 
     if (isVideoCore3D()) {
-        // OpenGL works, but is much slower than QPainter
-        m_recommendedCompositor = QPainterCompositing;
+        // OpenGL works, but may be slower (QPainter not available on X11)
+        m_recommendedCompositor = OpenGLCompositing;
     }
 
     if (isMesaDriver() && platformInterface == EglPlatformInterface) {

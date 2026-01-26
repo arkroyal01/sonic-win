@@ -12,65 +12,59 @@
 namespace KWin
 {
 
-VirtualKeyboardDBus::VirtualKeyboardDBus(InputMethod *parent)
+VirtualKeyboardDBus::VirtualKeyboardDBus(QObject *parent)
     : QObject(parent)
-    , m_inputMethod(parent)
 {
     QDBusConnection::sessionBus().registerObject(QStringLiteral("/VirtualKeyboard"), this,
                                                  QDBusConnection::ExportAllProperties | QDBusConnection::ExportScriptableContents | // qdbuscpp2xml doesn't support yet properties with NOTIFY
                                                      QDBusConnection::ExportAllSlots);
-    connect(parent, &InputMethod::activeChanged, this, &VirtualKeyboardDBus::activeChanged);
-    connect(parent, &InputMethod::enabledChanged, this, &VirtualKeyboardDBus::enabledChanged);
-    connect(parent, &InputMethod::visibleChanged, this, &VirtualKeyboardDBus::visibleChanged);
-    connect(parent, &InputMethod::availableChanged, this, &VirtualKeyboardDBus::availableChanged);
-    connect(parent, &InputMethod::activeClientSupportsTextInputChanged, this, &VirtualKeyboardDBus::activeClientSupportsTextInputChanged);
 }
 
 VirtualKeyboardDBus::~VirtualKeyboardDBus() = default;
 
 bool VirtualKeyboardDBus::isActive() const
 {
-    return m_inputMethod->isActive();
+    return false;
 }
 
 void VirtualKeyboardDBus::setEnabled(bool enabled)
 {
-    m_inputMethod->setEnabled(enabled);
+    // No-op (Wayland-only functionality)
 }
 
 void VirtualKeyboardDBus::setActive(bool active)
 {
-    m_inputMethod->setActive(active);
+    // No-op (Wayland-only functionality)
 }
 
 bool VirtualKeyboardDBus::isEnabled() const
 {
-    return m_inputMethod->isEnabled();
+    return false;
 }
 
 bool VirtualKeyboardDBus::isVisible() const
 {
-    return m_inputMethod->isVisible();
+    return false;
 }
 
 bool VirtualKeyboardDBus::isAvailable() const
 {
-    return m_inputMethod->isAvailable();
+    return false;
 }
 
 bool VirtualKeyboardDBus::activeClientSupportsTextInput() const
 {
-    return m_inputMethod->activeClientSupportsTextInput();
+    return false;
 }
 
 bool VirtualKeyboardDBus::willShowOnActive() const
 {
-    return isAvailable() && isEnabled() && m_inputMethod->shouldShowOnActive();
+    return false;
 }
 
 void VirtualKeyboardDBus::forceActivate()
 {
-    m_inputMethod->forceActivate();
+    // No-op (Wayland-only functionality)
 }
 }
 
