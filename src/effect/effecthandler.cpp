@@ -51,6 +51,19 @@
 #include "screenlockerwatcher.h"
 #endif
 
+#if HAVE_VULKAN
+#include "platformsupport/scenes/vulkan/vulkanbackend.h"
+#include "platformsupport/scenes/vulkan/vulkanbuffer.h"
+#include "platformsupport/scenes/vulkan/vulkancontext.h"
+#include "platformsupport/scenes/vulkan/vulkanpipeline.h"
+#include "platformsupport/scenes/vulkan/vulkanpipelinemanager.h"
+#include "platformsupport/scenes/vulkan/vulkantexture.h"
+#include "scene/itemrenderer_vulkan.h"
+#include <array>
+#include <cstring>
+#include <vulkan/vulkan.h>
+#endif
+
 #include <KDecoration3/Decoration>
 #include <KDecoration3/DecorationSettings>
 
@@ -1514,6 +1527,134 @@ void EffectsHandler::renderOffscreenQuickView(const RenderTarget &renderTarget, 
 
         GLShaderManager::instance()->popShader();
     }
+#if HAVE_VULKAN
+    else if (compositingType() == VulkanCompositing) {
+        const QImage img = w->bufferAsImage();
+        if (img.isNull()) {
+            return;
+        }
+
+        VulkanContext *ctx = VulkanContext::currentContext();
+        if (!ctx) {
+            return;
+        }
+
+        auto texture = VulkanTexture::upload(ctx, img);
+        if (!texture || !texture->isValid()) {
+            return;
+        }
+
+        auto *vkRenderer = dynamic_cast<ItemRendererVulkan *>(m_scene->renderer());
+        if (!vkRenderer) {
+            return;
+        }
+        VkCommandBuffer cmd = vkRenderer->currentCommandBuffer();
+        if (cmd == VK_NULL_HANDLE) {
+            return;
+        }
+
+        const QRectF rect = scaledRect(w->geometry(), viewport.scale());
+        const QSize vpSize = viewport.renderRect().size().toSize();
+
+        // Y-flip viewport (VK_KHR_maintenance1 negative-height) matching beginFrame()
+        VkViewport vkViewport{};
+        vkViewport.x = 0.0f;
+        vkViewport.y = static_cast<float>(vpSize.height());
+        vkViewport.width = static_cast<float>(vpSize.width());
+        vkViewport.height = -static_cast<float>(vpSize.height());
+        vkViewport.minDepth = 0.0f;
+        vkViewport.maxDepth = 1.0f;
+        vkCmdSetViewport(cmd, 0, 1, &vkViewport);
+
+        const VkRect2D scissor{{0, 0}, {uint32_t(vpSize.width()), uint32_t(vpSize.height())}};
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+        VulkanPipeline *pipeline = ctx->pipelineManager()->pipeline(VulkanShaderTrait::MapTexture | VulkanShaderTrait::Modulate);
+        if (!pipeline || !pipeline->isValid()) {
+            return;
+        }
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->pipeline());
+
+        // MVP follows the same convention as ItemRendererVulkan: viewport projection + rect translation
+        QMatrix4x4 mvp(viewport.projectionMatrix());
+        mvp.translate(rect.x(), rect.y());
+
+        VulkanPushConstants pc{};
+        memcpy(pc.mvp, mvp.data(), sizeof(pc.mvp));
+        pc.textureMatrix[0] = pc.textureMatrix[5] = pc.textureMatrix[10] = pc.textureMatrix[15] = 1.0f;
+        vkCmdPushConstants(cmd, pipeline->layout(),
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                           0, sizeof(VulkanPushConstants), &pc);
+
+        auto ubo = VulkanBuffer::createUniformBuffer(ctx, sizeof(VulkanUniforms));
+        if (!ubo) {
+            return;
+        }
+        VulkanUniforms u{};
+        u.uniformColor[0] = u.uniformColor[1] = u.uniformColor[2] = u.uniformColor[3] = 1.0f;
+        u.opacity = static_cast<float>(w->opacity());
+        u.brightness = 1.0f;
+        u.saturation = 1.0f;
+        ubo->upload(&u, sizeof(u));
+
+        VkDescriptorSet ds = ctx->allocateDescriptorSet(pipeline->descriptorSetLayout());
+        if (ds == VK_NULL_HANDLE) {
+            return;
+        }
+
+        // Fill all 4 texture slots with the overlay texture (shader uses slot 0 for MapTexture)
+        const VkDescriptorImageInfo imgInfo{texture->sampler(), texture->imageView(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        const std::array<VkDescriptorImageInfo, 4> imageInfos{imgInfo, imgInfo, imgInfo, imgInfo};
+
+        VkDescriptorBufferInfo bufInfo{};
+        bufInfo.buffer = ubo->buffer();
+        bufInfo.offset = 0;
+        bufInfo.range = sizeof(VulkanUniforms);
+
+        std::array<VkWriteDescriptorSet, 2> writes{};
+        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].dstSet = ds;
+        writes[0].dstBinding = 0;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[0].descriptorCount = 4;
+        writes[0].pImageInfo = imageInfos.data();
+        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[1].dstSet = ds;
+        writes[1].dstBinding = 1;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        writes[1].descriptorCount = 1;
+        writes[1].pBufferInfo = &bufInfo;
+
+        vkUpdateDescriptorSets(ctx->backend()->device(), 2, writes.data(), 0, nullptr);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                pipeline->layout(), 0, 1, &ds, 0, nullptr);
+
+        // Quad covering the overlay rect in local (0,0)-(width,height) space
+        const float qw = static_cast<float>(rect.width());
+        const float qh = static_cast<float>(rect.height());
+        const VulkanVertex2D verts[6] = {
+            {{0.0f, 0.0f}, {0.0f, 0.0f}},
+            {{qw, 0.0f}, {1.0f, 0.0f}},
+            {{0.0f, qh}, {0.0f, 1.0f}},
+            {{0.0f, qh}, {0.0f, 1.0f}},
+            {{qw, 0.0f}, {1.0f, 0.0f}},
+            {{qw, qh}, {1.0f, 1.0f}},
+        };
+        auto vertBuf = VulkanBuffer::createStreamingBuffer(ctx, sizeof(verts));
+        if (!vertBuf) {
+            return;
+        }
+        vertBuf->upload(verts, sizeof(verts));
+
+        const VkBuffer vb = vertBuf->buffer();
+        const VkDeviceSize vbOffset = 0;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &vbOffset);
+        vkCmdDraw(cmd, 6, 1, 0, 0);
+        // texture/ubo/vertBuf unique_ptrs go out of scope → deferred destruction queue.
+        // doBeginFrame() calls vkWaitForFences before cleanupPendingResources(), ensuring
+        // the GPU has finished frame N before these are freed on frame N+1.
+    }
+#endif
 }
 
 SessionState EffectsHandler::sessionState() const
