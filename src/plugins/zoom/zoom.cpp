@@ -604,6 +604,11 @@ void ZoomEffect::moveFocus(const QPoint &point)
     effects->addRepaintFull();
 }
 
+bool ZoomEffect::supported()
+{
+    return effects->isOpenGLCompositing();
+}
+
 bool ZoomEffect::isActive() const
 {
     return m_zoom != 1.0 || m_zoom != m_targetZoom;

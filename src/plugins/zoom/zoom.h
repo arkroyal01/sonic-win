@@ -51,6 +51,7 @@ public:
     void postPaintScreen() override;
     bool isActive() const override;
     int requestedEffectChainPosition() const override;
+    static bool supported();
 
     // for properties
     qreal configuredZoomFactor() const;
