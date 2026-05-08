@@ -10,12 +10,16 @@
 
 #pragma once
 
+#include "config-kwin.h"
 #include "effect/offscreeneffect.h"
 
 namespace KWin
 {
 
 class GLShader;
+#if HAVE_VULKAN
+class VulkanPipeline;
+#endif
 
 /**
  * Inverts desktop's colors
@@ -53,6 +57,9 @@ private:
     std::unique_ptr<GLShader> m_shader;
     bool m_allWindows;
     QList<EffectWindow *> m_windows;
+#if HAVE_VULKAN
+    VulkanPipeline *m_vkPipeline = nullptr;
+#endif
 };
 
 inline int InvertEffect::requestedEffectChainPosition() const

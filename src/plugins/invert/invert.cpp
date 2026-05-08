@@ -21,6 +21,12 @@
 
 #include <QMatrix4x4>
 
+#if HAVE_VULKAN
+#include "platformsupport/scenes/vulkan/vulkancontext.h"
+#include "platformsupport/scenes/vulkan/vulkanpipeline.h"
+#include "platformsupport/scenes/vulkan/vulkanpipelinemanager.h"
+#endif
+
 Q_LOGGING_CATEGORY(KWIN_INVERT, "kwin_effect_invert", QtWarningMsg)
 
 static void ensureResources()
@@ -69,7 +75,7 @@ InvertEffect::~InvertEffect() = default;
 
 bool InvertEffect::supported()
 {
-    return effects->compositingType() == OpenGLCompositing;
+    return effects->isOpenGLCompositing() || effects->isVulkanCompositing();
 }
 
 bool InvertEffect::isInvertable(EffectWindow *window) const
@@ -84,7 +90,24 @@ void InvertEffect::invert(EffectWindow *window)
     }
 
     redirect(window);
-    setShader(window, m_shader.get());
+
+    if (effects->isOpenGLCompositing()) {
+        setShader(window, m_shader.get());
+    }
+#if HAVE_VULKAN
+    else if (effects->isVulkanCompositing()) {
+        if (!m_vkPipeline) {
+            auto *ctx = VulkanContext::currentContext();
+            if (ctx && ctx->pipelineManager()) {
+                m_vkPipeline = ctx->pipelineManager()->pipeline(
+                    VulkanShaderTrait::MapTexture | VulkanShaderTrait::Modulate | VulkanShaderTrait::Invert);
+            }
+        }
+        if (m_vkPipeline) {
+            setPipeline(window, m_vkPipeline);
+        }
+    }
+#endif
 }
 
 void InvertEffect::uninvert(EffectWindow *window)
