@@ -8,11 +8,16 @@
 
 #include <unordered_set>
 
+#include "config-kwin.h"
 #include "effect/offscreeneffect.h"
 #include "opengl/glshadermanager.h"
 
 namespace KWin
 {
+
+#if HAVE_VULKAN
+class VulkanPipeline;
+#endif
 
 /**
  * The color filter supports protanopia, deuteranopia and tritanopia.
@@ -52,6 +57,10 @@ private:
 
     std::unordered_set<KWin::EffectWindow *> m_windows;
     std::unique_ptr<GLShader> m_shader;
+#if HAVE_VULKAN
+    VulkanPipeline *m_vkPipeline = nullptr;
+    float m_defectMatrix[12] = {}; // std140: 3 columns × 4 floats (3 data + 1 pad each)
+#endif
 };
 
 } // namespace

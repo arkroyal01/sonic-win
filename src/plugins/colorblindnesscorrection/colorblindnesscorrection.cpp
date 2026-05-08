@@ -6,10 +6,17 @@
 
 #include "colorblindnesscorrection.h"
 
+#include "config-kwin.h"
 #include "effect/effecthandler.h"
 #include "opengl/glshader.h"
 
 #include "colorblindnesscorrectionconfig.h"
+
+#if HAVE_VULKAN
+#include "platformsupport/scenes/vulkan/vulkancontext.h"
+#include "platformsupport/scenes/vulkan/vulkanpipeline.h"
+#include "platformsupport/scenes/vulkan/vulkanpipelinemanager.h"
+#endif
 
 Q_LOGGING_CATEGORY(KWIN_COLORBLINDNESS_CORRECTION, "kwin_effect_colorblindnesscorrection", QtWarningMsg)
 
@@ -38,7 +45,7 @@ ColorBlindnessCorrectionEffect::~ColorBlindnessCorrectionEffect()
 
 bool ColorBlindnessCorrectionEffect::supported()
 {
-    return effects->isOpenGLCompositing();
+    return effects->isOpenGLCompositing() || effects->isVulkanCompositing();
 }
 
 void ColorBlindnessCorrectionEffect::loadData()
@@ -46,7 +53,6 @@ void ColorBlindnessCorrectionEffect::loadData()
     ensureResources();
 
     QMatrix3x3 defectMatrix;
-    QString fragPath;
     switch (m_mode) {
     case Deuteranopia:
         defectMatrix(0, 0) = 1.0;
@@ -84,16 +90,34 @@ void ColorBlindnessCorrectionEffect::loadData()
         break;
     }
 
-    m_shader = GLShaderManager::instance()->generateShaderFromFile(GLShaderTrait::MapTexture, QString(), QStringLiteral(":/effects/colorblindnesscorrection/shaders/colorblindnesscorrection.frag"));
+    if (effects->isOpenGLCompositing()) {
+        m_shader = GLShaderManager::instance()->generateShaderFromFile(GLShaderTrait::MapTexture, QString(), QStringLiteral(":/effects/colorblindnesscorrection/shaders/colorblindnesscorrection.frag"));
 
-    if (!m_shader->isValid()) {
-        qCCritical(KWIN_COLORBLINDNESS_CORRECTION) << "Failed to load the shader!";
-        return;
+        if (!m_shader->isValid()) {
+            qCCritical(KWIN_COLORBLINDNESS_CORRECTION) << "Failed to load the shader!";
+            return;
+        }
+
+        ShaderBinder binder{m_shader.get()};
+        m_shader->setUniform("intensity", m_intensity);
+        m_shader->setUniform("defectMatrix", defectMatrix);
     }
-
-    ShaderBinder binder{m_shader.get()};
-    m_shader->setUniform("intensity", m_intensity);
-    m_shader->setUniform("defectMatrix", defectMatrix);
+#if HAVE_VULKAN
+    else if (effects->isVulkanCompositing()) {
+        auto *ctx = VulkanContext::currentContext();
+        if (ctx && ctx->pipelineManager()) {
+            m_vkPipeline = ctx->pipelineManager()->pipeline(
+                VulkanShaderTrait::MapTexture | VulkanShaderTrait::Modulate | VulkanShaderTrait::ColorBlindnessCorrect);
+        }
+        // Store the defect matrix in std140 column-major layout (3 columns × 4 floats each)
+        for (int col = 0; col < 3; ++col) {
+            m_defectMatrix[col * 4 + 0] = defectMatrix(0, col);
+            m_defectMatrix[col * 4 + 1] = defectMatrix(1, col);
+            m_defectMatrix[col * 4 + 2] = defectMatrix(2, col);
+            m_defectMatrix[col * 4 + 3] = 0.0f; // std140 padding
+        }
+    }
+#endif
 
     for (const auto windows = effects->stackingOrder(); EffectWindow *w : windows) {
         correctColor(w);
@@ -111,7 +135,15 @@ void ColorBlindnessCorrectionEffect::correctColor(KWin::EffectWindow *w)
     }
 
     redirect(w);
-    setShader(w, m_shader.get());
+    if (effects->isOpenGLCompositing()) {
+        setShader(w, m_shader.get());
+    }
+#if HAVE_VULKAN
+    else if (effects->isVulkanCompositing() && m_vkPipeline) {
+        setPipeline(w, m_vkPipeline);
+        setColorBlindnessParams(w, m_defectMatrix, m_intensity);
+    }
+#endif
     m_windows.insert(w);
 }
 

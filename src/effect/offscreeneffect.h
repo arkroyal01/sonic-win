@@ -81,6 +81,13 @@ protected:
     void setPipeline(EffectWindow *window, VulkanPipeline *pipeline, float brightness, float saturation);
 
     /**
+     * Set color blindness correction parameters for @p window.
+     * @param cbMatrix std140-padded 3x3 defect matrix (12 floats: 3 columns × 4 floats)
+     * @param cbIntensity correction intensity [0, 1]
+     **/
+    void setColorBlindnessParams(EffectWindow *window, const float cbMatrix[12], float cbIntensity);
+
+    /**
      * Set what mode to use to snap the vertices of this effect.
      *
      * @see RenderGeometry::VertexSnappingMode

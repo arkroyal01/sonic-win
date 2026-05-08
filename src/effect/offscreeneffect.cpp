@@ -107,8 +107,13 @@ struct VulkanOffscreenData : public OffscreenData
     float m_brightness = 1.0f;
     float m_saturation = 1.0f;
 
+    // Color blindness correction parameters (zero cbIntensity = disabled)
+    float m_cbDefectMatrix[12] = {};
+    float m_cbIntensity = 0.0f;
+
     void setShader(VulkanPipeline *pipeline);
     void setShader(VulkanPipeline *pipeline, float brightness, float saturation);
+    void setColorBlindnessParams(const float cbMatrix[12], float cbIntensity);
 };
 
 class OffscreenEffectPrivate
@@ -212,6 +217,14 @@ void OffscreenEffect::setPipeline(EffectWindow *window, VulkanPipeline *pipeline
     if (const auto it = d->windows.find(window); it != d->windows.end()) {
         auto *vulkanData = static_cast<VulkanOffscreenData *>(it->second.get());
         vulkanData->setShader(pipeline, brightness, saturation);
+    }
+}
+
+void OffscreenEffect::setColorBlindnessParams(EffectWindow *window, const float cbMatrix[12], float cbIntensity)
+{
+    if (const auto it = d->windows.find(window); it != d->windows.end()) {
+        auto *vulkanData = static_cast<VulkanOffscreenData *>(it->second.get());
+        vulkanData->setColorBlindnessParams(cbMatrix, cbIntensity);
     }
 }
 
@@ -409,6 +422,12 @@ void VulkanOffscreenData::setShader(VulkanPipeline *pipeline, float brightness, 
     m_saturation = saturation;
 }
 
+void VulkanOffscreenData::setColorBlindnessParams(const float cbMatrix[12], float cbIntensity)
+{
+    memcpy(m_cbDefectMatrix, cbMatrix, sizeof(m_cbDefectMatrix));
+    m_cbIntensity = cbIntensity;
+}
+
 void VulkanOffscreenData::paint(const RenderTarget &renderTarget, const RenderViewport &viewport, EffectWindow *window, const QRegion &region,
                                 const WindowPaintData &data, const WindowQuadList &quads)
 {
@@ -593,6 +612,12 @@ void VulkanOffscreenData::paint(const RenderTarget &renderTarget, const RenderVi
     uniforms.primaryBrightness[0] = toXYZ(1, 0);
     uniforms.primaryBrightness[1] = toXYZ(1, 1);
     uniforms.primaryBrightness[2] = toXYZ(1, 2);
+
+    // Color blindness correction parameters
+    if (m_cbIntensity > 0.0f) {
+        memcpy(uniforms.cbDefectMatrix, m_cbDefectMatrix, sizeof(uniforms.cbDefectMatrix));
+        uniforms.cbIntensity = m_cbIntensity;
+    }
 
     m_uniformBuffer->upload(&uniforms, sizeof(VulkanUniforms), 0);
 

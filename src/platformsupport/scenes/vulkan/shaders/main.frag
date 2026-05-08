@@ -18,6 +18,7 @@ layout(constant_id = 5) const bool TRAIT_ROUNDED_CORNERS = false;
 layout(constant_id = 6) const bool TRAIT_BORDER = false;
 layout(constant_id = 7) const bool TRAIT_YUV = false;
 layout(constant_id = 8) const bool TRAIT_INVERT = false;
+layout(constant_id = 9) const bool TRAIT_COLORBLINDNESS = false;
 
 // Input from vertex shader
 layout(location = 0) in vec2 fragTexCoord;
@@ -57,6 +58,11 @@ layout(set = 0, binding = 1) uniform UniformBufferObject {
     float maxDestLuminance;
     mat4 destToLMS;
     mat4 lmsToDest;
+
+    // Color blindness correction (TRAIT_COLORBLINDNESS)
+    // mat3 stored as 3 vec4s for std140 compliance
+    mat3 cbDefectMatrix;
+    float cbIntensity;
 } ubo;
 
 // Color management constants
@@ -285,6 +291,37 @@ void main() {
     // Apply invert effect
     if (TRAIT_INVERT) {
         color.rgb = vec3(1.0) - color.rgb;
+    }
+
+    // Apply color blindness correction
+    if (TRAIT_COLORBLINDNESS) {
+        // sRGB <-> LMS conversion matrices (same as the GL colorblindnesscorrection effect)
+        const mat3 srgbToLMS = mat3(
+            17.8824,   3.45565,  0.0299566,
+            43.5161,   27.1554,  0.184309,
+            4.11935,   3.86714,  1.46709
+        );
+        const mat3 errorMat = mat3(
+            0.0809444479,  -0.0102485335, -0.000365296938,
+            -0.130504409,   0.0540193266, -0.00412161469,
+            0.116721066,   -0.113614708,   0.693511405
+        );
+
+        // Unpremultiply, decode sRGB gamma, apply correction, re-encode
+        float a = max(color.a, 0.001);
+        vec3 straight = color.rgb / a;
+        vec3 linear = srgbToLinear(straight);
+
+        vec3 LMS = srgbToLMS * linear;
+        vec3 lms = ubo.cbDefectMatrix * LMS;
+        vec3 error = errorMat * lms;
+
+        vec3 diff = (linear - error) * vec3(ubo.cbIntensity);
+        vec3 correction = vec3(0.0,
+                               (diff.r * 0.7) + (diff.g * 1.0),
+                               (diff.r * 0.7) + (diff.b * 1.0));
+        vec3 corrected = clamp(linear + correction, 0.0, 1.0);
+        color.rgb = linearToSrgb(corrected) * color.a;
     }
 
     // Apply rounded corners

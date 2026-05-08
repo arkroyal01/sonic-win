@@ -35,6 +35,7 @@ enum class VulkanShaderTrait {
     Border = 1 << 6, ///< Render border
     YUV = 1 << 7, ///< YUV to RGB conversion (for multi-plane textures)
     Invert = 1 << 8, ///< Invert colors
+    ColorBlindnessCorrect = 1 << 9, ///< Color blindness simulation correction
 };
 
 Q_DECLARE_FLAGS(VulkanShaderTraits, VulkanShaderTrait)
@@ -173,6 +174,12 @@ struct VulkanUniforms
     float maxDestLuminance;
     float destToLMS[16];
     float lmsToDest[16];
+
+    // Color blindness correction (TRAIT_COLORBLINDNESS)
+    // mat3 stored as 3 columns, each padded to vec4 (std140 layout)
+    float cbDefectMatrix[12]; // 3 columns × (3 floats + 1 pad) = 12 floats
+    float cbIntensity;
+    float _cbPad[3];
 };
 
 } // namespace KWin
