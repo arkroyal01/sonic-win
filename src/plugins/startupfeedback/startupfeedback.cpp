@@ -24,6 +24,7 @@
 #include <KSharedConfig>
 #include <KWindowSystem>
 // KWin
+#include "core/colorspace.h"
 #include "core/output.h"
 #include "core/pixelgrid.h"
 #include "core/rendertarget.h"
@@ -32,6 +33,19 @@
 #include "cursorsource.h"
 #include "effect/effecthandler.h"
 #include "opengl/glutils.h"
+#include "scene/workspacescene.h"
+
+#if HAVE_VULKAN
+#include "platformsupport/scenes/vulkan/vulkanbackend.h"
+#include "platformsupport/scenes/vulkan/vulkanbuffer.h"
+#include "platformsupport/scenes/vulkan/vulkancontext.h"
+#include "platformsupport/scenes/vulkan/vulkanpipeline.h"
+#include "platformsupport/scenes/vulkan/vulkanpipelinemanager.h"
+#include "platformsupport/scenes/vulkan/vulkantexture.h"
+#include "scene/itemrenderer_vulkan.h"
+#include <array>
+#include <vulkan/vulkan.h>
+#endif
 
 // based on StartupId in KRunner by Lubos Lunak
 // SPDX-FileCopyrightText: 2001 Lubos Lunak <l.lunak@kde.org>
@@ -129,7 +143,7 @@ StartupFeedbackEffect::~StartupFeedbackEffect()
 
 bool StartupFeedbackEffect::supported()
 {
-    return effects->isOpenGLCompositing();
+    return effects->isOpenGLCompositing() || effects->isVulkanCompositing();
 }
 
 void StartupFeedbackEffect::reconfigure(Effect::ReconfigureFlags flags)
@@ -200,42 +214,49 @@ void StartupFeedbackEffect::prePaintScreen(ScreenPrePaintData &data, std::chrono
 void StartupFeedbackEffect::paintScreen(const RenderTarget &renderTarget, const RenderViewport &viewport, int mask, const QRegion &region, Output *screen)
 {
     effects->paintScreen(renderTarget, viewport, mask, region, screen);
-    if (m_active) {
-        GLTexture *texture;
-        switch (m_type) {
-        case BouncingFeedback:
-            texture = m_bouncingTextures[FRAME_TO_BOUNCE_TEXTURE[m_frame]].get();
-            break;
-        case BlinkingFeedback: // fall through
-        case PassiveFeedback:
-            texture = m_texture.get();
-            break;
-        default:
-            return; // safety
-        }
-        if (!texture) {
-            return;
-        }
-        glEnable(GL_BLEND);
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        GLShader *shader = nullptr;
-        if (m_type == BlinkingFeedback && m_blinkingShader && m_blinkingShader->isValid()) {
-            const QColor &blinkingColor = BLINKING_COLORS[FRAME_TO_BLINKING_COLOR[m_frame]];
-            GLShaderManager::instance()->pushShader(m_blinkingShader.get());
-            shader = m_blinkingShader.get();
-            m_blinkingShader->setUniform(GLShader::ColorUniform::Color, blinkingColor);
-        } else {
-            shader = GLShaderManager::instance()->pushShader(GLShaderTrait::MapTexture | GLShaderTrait::TransformColorspace);
-        }
-        const QRectF pixelGeometry = snapToPixelGridF(scaledRect(m_currentGeometry, viewport.scale()));
-        QMatrix4x4 mvp = viewport.projectionMatrix();
-        mvp.translate(pixelGeometry.x(), pixelGeometry.y());
-        shader->setUniform(GLShader::Mat4Uniform::ModelViewProjectionMatrix, mvp);
-        shader->setColorspaceUniforms(ColorDescription::sRGB, renderTarget.colorDescription(), RenderingIntent::Perceptual);
-        texture->render(pixelGeometry.size());
-        GLShaderManager::instance()->popShader();
-        glDisable(GL_BLEND);
+    if (!m_active) {
+        return;
     }
+#if HAVE_VULKAN
+    if (effects->isVulkanCompositing()) {
+        paintVulkan(renderTarget, viewport);
+        return;
+    }
+#endif
+    GLTexture *texture;
+    switch (m_type) {
+    case BouncingFeedback:
+        texture = m_bouncingTextures[FRAME_TO_BOUNCE_TEXTURE[m_frame]].get();
+        break;
+    case BlinkingFeedback: // fall through
+    case PassiveFeedback:
+        texture = m_texture.get();
+        break;
+    default:
+        return; // safety
+    }
+    if (!texture) {
+        return;
+    }
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    GLShader *shader = nullptr;
+    if (m_type == BlinkingFeedback && m_blinkingShader && m_blinkingShader->isValid()) {
+        const QColor &blinkingColor = BLINKING_COLORS[FRAME_TO_BLINKING_COLOR[m_frame]];
+        GLShaderManager::instance()->pushShader(m_blinkingShader.get());
+        shader = m_blinkingShader.get();
+        m_blinkingShader->setUniform(GLShader::ColorUniform::Color, blinkingColor);
+    } else {
+        shader = GLShaderManager::instance()->pushShader(GLShaderTrait::MapTexture | GLShaderTrait::TransformColorspace);
+    }
+    const QRectF pixelGeometry = snapToPixelGridF(scaledRect(m_currentGeometry, viewport.scale()));
+    QMatrix4x4 mvp = viewport.projectionMatrix();
+    mvp.translate(pixelGeometry.x(), pixelGeometry.y());
+    shader->setUniform(GLShader::Mat4Uniform::ModelViewProjectionMatrix, mvp);
+    shader->setColorspaceUniforms(ColorDescription::sRGB, renderTarget.colorDescription(), RenderingIntent::Perceptual);
+    texture->render(pixelGeometry.size());
+    GLShaderManager::instance()->popShader();
+    glDisable(GL_BLEND);
 }
 
 void StartupFeedbackEffect::postPaintScreen()
@@ -353,16 +374,24 @@ void StartupFeedbackEffect::stop()
     disconnect(effects, &EffectsHandler::mouseChanged, this, &StartupFeedbackEffect::slotMouseChanged);
     m_active = false;
     m_lastPresentTime = std::chrono::milliseconds::zero();
-    effects->makeOpenGLContextCurrent();
+    if (effects->isOpenGLCompositing()) {
+        effects->makeOpenGLContextCurrent();
+    }
     switch (m_type) {
     case BouncingFeedback:
         for (int i = 0; i < 5; ++i) {
             m_bouncingTextures[i].reset();
+#if HAVE_VULKAN
+            m_vkBouncingTextures[i].reset();
+#endif
         }
         break;
     case BlinkingFeedback:
     case PassiveFeedback:
         m_texture.reset();
+#if HAVE_VULKAN
+        m_vkTexture.reset();
+#endif
         break;
     case NoFeedback:
         return; // don't want the full repaint
@@ -374,32 +403,55 @@ void StartupFeedbackEffect::stop()
 
 void StartupFeedbackEffect::prepareTextures(const QPixmap &pix, qreal devicePixelRatio)
 {
-    effects->makeOpenGLContextCurrent();
-    switch (m_type) {
-    case BouncingFeedback:
-        for (int i = 0; i < 5; ++i) {
-            m_bouncingTextures[i] = GLTexture::upload(scalePixmap(pix, BOUNCE_SIZES[i], devicePixelRatio));
-            if (!m_bouncingTextures[i]) {
+    if (effects->isOpenGLCompositing()) {
+        effects->makeOpenGLContextCurrent();
+        switch (m_type) {
+        case BouncingFeedback:
+            for (int i = 0; i < 5; ++i) {
+                m_bouncingTextures[i] = GLTexture::upload(scalePixmap(pix, BOUNCE_SIZES[i], devicePixelRatio));
+                if (!m_bouncingTextures[i]) {
+                    return;
+                }
+                m_bouncingTextures[i]->setFilter(GL_LINEAR);
+                m_bouncingTextures[i]->setWrapMode(GL_CLAMP_TO_EDGE);
+            }
+            break;
+        case BlinkingFeedback:
+        case PassiveFeedback:
+            m_texture = GLTexture::upload(pix);
+            if (!m_texture) {
                 return;
             }
-            m_bouncingTextures[i]->setFilter(GL_LINEAR);
-            m_bouncingTextures[i]->setWrapMode(GL_CLAMP_TO_EDGE);
+            m_texture->setFilter(GL_LINEAR);
+            m_texture->setWrapMode(GL_CLAMP_TO_EDGE);
+            break;
+        default:
+            stop();
+            break;
         }
-        break;
-    case BlinkingFeedback:
-    case PassiveFeedback:
-        m_texture = GLTexture::upload(pix);
-        if (!m_texture) {
+    }
+#if HAVE_VULKAN
+    else if (effects->isVulkanCompositing()) {
+        auto *ctx = VulkanContext::currentContext();
+        if (!ctx) {
             return;
         }
-        m_texture->setFilter(GL_LINEAR);
-        m_texture->setWrapMode(GL_CLAMP_TO_EDGE);
-        break;
-    default:
-        // for safety
-        stop();
-        break;
+        switch (m_type) {
+        case BouncingFeedback:
+            for (int i = 0; i < 5; ++i) {
+                m_vkBouncingTextures[i] = VulkanTexture::upload(ctx, scalePixmap(pix, BOUNCE_SIZES[i], devicePixelRatio));
+            }
+            break;
+        case BlinkingFeedback:
+        case PassiveFeedback:
+            m_vkTexture = VulkanTexture::upload(ctx, pix.toImage());
+            break;
+        default:
+            stop();
+            break;
+        }
     }
+#endif
 }
 
 QImage StartupFeedbackEffect::scalePixmap(const QPixmap &pm, const QSize &size, qreal devicePixelRatio) const
@@ -459,7 +511,23 @@ QRect StartupFeedbackEffect::feedbackRect() const
     }
     const QPoint cursorPos = effects->cursorPos().toPoint() + QPoint(xDiff, yDiff + yOffset);
     QRect rect;
-    if (texture) {
+    bool hasTexture = (texture != nullptr);
+#if HAVE_VULKAN
+    if (!hasTexture) {
+        switch (m_type) {
+        case BouncingFeedback:
+            hasTexture = (m_vkBouncingTextures[FRAME_TO_BOUNCE_TEXTURE[m_frame]] != nullptr);
+            break;
+        case BlinkingFeedback:
+        case PassiveFeedback:
+            hasTexture = (m_vkTexture != nullptr);
+            break;
+        default:
+            break;
+        }
+    }
+#endif
+    if (hasTexture) {
         rect = QRect(cursorPos, feedbackIconSize());
     }
     return rect;
@@ -469,6 +537,144 @@ bool StartupFeedbackEffect::isActive() const
 {
     return m_active;
 }
+
+#if HAVE_VULKAN
+void StartupFeedbackEffect::paintVulkan(const RenderTarget &renderTarget, const RenderViewport &viewport)
+{
+    auto *ctx = VulkanContext::currentContext();
+    if (!ctx) {
+        return;
+    }
+    auto *vkRenderer = dynamic_cast<ItemRendererVulkan *>(effects->scene()->renderer());
+    if (!vkRenderer) {
+        return;
+    }
+    VkCommandBuffer cmd = vkRenderer->currentCommandBuffer();
+    if (cmd == VK_NULL_HANDLE) {
+        return;
+    }
+
+    VulkanTexture *tex = nullptr;
+    switch (m_type) {
+    case BouncingFeedback:
+        tex = m_vkBouncingTextures[FRAME_TO_BOUNCE_TEXTURE[m_frame]].get();
+        break;
+    case BlinkingFeedback:
+    case PassiveFeedback:
+        tex = m_vkTexture.get();
+        break;
+    default:
+        return;
+    }
+    if (!tex || !tex->isValid()) {
+        return;
+    }
+
+    VulkanPipeline *pipeline = ctx->pipelineManager()->pipeline(
+        VulkanShaderTrait::MapTexture | VulkanShaderTrait::Modulate | VulkanShaderTrait::TransformColorspace);
+    if (!pipeline || !pipeline->isValid()) {
+        return;
+    }
+
+    const QRectF pixelRect = snapToPixelGridF(scaledRect(m_currentGeometry, viewport.scale()));
+    const float x0 = pixelRect.x(), y0 = pixelRect.y();
+    const float x1 = x0 + pixelRect.width(), y1 = y0 + pixelRect.height();
+
+    const VulkanVertex2D quadVerts[6] = {
+        {{x0, y0}, {0.0f, 0.0f}},
+        {{x1, y0}, {1.0f, 0.0f}},
+        {{x0, y1}, {0.0f, 1.0f}},
+        {{x1, y0}, {1.0f, 0.0f}},
+        {{x1, y1}, {1.0f, 1.0f}},
+        {{x0, y1}, {0.0f, 1.0f}},
+    };
+
+    auto vertBuf = VulkanBuffer::createStreamingBuffer(ctx, sizeof(quadVerts));
+    if (!vertBuf) {
+        return;
+    }
+    vertBuf->upload(quadVerts, sizeof(quadVerts));
+
+    VulkanPushConstants pc{};
+    const QMatrix4x4 mvp = viewport.projectionMatrix();
+    memcpy(pc.mvp, mvp.constData(), sizeof(pc.mvp));
+    pc.textureMatrix[0] = pc.textureMatrix[5] = pc.textureMatrix[10] = pc.textureMatrix[15] = 1.0f;
+
+    VulkanUniforms uniforms{};
+    uniforms.opacity = 1.0f;
+    uniforms.brightness = 1.0f;
+    uniforms.saturation = 1.0f;
+
+    const ColorDescription srcColor = ColorDescription::sRGB;
+    const ColorDescription dstColor = renderTarget.colorDescription();
+    const QMatrix4x4 colorimetryTransform = srcColor.toOther(dstColor, RenderingIntent::Perceptual);
+    memcpy(uniforms.colorimetryTransform, colorimetryTransform.data(), sizeof(uniforms.colorimetryTransform));
+    uniforms.sourceTransferFunction = srcColor.transferFunction().type;
+    uniforms.sourceTransferParams[0] = srcColor.transferFunction().minLuminance;
+    uniforms.sourceTransferParams[1] = srcColor.transferFunction().maxLuminance - srcColor.transferFunction().minLuminance;
+    uniforms.sourceReferenceLuminance = srcColor.referenceLuminance();
+    uniforms.destTransferFunction = dstColor.transferFunction().type;
+    uniforms.destTransferParams[0] = dstColor.transferFunction().minLuminance;
+    uniforms.destTransferParams[1] = dstColor.transferFunction().maxLuminance - dstColor.transferFunction().minLuminance;
+    uniforms.destReferenceLuminance = dstColor.referenceLuminance();
+    uniforms.maxDestLuminance = dstColor.maxHdrLuminance().value_or(10000.0f);
+    uniforms.maxTonemappingLuminance = dstColor.referenceLuminance();
+
+    const QMatrix4x4 destToLMS = dstColor.containerColorimetry().toLMS();
+    const QMatrix4x4 lmsToDest = dstColor.containerColorimetry().fromLMS();
+    memcpy(uniforms.destToLMS, destToLMS.data(), sizeof(uniforms.destToLMS));
+    memcpy(uniforms.lmsToDest, lmsToDest.data(), sizeof(uniforms.lmsToDest));
+
+    const auto toXYZ = dstColor.containerColorimetry().toXYZ();
+    uniforms.primaryBrightness[0] = toXYZ(1, 0);
+    uniforms.primaryBrightness[1] = toXYZ(1, 1);
+    uniforms.primaryBrightness[2] = toXYZ(1, 2);
+
+    auto uboBuf = VulkanBuffer::createUniformBuffer(ctx, sizeof(VulkanUniforms));
+    if (!uboBuf) {
+        return;
+    }
+    uboBuf->upload(&uniforms, sizeof(uniforms));
+
+    VkDescriptorSet ds = ctx->allocateDescriptorSet(pipeline->descriptorSetLayout());
+    if (ds == VK_NULL_HANDLE) {
+        return;
+    }
+
+    const VkDescriptorImageInfo imgInfo{tex->sampler(), tex->imageView(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    const std::array<VkDescriptorImageInfo, 4> imageInfos{imgInfo, imgInfo, imgInfo, imgInfo};
+    VkDescriptorBufferInfo bufInfo{};
+    bufInfo.buffer = uboBuf->buffer();
+    bufInfo.offset = 0;
+    bufInfo.range = sizeof(VulkanUniforms);
+
+    std::array<VkWriteDescriptorSet, 2> writes{};
+    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[0].dstSet = ds;
+    writes[0].dstBinding = 0;
+    writes[0].descriptorCount = 4;
+    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[0].pImageInfo = imageInfos.data();
+    writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[1].dstSet = ds;
+    writes[1].dstBinding = 1;
+    writes[1].descriptorCount = 1;
+    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    writes[1].pBufferInfo = &bufInfo;
+    vkUpdateDescriptorSets(ctx->backend()->device(), 2, writes.data(), 0, nullptr);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->pipeline());
+    vkCmdPushConstants(cmd, pipeline->layout(),
+                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                       0, sizeof(VulkanPushConstants), &pc);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->layout(), 0, 1, &ds, 0, nullptr);
+
+    const VkBuffer vb = vertBuf->buffer();
+    const VkDeviceSize vbOffset = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &vbOffset);
+    vkCmdDraw(cmd, 6, 1, 0, 0);
+}
+#endif
 
 } // namespace
 

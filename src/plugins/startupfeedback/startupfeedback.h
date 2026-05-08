@@ -8,6 +8,7 @@
 */
 
 #pragma once
+#include "config-kwin.h"
 #include "effect/effect.h"
 #include <KConfigWatcher>
 
@@ -23,6 +24,9 @@ namespace KWin
 
 class GLShader;
 class GLTexture;
+#if HAVE_VULKAN
+class VulkanTexture;
+#endif
 
 class StartupFeedbackEffect
     : public Effect
@@ -77,6 +81,9 @@ private:
     void prepareTextures(const QPixmap &pix, qreal devicePixelRatio);
     QRect feedbackRect() const;
     QSize feedbackIconSize() const;
+#if HAVE_VULKAN
+    void paintVulkan(const RenderTarget &renderTarget, const RenderViewport &viewport);
+#endif
 
     qreal m_bounceSizesRatio;
     KStartupInfo *m_startupInfo;
@@ -96,5 +103,9 @@ private:
     KConfigWatcher::Ptr m_configWatcher;
     bool m_splashVisible;
     std::chrono::seconds m_timeout;
+#if HAVE_VULKAN
+    std::unique_ptr<VulkanTexture> m_vkBouncingTextures[5];
+    std::unique_ptr<VulkanTexture> m_vkTexture;
+#endif
 };
 } // namespace
