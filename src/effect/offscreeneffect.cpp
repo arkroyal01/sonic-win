@@ -108,6 +108,7 @@ struct VulkanOffscreenData : public OffscreenData
     float m_saturation = 1.0f;
 
     void setShader(VulkanPipeline *pipeline);
+    void setShader(VulkanPipeline *pipeline, float brightness, float saturation);
 };
 
 class OffscreenEffectPrivate
@@ -203,6 +204,14 @@ void OffscreenEffect::setPipeline(EffectWindow *window, VulkanPipeline *pipeline
     if (const auto it = d->windows.find(window); it != d->windows.end()) {
         auto *vulkanData = static_cast<VulkanOffscreenData *>(it->second.get());
         vulkanData->setShader(pipeline);
+    }
+}
+
+void OffscreenEffect::setPipeline(EffectWindow *window, VulkanPipeline *pipeline, float brightness, float saturation)
+{
+    if (const auto it = d->windows.find(window); it != d->windows.end()) {
+        auto *vulkanData = static_cast<VulkanOffscreenData *>(it->second.get());
+        vulkanData->setShader(pipeline, brightness, saturation);
     }
 }
 
@@ -391,6 +400,13 @@ void VulkanOffscreenData::setVertexSnappingMode(RenderGeometry::VertexSnappingMo
 void VulkanOffscreenData::setShader(VulkanPipeline *pipeline)
 {
     m_pipeline = pipeline;
+}
+
+void VulkanOffscreenData::setShader(VulkanPipeline *pipeline, float brightness, float saturation)
+{
+    m_pipeline = pipeline;
+    m_brightness = brightness;
+    m_saturation = saturation;
 }
 
 void VulkanOffscreenData::paint(const RenderTarget &renderTarget, const RenderViewport &viewport, EffectWindow *window, const QRegion &region,
