@@ -142,6 +142,7 @@ private:
     VulkanContext *m_context;
 
     VkCommandBuffer m_currentCommandBuffer = VK_NULL_HANDLE;
+    VkCommandBuffer m_prevCommandBuffer = VK_NULL_HANDLE; // freed at the start of the next beginFrame()
     VulkanFramebuffer *m_currentFramebuffer = nullptr;
     QMatrix4x4 m_currentProjection;
 

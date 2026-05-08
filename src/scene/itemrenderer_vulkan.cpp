@@ -71,6 +71,12 @@ ItemRendererVulkan::~ItemRendererVulkan()
     if (m_context) {
         m_context->makeCurrent();
     }
+    if (m_prevCommandBuffer != VK_NULL_HANDLE) {
+        m_context->freeCommandBuffer(m_prevCommandBuffer);
+    }
+    if (m_currentCommandBuffer != VK_NULL_HANDLE) {
+        m_context->freeCommandBuffer(m_currentCommandBuffer);
+    }
     m_uniformBuffer.reset();
 }
 
@@ -84,6 +90,14 @@ void ItemRendererVulkan::beginFrame(const RenderTarget &renderTarget, const Rend
     if (!m_context->makeCurrent()) {
         qCWarning(KWIN_CORE) << "Failed to make Vulkan context current";
         return;
+    }
+
+    // Free the previous frame's command buffer.
+    // doBeginFrame() calls swapchain->waitForFence() before invoking beginFrame(), so the
+    // GPU is guaranteed to have finished using m_prevCommandBuffer by the time we get here.
+    if (m_prevCommandBuffer != VK_NULL_HANDLE) {
+        m_context->freeCommandBuffer(m_prevCommandBuffer);
+        m_prevCommandBuffer = VK_NULL_HANDLE;
     }
 
     // Clean up any pending resources from previous frames (samplers that were in use)
@@ -241,6 +255,7 @@ void ItemRendererVulkan::endFrame()
         VkResult result = vkQueueSubmit(m_backend->graphicsQueue(), 1, &submitInfo, fence);
         if (result != VK_SUCCESS) {
             qCWarning(KWIN_CORE) << "Failed to submit command buffer with GPU-GPU sync:" << result;
+            m_context->freeCommandBuffer(m_currentCommandBuffer);
             m_currentCommandBuffer = VK_NULL_HANDLE;
             m_currentFramebuffer = nullptr;
             m_currentSyncInfo = VulkanSyncInfo{};
@@ -309,7 +324,10 @@ void ItemRendererVulkan::endFrame()
                         qCDebug(KWIN_CORE) << "ItemRendererVulkan::endFrame() - non-blocking sync with export fence";
                     }
                     m_releasePoints.clear();
+                    // Wait for the fence so the command buffer is safe to free immediately.
+                    vkWaitForFences(m_backend->device(), 1, &exportableFence, VK_TRUE, UINT64_MAX);
                     vkDestroyFence(m_backend->device(), exportableFence, nullptr);
+                    m_context->freeCommandBuffer(m_currentCommandBuffer);
                     m_currentCommandBuffer = VK_NULL_HANDLE;
                     m_currentFramebuffer = nullptr;
                     m_currentSyncInfo = VulkanSyncInfo{};
@@ -326,6 +344,7 @@ void ItemRendererVulkan::endFrame()
         VkResult result = vkQueueSubmit(m_backend->graphicsQueue(), 1, &submitInfo, fence);
         if (result != VK_SUCCESS) {
             qCWarning(KWIN_CORE) << "Failed to submit command buffer:" << result;
+            m_context->freeCommandBuffer(m_currentCommandBuffer);
             m_currentCommandBuffer = VK_NULL_HANDLE;
             m_currentFramebuffer = nullptr;
             m_currentSyncInfo = VulkanSyncInfo{};
@@ -334,6 +353,13 @@ void ItemRendererVulkan::endFrame()
         qCDebug(KWIN_CORE) << "Successfully submitted command buffer without blocking";
         m_releasePoints.clear();
 
+        // Wait for the fence so the command buffer can be freed immediately rather than
+        // leaking via m_prevCommandBuffer (the fallback path has no guarantee that
+        // doBeginFrame will wait for this specific fence next frame).
+        vkWaitForFences(m_backend->device(), 1, &fence, VK_TRUE, UINT64_MAX);
+        m_context->freeCommandBuffer(m_currentCommandBuffer);
+        m_currentCommandBuffer = VK_NULL_HANDLE;
+
         qCDebug(KWIN_CORE) << "ItemRendererVulkan::endFrame() - non-blocking sync (optimized fallback)";
 
         // Descriptor sets will be freed when the descriptor pool is reset at the start
@@ -341,6 +367,9 @@ void ItemRendererVulkan::endFrame()
         m_frameDescriptorSets.clear();
     }
 
+    // Defer freeing to the start of the next beginFrame(), where doBeginFrame() has
+    // already waited for the inFlightFence, guaranteeing the GPU is done with this buffer.
+    m_prevCommandBuffer = m_currentCommandBuffer;
     m_currentCommandBuffer = VK_NULL_HANDLE;
     m_currentFramebuffer = nullptr;
     m_currentSyncInfo = VulkanSyncInfo{};
