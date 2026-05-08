@@ -11,11 +11,13 @@
 // KConfigSkeleton
 #include "mouseclickconfig.h"
 
+#include "config-kwin.h"
 #include "core/inputdevice.h"
 #include "core/rendertarget.h"
 #include "core/renderviewport.h"
 #include "effect/effecthandler.h"
 #include "input_event.h"
+#include "scene/workspacescene.h"
 
 #include <QAction>
 
@@ -25,6 +27,18 @@
 #include <QPainter>
 
 #include <cmath>
+
+#if HAVE_VULKAN
+#include "platformsupport/scenes/vulkan/vulkanbackend.h"
+#include "platformsupport/scenes/vulkan/vulkanbuffer.h"
+#include "platformsupport/scenes/vulkan/vulkancontext.h"
+#include "platformsupport/scenes/vulkan/vulkanpipeline.h"
+#include "platformsupport/scenes/vulkan/vulkanpipelinemanager.h"
+#include "platformsupport/scenes/vulkan/vulkantexture.h"
+#include "scene/itemrenderer_vulkan.h"
+#include <array>
+#include <vulkan/vulkan.h>
+#endif
 
 namespace KWin
 {
@@ -255,6 +269,11 @@ void MouseClickEffect::drawCircle(const RenderViewport &viewport, const QColor &
     if (effects->isOpenGLCompositing()) {
         drawCircleGl(viewport, color, cx, cy, r);
     }
+#if HAVE_VULKAN
+    else if (effects->isVulkanCompositing()) {
+        drawCircleVulkan(viewport, color, cx, cy, r);
+    }
+#endif
 }
 
 void MouseClickEffect::drawCircleGl(const RenderViewport &viewport, const QColor &color, float cx, float cy, float r)
@@ -338,6 +357,142 @@ TabletToolEvent &MouseClickEffect::getOrCreateTabletPoint(InputDeviceTabletTool 
     }
     return point;
 }
+
+#if HAVE_VULKAN
+void MouseClickEffect::drawCircleVulkan(const RenderViewport &viewport, const QColor &color, float cx, float cy, float r)
+{
+    VulkanContext *ctx = VulkanContext::currentContext();
+    if (!ctx) {
+        return;
+    }
+    auto *vkRenderer = dynamic_cast<ItemRendererVulkan *>(effects->scene()->renderer());
+    if (!vkRenderer) {
+        return;
+    }
+    VkCommandBuffer cmd = vkRenderer->currentCommandBuffer();
+    if (cmd == VK_NULL_HANDLE) {
+        return;
+    }
+    VulkanTexture *whiteTex = vkRenderer->defaultWhiteTexture();
+    if (!whiteTex || !whiteTex->isValid()) {
+        return;
+    }
+    VulkanPipeline *pipeline = ctx->pipelineManager()->pipeline(VulkanShaderTrait::UniformColor);
+    if (!pipeline || !pipeline->isValid()) {
+        return;
+    }
+
+    // Tessellate the circle outline as 80 thin quads (one per segment).
+    // Each quad is two triangles with half-width = lineWidth/2 perpendicular to the segment.
+    static const int kSegments = 80;
+    static const float kTheta = 2.0f * M_PI / kSegments;
+    const float scale = viewport.scale();
+    const float halfW = m_lineWidth * 0.5f;
+
+    QList<VulkanVertex2D> verts;
+    verts.reserve(kSegments * 6);
+
+    float px = cx + r, py = cy; // previous point
+    for (int i = 1; i <= kSegments; ++i) {
+        const float angle = kTheta * i;
+        const float qx = cx + r * std::cos(angle);
+        const float qy = cy + r * std::sin(angle);
+
+        // Segment direction and perpendicular normal
+        const float dx = qx - px, dy = qy - py;
+        const float len = std::sqrt(dx * dx + dy * dy);
+        if (len < 1e-6f) {
+            px = qx;
+            py = qy;
+            continue;
+        }
+        const float nx = -dy / len * halfW, ny = dx / len * halfW;
+
+        // Quad corners (in logical pixels, scaled to device pixels)
+        const float ax = (px - nx) * scale, ay = (py - ny) * scale;
+        const float bx = (px + nx) * scale, by = (py + ny) * scale;
+        const float cx2 = (qx - nx) * scale, cy2 = (qy - ny) * scale;
+        const float dx2 = (qx + nx) * scale, dy2 = (qy + ny) * scale;
+
+        verts.push_back({{ax, ay}, {0.0f, 0.0f}});
+        verts.push_back({{bx, by}, {0.0f, 1.0f}});
+        verts.push_back({{cx2, cy2}, {1.0f, 0.0f}});
+        verts.push_back({{bx, by}, {0.0f, 1.0f}});
+        verts.push_back({{dx2, dy2}, {1.0f, 1.0f}});
+        verts.push_back({{cx2, cy2}, {1.0f, 0.0f}});
+
+        px = qx;
+        py = qy;
+    }
+
+    auto vertBuf = VulkanBuffer::createStreamingBuffer(ctx, verts.size() * sizeof(VulkanVertex2D));
+    if (!vertBuf) {
+        return;
+    }
+    vertBuf->upload(verts.constData(), verts.size() * sizeof(VulkanVertex2D));
+
+    VulkanPushConstants pc{};
+    const QMatrix4x4 mvp = viewport.projectionMatrix();
+    memcpy(pc.mvp, mvp.constData(), sizeof(pc.mvp));
+    pc.textureMatrix[0] = pc.textureMatrix[5] = pc.textureMatrix[10] = pc.textureMatrix[15] = 1.0f;
+
+    // Premultiplied RGBA for the UniformColor pipeline
+    VulkanUniforms ubo{};
+    const float alpha = color.alphaF();
+    ubo.uniformColor[0] = color.redF() * alpha;
+    ubo.uniformColor[1] = color.greenF() * alpha;
+    ubo.uniformColor[2] = color.blueF() * alpha;
+    ubo.uniformColor[3] = alpha;
+    ubo.opacity = 1.0f;
+    ubo.brightness = 1.0f;
+    ubo.saturation = 1.0f;
+
+    auto uboBuf = VulkanBuffer::createUniformBuffer(ctx, sizeof(VulkanUniforms));
+    if (!uboBuf) {
+        return;
+    }
+    uboBuf->upload(&ubo, sizeof(ubo));
+
+    VkDescriptorSet ds = ctx->allocateDescriptorSet(pipeline->descriptorSetLayout());
+    if (ds == VK_NULL_HANDLE) {
+        return;
+    }
+
+    const VkDescriptorImageInfo imgInfo{whiteTex->sampler(), whiteTex->imageView(),
+                                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    const std::array<VkDescriptorImageInfo, 4> imageInfos{imgInfo, imgInfo, imgInfo, imgInfo};
+    VkDescriptorBufferInfo bufInfo{};
+    bufInfo.buffer = uboBuf->buffer();
+    bufInfo.offset = 0;
+    bufInfo.range = sizeof(VulkanUniforms);
+
+    std::array<VkWriteDescriptorSet, 2> writes{};
+    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[0].dstSet = ds;
+    writes[0].dstBinding = 0;
+    writes[0].descriptorCount = 4;
+    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[0].pImageInfo = imageInfos.data();
+    writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[1].dstSet = ds;
+    writes[1].dstBinding = 1;
+    writes[1].descriptorCount = 1;
+    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    writes[1].pBufferInfo = &bufInfo;
+    vkUpdateDescriptorSets(ctx->backend()->device(), 2, writes.data(), 0, nullptr);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->pipeline());
+    vkCmdPushConstants(cmd, pipeline->layout(),
+                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                       0, sizeof(VulkanPushConstants), &pc);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->layout(), 0, 1, &ds, 0, nullptr);
+
+    const VkBuffer vb = vertBuf->buffer();
+    const VkDeviceSize vbOffset = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &vbOffset);
+    vkCmdDraw(cmd, verts.size(), 1, 0, 0);
+}
+#endif
 
 bool MouseClickEffect::tabletToolProximity(TabletToolProximityEvent *event)
 {

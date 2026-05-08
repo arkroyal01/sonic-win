@@ -128,6 +128,11 @@ public:
     size_t vertexBufferOffset() const { return m_vertexBufferOffset; }
     void setVertexBufferOffset(size_t offset) { m_vertexBufferOffset = offset; }
 
+    VulkanTexture *defaultWhiteTexture() const
+    {
+        return m_defaultWhiteTexture.get();
+    }
+
 private:
     QVector4D modulate(float opacity, float brightness) const;
     void createRenderNode(Item *item, RenderContext *context);
