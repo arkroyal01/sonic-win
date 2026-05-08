@@ -291,6 +291,91 @@ GLShader *ZoomEffect::shaderForZoom(double zoom)
 
 void ZoomEffect::paintScreen(const RenderTarget &renderTarget, const RenderViewport &viewport, int mask, const QRegion &region, Output *screen)
 {
+#if HAVE_VULKAN
+    if (effects->isVulkanCompositing()) {
+        const QSize screenSize = effects->virtualScreenSize();
+        const qreal scale = viewport.scale();
+        const QRectF &viewportRect = viewport.renderRect();
+
+        qreal xTranslation = 0;
+        qreal yTranslation = 0;
+        switch (m_mouseTracking) {
+        case MouseTrackingProportional:
+            xTranslation = -int(m_cursorPoint.x() * (m_zoom - 1.0));
+            yTranslation = -int(m_cursorPoint.y() * (m_zoom - 1.0));
+            m_prevPoint = m_cursorPoint;
+            break;
+        case MouseTrackingCentered:
+            m_prevPoint = m_cursorPoint;
+            // fall through
+        case MouseTrackingDisabled:
+            xTranslation = std::min(0, std::max(int(screenSize.width() - screenSize.width() * m_zoom), int(screenSize.width() / 2 - m_prevPoint.x() * m_zoom)));
+            yTranslation = std::min(0, std::max(int(screenSize.height() - screenSize.height() * m_zoom), int(screenSize.height() / 2 - m_prevPoint.y() * m_zoom)));
+            break;
+        case MouseTrackingPush: {
+            const int x = m_cursorPoint.x() * m_zoom - m_prevPoint.x() * (m_zoom - 1.0);
+            const int y = m_cursorPoint.y() * m_zoom - m_prevPoint.y() * (m_zoom - 1.0);
+            const int threshold = 4;
+            const QRectF currScreen = effects->screenAt(QPoint(x, y))->geometry();
+            const int screenTop = currScreen.top();
+            const int screenLeft = currScreen.left();
+            const int screenRight = currScreen.right();
+            const int screenBottom = currScreen.bottom();
+            const int screenCenterX = currScreen.center().x();
+            const int screenCenterY = currScreen.center().y();
+            const bool adjacentLeft = screenExistsAt(QPoint(screenLeft - 1, screenCenterY));
+            const bool adjacentRight = screenExistsAt(QPoint(screenRight + 1, screenCenterY));
+            const bool adjacentTop = screenExistsAt(QPoint(screenCenterX, screenTop - 1));
+            const bool adjacentBottom = screenExistsAt(QPoint(screenCenterX, screenBottom + 1));
+            m_xMove = m_yMove = 0;
+            if (x < screenLeft + threshold && !adjacentLeft) {
+                m_xMove = (x - threshold - screenLeft) / m_zoom;
+            } else if (x > screenRight - threshold && !adjacentRight) {
+                m_xMove = (x + threshold - screenRight) / m_zoom;
+            }
+            if (y < screenTop + threshold && !adjacentTop) {
+                m_yMove = (y - threshold - screenTop) / m_zoom;
+            } else if (y > screenBottom - threshold && !adjacentBottom) {
+                m_yMove = (y + threshold - screenBottom) / m_zoom;
+            }
+            if (m_xMove) {
+                m_prevPoint.setX(m_prevPoint.x() + m_xMove);
+            }
+            if (m_yMove) {
+                m_prevPoint.setY(m_prevPoint.y() + m_yMove);
+            }
+            xTranslation = -int(m_prevPoint.x() * (m_zoom - 1.0));
+            yTranslation = -int(m_prevPoint.y() * (m_zoom - 1.0));
+            break;
+        }
+        }
+
+        if (isFocusTrackingEnabled() || isTextCaretTrackingEnabled()) {
+            bool acceptFocus = true;
+            if (m_mouseTracking != MouseTrackingDisabled && m_focusDelay > 0) {
+                const int msecs = m_lastMouseEvent.msecsTo(m_lastFocusEvent);
+                acceptFocus = msecs > m_focusDelay;
+            }
+            if (acceptFocus) {
+                xTranslation = -int(m_focusPoint.x() * (m_zoom - 1.0));
+                yTranslation = -int(m_focusPoint.y() * (m_zoom - 1.0));
+                m_prevPoint = m_focusPoint;
+            }
+        }
+
+        // Zoom by shrinking the visible logical rect by m_zoom and adjusting the scale.
+        // The projection matrix then maps this smaller visible area to fill the full display.
+        QRectF visibleRect(
+            viewportRect.x() - xTranslation / m_zoom,
+            viewportRect.y() - yTranslation / m_zoom,
+            viewportRect.width() / m_zoom,
+            viewportRect.height() / m_zoom);
+        RenderViewport zoomedViewport(visibleRect, scale * m_zoom, renderTarget);
+        effects->paintScreen(renderTarget, zoomedViewport, mask, region, screen);
+        return;
+    }
+#endif
+
     OffscreenData *offscreenData = ensureOffscreenData(renderTarget, viewport, screen);
     if (!offscreenData) {
         return;
@@ -589,7 +674,9 @@ void ZoomEffect::slotWindowDamaged()
 void ZoomEffect::slotScreenRemoved(Output *screen)
 {
     if (auto it = m_offscreenData.find(screen); it != m_offscreenData.end()) {
-        effects->makeOpenGLContextCurrent();
+        if (effects->isOpenGLCompositing()) {
+            effects->makeOpenGLContextCurrent();
+        }
         m_offscreenData.erase(it);
     }
 }
@@ -606,7 +693,7 @@ void ZoomEffect::moveFocus(const QPoint &point)
 
 bool ZoomEffect::supported()
 {
-    return effects->isOpenGLCompositing();
+    return effects->isOpenGLCompositing() || effects->isVulkanCompositing();
 }
 
 bool ZoomEffect::isActive() const
