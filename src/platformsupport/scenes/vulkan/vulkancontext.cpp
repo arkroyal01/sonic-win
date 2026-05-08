@@ -1245,4 +1245,83 @@ bool VulkanContext::supportsExternalFenceFd() const
     return m_backend->supportsExternalFenceFd();
 }
 
+QImage VulkanContext::readTextureToImage(VulkanTexture *texture, const QRect &rect)
+{
+    if (!texture || !texture->isValid()) {
+        return {};
+    }
+
+    const QRect region = rect.isEmpty() ? QRect(QPoint(0, 0), texture->size()) : rect;
+    const int w = region.width();
+    const int h = region.height();
+    if (w <= 0 || h <= 0) {
+        return {};
+    }
+
+    const VkDeviceSize bufferSize = VkDeviceSize(w) * h * 4; // RGBA8 = 4 bytes/pixel
+    auto staging = VulkanBuffer::createStagingBuffer(this, bufferSize);
+    if (!staging) {
+        qCWarning(KWIN_VULKAN) << "readTextureToImage: failed to create staging buffer";
+        return {};
+    }
+
+    VkCommandBuffer cmd = beginSingleTimeCommands();
+    if (cmd == VK_NULL_HANDLE) {
+        return {};
+    }
+
+    // Transition from SHADER_READ_ONLY_OPTIMAL to TRANSFER_SRC_OPTIMAL
+    VkImageMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = texture->image();
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    // Copy image region to staging buffer
+    VkBufferImageCopy copyRegion{};
+    copyRegion.bufferOffset = 0;
+    copyRegion.bufferRowLength = 0; // tightly packed
+    copyRegion.bufferImageHeight = 0; // tightly packed
+    copyRegion.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copyRegion.imageOffset = {region.x(), region.y(), 0};
+    copyRegion.imageExtent = {uint32_t(w), uint32_t(h), 1};
+    vkCmdCopyImageToBuffer(cmd, texture->image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           staging->buffer(), 1, &copyRegion);
+
+    // Transition back to SHADER_READ_ONLY_OPTIMAL
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    endSingleTimeCommands(cmd); // blocks until GPU idle
+
+    // Determine QImage format from texture format
+    const bool isBGRA = (texture->format() == VK_FORMAT_B8G8R8A8_SRGB
+                         || texture->format() == VK_FORMAT_B8G8R8A8_UNORM);
+    const QImage::Format imgFormat = isBGRA
+        ? QImage::Format_ARGB32_Premultiplied // BGRA in memory = ARGB32 in Qt
+        : QImage::Format_RGBA8888_Premultiplied;
+
+    QImage img(w, h, imgFormat);
+    const void *mapped = staging->map();
+    if (!mapped) {
+        qCWarning(KWIN_VULKAN) << "readTextureToImage: failed to map staging buffer";
+        return {};
+    }
+    memcpy(img.bits(), mapped, bufferSize);
+    staging->unmap();
+
+    return img;
+}
+
 } // namespace KWin

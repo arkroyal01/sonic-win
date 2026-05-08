@@ -11,6 +11,9 @@
 #include "screenshot.h"
 #include "screenshotdbusinterface2.h"
 
+#include "config-kwin.h"
+
+#include "compositor.h"
 #include "core/output.h"
 #include "core/pixelgrid.h"
 #include "core/rendertarget.h"
@@ -18,6 +21,17 @@
 #include "effect/effecthandler.h"
 #include "opengl/glplatform.h"
 #include "opengl/glutils.h"
+
+#if HAVE_VULKAN
+#include "platformsupport/scenes/vulkan/vulkanbackend.h"
+#include "platformsupport/scenes/vulkan/vulkancontext.h"
+#include "platformsupport/scenes/vulkan/vulkanframebuffer.h"
+#include "platformsupport/scenes/vulkan/vulkanrenderpass.h"
+#include "platformsupport/scenes/vulkan/vulkanrendertarget.h"
+#include "scene/itemrenderer_vulkan.h"
+#include "scene/workspacescene_vulkan.h"
+#include <vulkan/vulkan.h>
+#endif
 
 #include <QPainter>
 
@@ -85,7 +99,7 @@ static void convertFromGLImage(QImage &img, int w, int h, const OutputTransform 
 
 bool ScreenShotEffect::supported()
 {
-    return effects->isOpenGLCompositing();
+    return effects->isOpenGLCompositing() || effects->isVulkanCompositing();
 }
 
 ScreenShotEffect::ScreenShotEffect()
@@ -279,6 +293,65 @@ void ScreenShotEffect::takeScreenShot(ScreenShotWindowData *screenshot)
             GLFramebuffer::popFramebuffer();
             convertFromGLImage(img, img.width(), img.height(), renderTarget.transform());
         }
+#if HAVE_VULKAN
+        else if (effects->isVulkanCompositing()) {
+            VulkanContext *ctx = VulkanContext::currentContext();
+            if (ctx) {
+                const VkFormat fmt = ctx->backend()->colorFormat();
+                auto rp = VulkanRenderPass::createForOffscreen(ctx, fmt, false);
+                auto fbo = rp ? VulkanFramebuffer::createWithTexture(ctx, rp.get(), scaledGeometry.size(), fmt) : nullptr;
+                if (fbo && fbo->isValid()) {
+                    VkCommandBuffer cmd = ctx->beginSingleTimeCommands();
+                    if (cmd != VK_NULL_HANDLE) {
+                        auto vkRT = std::make_unique<VulkanRenderTarget>(fbo.get());
+                        vkRT->setCommandBuffer(cmd);
+                        RenderTarget offscreenRT(vkRT.get());
+                        RenderViewport viewport(geometry, devicePixelRatio, offscreenRT);
+
+                        VkClearValue clearVal{};
+                        VkRect2D area{{0, 0}, {uint32_t(scaledGeometry.width()), uint32_t(scaledGeometry.height())}};
+                        rp->begin(cmd, fbo->framebuffer(), area, &clearVal, 1);
+
+                        VkViewport vp{};
+                        vp.x = 0.0f;
+                        vp.y = float(scaledGeometry.height());
+                        vp.width = float(scaledGeometry.width());
+                        vp.height = -float(scaledGeometry.height());
+                        vp.minDepth = 0.0f;
+                        vp.maxDepth = 1.0f;
+                        vkCmdSetViewport(cmd, 0, 1, &vp);
+                        VkRect2D scissor{{0, 0}, {uint32_t(scaledGeometry.width()), uint32_t(scaledGeometry.height())}};
+                        vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+                        // Save/restore vertex buffer offset: drawWindow() advances the shared
+                        // streaming buffer. endSingleTimeCommands() calls vkQueueWaitIdle so
+                        // the GPU finishes before we restore, making the region safe to reuse.
+                        auto *vkScene = dynamic_cast<WorkspaceSceneVulkan *>(Compositor::self()->scene());
+                        auto *vkRenderer = vkScene ? static_cast<ItemRendererVulkan *>(vkScene->renderer()) : nullptr;
+                        const size_t savedOffset = vkRenderer ? vkRenderer->vertexBufferOffset() : 0;
+
+                        WindowPaintData d;
+                        effects->drawWindow(offscreenRT, viewport, window, mask, infiniteRegion(), d);
+
+                        if (vkRenderer) {
+                            vkRenderer->setVertexBufferOffset(savedOffset);
+                        }
+
+                        rp->end(cmd);
+                        if (VulkanTexture *tex = fbo->colorTexture()) {
+                            tex->setCurrentLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                        }
+                        ctx->endSingleTimeCommands(cmd); // blocks until GPU idle
+
+                        if (VulkanTexture *tex = fbo->colorTexture()) {
+                            img = ctx->readTextureToImage(tex);
+                            img.setDevicePixelRatio(devicePixelRatio);
+                        }
+                    }
+                }
+            }
+        }
+#endif
 
         if (screenshot->flags & ScreenShotIncludeCursor) {
             grabPointerImage(img, geometry.x(), geometry.y());

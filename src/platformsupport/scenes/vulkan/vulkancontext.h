@@ -11,6 +11,8 @@
 #include "kwin_export.h"
 #include "utils/filedescriptor.h"
 
+#include <QImage>
+#include <QRect>
 #include <QSize>
 #include <QStack>
 #include <QVector>
@@ -120,6 +122,19 @@ public:
      * @brief End and submit a single-time command buffer.
      */
     void endSingleTimeCommands(VkCommandBuffer commandBuffer);
+
+    /**
+     * @brief Read a region of a texture into a QImage (blocking).
+     *
+     * The texture must be in VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL.
+     * Uses a staging buffer and vkQueueWaitIdle — intended for one-shot
+     * screenshot readback, not per-frame use.
+     *
+     * @param texture  The texture to read from.
+     * @param rect     The region to read (in texel coordinates). Empty = full texture.
+     * @return         RGBA8 QImage, or a null QImage on failure.
+     */
+    QImage readTextureToImage(VulkanTexture *texture, const QRect &rect = QRect());
 
     /**
      * @brief Allocate a descriptor set from the descriptor pool.
