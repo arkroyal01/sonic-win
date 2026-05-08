@@ -175,6 +175,12 @@ public:
     static VulkanContext *currentContext();
 
     /**
+     * @brief Convert a DRM fourcc format to the corresponding Vulkan format.
+     * Returns VK_FORMAT_UNDEFINED for unknown formats.
+     */
+    static VkFormat drmFormatToVkFormat(uint32_t drmFormat);
+
+    /**
      * @brief Get or create a fence for synchronization.
      */
     VkFence getOrCreateFence();

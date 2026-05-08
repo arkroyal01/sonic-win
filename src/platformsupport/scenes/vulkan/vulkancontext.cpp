@@ -25,8 +25,7 @@
 namespace KWin
 {
 
-// Convert DRM format to Vulkan format
-static VkFormat drmFormatToVkFormat(uint32_t drmFormat)
+VkFormat VulkanContext::drmFormatToVkFormat(uint32_t drmFormat)
 {
     switch (drmFormat) {
     case DRM_FORMAT_ARGB8888:

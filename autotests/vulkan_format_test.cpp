@@ -13,263 +13,126 @@
 #include "config-kwin.h"
 
 #if HAVE_VULKAN
+#include "platformsupport/scenes/vulkan/vulkancontext.h"
+#include "platformsupport/scenes/vulkan/vulkantexture.h"
 #include <libdrm/drm_fourcc.h>
 #include <vulkan/vulkan.h>
 #endif
 
+using namespace KWin;
+
 /**
- * @brief Tests for Vulkan format conversions and related utilities.
+ * @brief Tests for Vulkan format conversion functions.
  *
- * These tests verify format conversion logic that is critical for
- * proper texture handling in the Vulkan backend.
+ * These tests call the real production functions directly.
+ * A test failure here means the production mapping changed and the caller
+ * (surface texture import, DMA-BUF import, or offscreen rendering) may be broken.
  */
 class VulkanFormatTest : public QObject
 {
     Q_OBJECT
 
 private Q_SLOTS:
-    void testDepthToDrmFormat_data();
-    void testDepthToDrmFormat();
     void testDrmFormatToVkFormat_data();
     void testDrmFormatToVkFormat();
-    void testQImageFormatMapping_data();
-    void testQImageFormatMapping();
-    void testFormatHasAlpha_data();
-    void testFormatHasAlpha();
+    void testQImageFormatToVkFormat_data();
+    void testQImageFormatToVkFormat();
 };
 
 #if HAVE_VULKAN
-
-// Re-implement the format conversion functions for testing
-// (These mirror the implementations in vulkansurfacetexture_x11.cpp and vulkantexture.cpp)
-
-static uint32_t depthToDrmFormat(uint8_t depth)
-{
-    switch (depth) {
-    case 32:
-        return DRM_FORMAT_ARGB8888;
-    case 24:
-        return DRM_FORMAT_XRGB8888;
-    case 30:
-        return DRM_FORMAT_XRGB2101010;
-    case 16:
-        return DRM_FORMAT_RGB565;
-    default:
-        return 0;
-    }
-}
-
-static VkFormat drmFormatToVkFormat(uint32_t drmFormat)
-{
-    switch (drmFormat) {
-    case DRM_FORMAT_ARGB8888:
-        return VK_FORMAT_B8G8R8A8_UNORM;
-    case DRM_FORMAT_XRGB8888:
-        return VK_FORMAT_B8G8R8A8_UNORM;
-    case DRM_FORMAT_ABGR8888:
-        return VK_FORMAT_R8G8B8A8_UNORM;
-    case DRM_FORMAT_XBGR8888:
-        return VK_FORMAT_R8G8B8A8_UNORM;
-    case DRM_FORMAT_RGB888:
-        return VK_FORMAT_R8G8B8_UNORM;
-    case DRM_FORMAT_BGR888:
-        return VK_FORMAT_B8G8R8_UNORM;
-    case DRM_FORMAT_RGB565:
-        return VK_FORMAT_R5G6B5_UNORM_PACK16;
-    case DRM_FORMAT_BGR565:
-        return VK_FORMAT_B5G6R5_UNORM_PACK16;
-    case DRM_FORMAT_ARGB2101010:
-        return VK_FORMAT_A2R10G10B10_UNORM_PACK32;
-    case DRM_FORMAT_XRGB2101010:
-        return VK_FORMAT_A2R10G10B10_UNORM_PACK32;
-    case DRM_FORMAT_ABGR2101010:
-        return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
-    case DRM_FORMAT_XBGR2101010:
-        return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
-    case DRM_FORMAT_ABGR16161616F:
-        return VK_FORMAT_R16G16B16A16_SFLOAT;
-    default:
-        return VK_FORMAT_UNDEFINED;
-    }
-}
-
-static VkFormat qImageFormatToVkFormat(QImage::Format format)
-{
-    switch (format) {
-    case QImage::Format_RGBA8888:
-    case QImage::Format_RGBA8888_Premultiplied:
-        return VK_FORMAT_R8G8B8A8_UNORM;
-    case QImage::Format_RGBX8888:
-        return VK_FORMAT_R8G8B8A8_UNORM;
-    case QImage::Format_RGB888:
-        return VK_FORMAT_R8G8B8_UNORM;
-    case QImage::Format_ARGB32:
-    case QImage::Format_ARGB32_Premultiplied:
-        return VK_FORMAT_B8G8R8A8_UNORM;
-    case QImage::Format_RGB32:
-        return VK_FORMAT_B8G8R8A8_UNORM;
-    case QImage::Format_Grayscale8:
-        return VK_FORMAT_R8_UNORM;
-    case QImage::Format_Grayscale16:
-        return VK_FORMAT_R16_UNORM;
-    case QImage::Format_RGBA64:
-    case QImage::Format_RGBA64_Premultiplied:
-        return VK_FORMAT_R16G16B16A16_UNORM;
-    case QImage::Format_RGBX64:
-        return VK_FORMAT_R16G16B16A16_UNORM;
-    case QImage::Format_RGBA16FPx4:
-    case QImage::Format_RGBA16FPx4_Premultiplied:
-        return VK_FORMAT_R16G16B16A16_SFLOAT;
-    case QImage::Format_RGBA32FPx4:
-    case QImage::Format_RGBA32FPx4_Premultiplied:
-        return VK_FORMAT_R32G32B32A32_SFLOAT;
-    default:
-        return VK_FORMAT_UNDEFINED;
-    }
-}
-
-static bool vkFormatHasAlpha(VkFormat format)
-{
-    switch (format) {
-    case VK_FORMAT_R8G8B8A8_UNORM:
-    case VK_FORMAT_R8G8B8A8_SRGB:
-    case VK_FORMAT_B8G8R8A8_UNORM:
-    case VK_FORMAT_B8G8R8A8_SRGB:
-    case VK_FORMAT_A8B8G8R8_UNORM_PACK32:
-    case VK_FORMAT_R16G16B16A16_SFLOAT:
-    case VK_FORMAT_R32G32B32A32_SFLOAT:
-    case VK_FORMAT_R16G16B16A16_UNORM:
-    case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
-    case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
-        return true;
-    default:
-        return false;
-    }
-}
-
-#endif // HAVE_VULKAN
-
-void VulkanFormatTest::testDepthToDrmFormat_data()
-{
-    QTest::addColumn<int>("depth");
-    QTest::addColumn<uint32_t>("expectedFormat");
-
-#if HAVE_VULKAN
-    QTest::newRow("32-bit") << 32 << static_cast<uint32_t>(DRM_FORMAT_ARGB8888);
-    QTest::newRow("24-bit") << 24 << static_cast<uint32_t>(DRM_FORMAT_XRGB8888);
-    QTest::newRow("30-bit") << 30 << static_cast<uint32_t>(DRM_FORMAT_XRGB2101010);
-    QTest::newRow("16-bit") << 16 << static_cast<uint32_t>(DRM_FORMAT_RGB565);
-    QTest::newRow("8-bit (unsupported)") << 8 << static_cast<uint32_t>(0);
-    QTest::newRow("1-bit (unsupported)") << 1 << static_cast<uint32_t>(0);
-#endif
-}
-
-void VulkanFormatTest::testDepthToDrmFormat()
-{
-#if HAVE_VULKAN
-    QFETCH(int, depth);
-    QFETCH(uint32_t, expectedFormat);
-
-    QCOMPARE(depthToDrmFormat(static_cast<uint8_t>(depth)), expectedFormat);
-#else
-    QSKIP("Vulkan support not available");
-#endif
-}
 
 void VulkanFormatTest::testDrmFormatToVkFormat_data()
 {
     QTest::addColumn<uint32_t>("drmFormat");
     QTest::addColumn<int>("expectedVkFormat");
 
-#if HAVE_VULKAN
-    QTest::newRow("ARGB8888") << static_cast<uint32_t>(DRM_FORMAT_ARGB8888) << static_cast<int>(VK_FORMAT_B8G8R8A8_UNORM);
-    QTest::newRow("XRGB8888") << static_cast<uint32_t>(DRM_FORMAT_XRGB8888) << static_cast<int>(VK_FORMAT_B8G8R8A8_UNORM);
-    QTest::newRow("ABGR8888") << static_cast<uint32_t>(DRM_FORMAT_ABGR8888) << static_cast<int>(VK_FORMAT_R8G8B8A8_UNORM);
-    QTest::newRow("XBGR8888") << static_cast<uint32_t>(DRM_FORMAT_XBGR8888) << static_cast<int>(VK_FORMAT_R8G8B8A8_UNORM);
-    QTest::newRow("RGB888") << static_cast<uint32_t>(DRM_FORMAT_RGB888) << static_cast<int>(VK_FORMAT_R8G8B8_UNORM);
-    QTest::newRow("BGR888") << static_cast<uint32_t>(DRM_FORMAT_BGR888) << static_cast<int>(VK_FORMAT_B8G8R8_UNORM);
-    QTest::newRow("RGB565") << static_cast<uint32_t>(DRM_FORMAT_RGB565) << static_cast<int>(VK_FORMAT_R5G6B5_UNORM_PACK16);
-    QTest::newRow("ARGB2101010") << static_cast<uint32_t>(DRM_FORMAT_ARGB2101010) << static_cast<int>(VK_FORMAT_A2R10G10B10_UNORM_PACK32);
-    QTest::newRow("ABGR16161616F") << static_cast<uint32_t>(DRM_FORMAT_ABGR16161616F) << static_cast<int>(VK_FORMAT_R16G16B16A16_SFLOAT);
-    QTest::newRow("Unknown format") << static_cast<uint32_t>(0x12345678) << static_cast<int>(VK_FORMAT_UNDEFINED);
-#endif
+    // Colour formats: X11 pixmaps are sRGB-encoded, so production uses SRGB formats.
+    // If these change to UNORM, X11 window colours will be rendered with wrong gamma.
+    QTest::newRow("ARGB8888 -> SRGB") << uint32_t(DRM_FORMAT_ARGB8888) << int(VK_FORMAT_B8G8R8A8_SRGB);
+    QTest::newRow("XRGB8888 -> SRGB") << uint32_t(DRM_FORMAT_XRGB8888) << int(VK_FORMAT_B8G8R8A8_SRGB);
+    QTest::newRow("ABGR8888 -> SRGB") << uint32_t(DRM_FORMAT_ABGR8888) << int(VK_FORMAT_R8G8B8A8_SRGB);
+    QTest::newRow("XBGR8888 -> SRGB") << uint32_t(DRM_FORMAT_XBGR8888) << int(VK_FORMAT_R8G8B8A8_SRGB);
+    // RGB888/BGR888 use 4-component SRGB for driver compatibility (alpha ignored)
+    QTest::newRow("RGB888  -> B8G8R8A8_SRGB") << uint32_t(DRM_FORMAT_RGB888) << int(VK_FORMAT_R8G8B8A8_SRGB);
+    QTest::newRow("BGR888  -> R8G8B8A8_SRGB") << uint32_t(DRM_FORMAT_BGR888) << int(VK_FORMAT_B8G8R8A8_SRGB);
+    // Wide/HDR formats stay UNORM (no sRGB equivalent in standard Vulkan)
+    QTest::newRow("RGB565  -> UNORM") << uint32_t(DRM_FORMAT_RGB565) << int(VK_FORMAT_R5G6B5_UNORM_PACK16);
+    QTest::newRow("BGR565  -> UNORM") << uint32_t(DRM_FORMAT_BGR565) << int(VK_FORMAT_B5G6R5_UNORM_PACK16);
+    QTest::newRow("ARGB2101010 -> UNORM") << uint32_t(DRM_FORMAT_ARGB2101010) << int(VK_FORMAT_A2R10G10B10_UNORM_PACK32);
+    QTest::newRow("XRGB2101010 -> UNORM") << uint32_t(DRM_FORMAT_XRGB2101010) << int(VK_FORMAT_A2R10G10B10_UNORM_PACK32);
+    QTest::newRow("ABGR2101010 -> UNORM") << uint32_t(DRM_FORMAT_ABGR2101010) << int(VK_FORMAT_A2B10G10R10_UNORM_PACK32);
+    QTest::newRow("XBGR2101010 -> UNORM") << uint32_t(DRM_FORMAT_XBGR2101010) << int(VK_FORMAT_A2B10G10R10_UNORM_PACK32);
+    // YUV plane formats
+    QTest::newRow("R8   -> R8_UNORM") << uint32_t(DRM_FORMAT_R8) << int(VK_FORMAT_R8_UNORM);
+    QTest::newRow("GR88 -> R8G8_UNORM") << uint32_t(DRM_FORMAT_GR88) << int(VK_FORMAT_R8G8_UNORM);
+    QTest::newRow("RG88 -> R8G8_UNORM") << uint32_t(DRM_FORMAT_RG88) << int(VK_FORMAT_R8G8_UNORM);
+    // Unknown format returns UNDEFINED
+    QTest::newRow("unknown -> UNDEFINED") << uint32_t(0x12345678) << int(VK_FORMAT_UNDEFINED);
 }
 
 void VulkanFormatTest::testDrmFormatToVkFormat()
 {
-#if HAVE_VULKAN
     QFETCH(uint32_t, drmFormat);
     QFETCH(int, expectedVkFormat);
 
-    QCOMPARE(static_cast<int>(drmFormatToVkFormat(drmFormat)), expectedVkFormat);
-#else
-    QSKIP("Vulkan support not available");
-#endif
+    QCOMPARE(int(VulkanContext::drmFormatToVkFormat(drmFormat)), expectedVkFormat);
 }
 
-void VulkanFormatTest::testQImageFormatMapping_data()
+void VulkanFormatTest::testQImageFormatToVkFormat_data()
 {
     QTest::addColumn<int>("qImageFormat");
     QTest::addColumn<int>("expectedVkFormat");
 
-#if HAVE_VULKAN
-    QTest::newRow("RGBA8888") << static_cast<int>(QImage::Format_RGBA8888) << static_cast<int>(VK_FORMAT_R8G8B8A8_UNORM);
-    QTest::newRow("RGBA8888_Premultiplied") << static_cast<int>(QImage::Format_RGBA8888_Premultiplied) << static_cast<int>(VK_FORMAT_R8G8B8A8_UNORM);
-    QTest::newRow("ARGB32") << static_cast<int>(QImage::Format_ARGB32) << static_cast<int>(VK_FORMAT_B8G8R8A8_UNORM);
-    QTest::newRow("ARGB32_Premultiplied") << static_cast<int>(QImage::Format_ARGB32_Premultiplied) << static_cast<int>(VK_FORMAT_B8G8R8A8_UNORM);
-    QTest::newRow("RGB32") << static_cast<int>(QImage::Format_RGB32) << static_cast<int>(VK_FORMAT_B8G8R8A8_UNORM);
-    QTest::newRow("RGB888") << static_cast<int>(QImage::Format_RGB888) << static_cast<int>(VK_FORMAT_R8G8B8_UNORM);
-    QTest::newRow("Grayscale8") << static_cast<int>(QImage::Format_Grayscale8) << static_cast<int>(VK_FORMAT_R8_UNORM);
-    QTest::newRow("Grayscale16") << static_cast<int>(QImage::Format_Grayscale16) << static_cast<int>(VK_FORMAT_R16_UNORM);
-    QTest::newRow("RGBA64") << static_cast<int>(QImage::Format_RGBA64) << static_cast<int>(VK_FORMAT_R16G16B16A16_UNORM);
-    QTest::newRow("RGBA16FPx4") << static_cast<int>(QImage::Format_RGBA16FPx4) << static_cast<int>(VK_FORMAT_R16G16B16A16_SFLOAT);
-    QTest::newRow("RGBA32FPx4") << static_cast<int>(QImage::Format_RGBA32FPx4) << static_cast<int>(VK_FORMAT_R32G32B32A32_SFLOAT);
-    QTest::newRow("Mono (unsupported)") << static_cast<int>(QImage::Format_Mono) << static_cast<int>(VK_FORMAT_UNDEFINED);
-    QTest::newRow("Invalid") << static_cast<int>(QImage::Format_Invalid) << static_cast<int>(VK_FORMAT_UNDEFINED);
-#endif
+    // Qt paints in sRGB, so production uses SRGB Vulkan formats for proper gamma on sampling.
+    // A change to UNORM here would silently double-apply gamma correction on every frame.
+    QTest::newRow("RGBA8888            -> R8G8B8A8_SRGB") << int(QImage::Format_RGBA8888) << int(VK_FORMAT_R8G8B8A8_SRGB);
+    QTest::newRow("RGBA8888_Pre        -> R8G8B8A8_SRGB") << int(QImage::Format_RGBA8888_Premultiplied) << int(VK_FORMAT_R8G8B8A8_SRGB);
+    QTest::newRow("RGBX8888            -> R8G8B8A8_SRGB") << int(QImage::Format_RGBX8888) << int(VK_FORMAT_R8G8B8A8_SRGB);
+    QTest::newRow("RGB888              -> R8G8B8_SRGB") << int(QImage::Format_RGB888) << int(VK_FORMAT_R8G8B8_SRGB);
+    QTest::newRow("ARGB32              -> B8G8R8A8_SRGB") << int(QImage::Format_ARGB32) << int(VK_FORMAT_B8G8R8A8_SRGB);
+    QTest::newRow("ARGB32_Pre          -> B8G8R8A8_SRGB") << int(QImage::Format_ARGB32_Premultiplied) << int(VK_FORMAT_B8G8R8A8_SRGB);
+    QTest::newRow("RGB32               -> B8G8R8A8_SRGB") << int(QImage::Format_RGB32) << int(VK_FORMAT_B8G8R8A8_SRGB);
+    // Grayscale and HDR formats have no sRGB Vulkan equivalent — stay UNORM
+    QTest::newRow("Grayscale8          -> R8_UNORM") << int(QImage::Format_Grayscale8) << int(VK_FORMAT_R8_UNORM);
+    QTest::newRow("Grayscale16         -> R16_UNORM") << int(QImage::Format_Grayscale16) << int(VK_FORMAT_R16_UNORM);
+    QTest::newRow("RGBA64              -> R16G16B16A16_UNORM") << int(QImage::Format_RGBA64) << int(VK_FORMAT_R16G16B16A16_UNORM);
+    QTest::newRow("RGBA64_Pre          -> R16G16B16A16_UNORM") << int(QImage::Format_RGBA64_Premultiplied) << int(VK_FORMAT_R16G16B16A16_UNORM);
+    QTest::newRow("RGBX64              -> R16G16B16A16_UNORM") << int(QImage::Format_RGBX64) << int(VK_FORMAT_R16G16B16A16_UNORM);
+    QTest::newRow("RGBA16FPx4          -> R16G16B16A16_SFLOAT") << int(QImage::Format_RGBA16FPx4) << int(VK_FORMAT_R16G16B16A16_SFLOAT);
+    QTest::newRow("RGBA16FPx4_Pre      -> R16G16B16A16_SFLOAT") << int(QImage::Format_RGBA16FPx4_Premultiplied) << int(VK_FORMAT_R16G16B16A16_SFLOAT);
+    QTest::newRow("RGBA32FPx4          -> R32G32B32A32_SFLOAT") << int(QImage::Format_RGBA32FPx4) << int(VK_FORMAT_R32G32B32A32_SFLOAT);
+    QTest::newRow("RGBA32FPx4_Pre      -> R32G32B32A32_SFLOAT") << int(QImage::Format_RGBA32FPx4_Premultiplied) << int(VK_FORMAT_R32G32B32A32_SFLOAT);
+    // Unsupported formats return UNDEFINED
+    QTest::newRow("Mono    -> UNDEFINED") << int(QImage::Format_Mono) << int(VK_FORMAT_UNDEFINED);
+    QTest::newRow("Invalid -> UNDEFINED") << int(QImage::Format_Invalid) << int(VK_FORMAT_UNDEFINED);
 }
 
-void VulkanFormatTest::testQImageFormatMapping()
+void VulkanFormatTest::testQImageFormatToVkFormat()
 {
-#if HAVE_VULKAN
     QFETCH(int, qImageFormat);
     QFETCH(int, expectedVkFormat);
 
-    QCOMPARE(static_cast<int>(qImageFormatToVkFormat(static_cast<QImage::Format>(qImageFormat))), expectedVkFormat);
-#else
-    QSKIP("Vulkan support not available");
-#endif
+    QCOMPARE(int(VulkanTexture::qImageFormatToVkFormat(QImage::Format(qImageFormat))), expectedVkFormat);
 }
 
-void VulkanFormatTest::testFormatHasAlpha_data()
+#else // !HAVE_VULKAN
+
+void VulkanFormatTest::testDrmFormatToVkFormat_data()
 {
-    QTest::addColumn<int>("vkFormat");
-    QTest::addColumn<bool>("expectedHasAlpha");
-
-#if HAVE_VULKAN
-    QTest::newRow("R8G8B8A8_UNORM") << static_cast<int>(VK_FORMAT_R8G8B8A8_UNORM) << true;
-    QTest::newRow("B8G8R8A8_UNORM") << static_cast<int>(VK_FORMAT_B8G8R8A8_UNORM) << true;
-    QTest::newRow("R16G16B16A16_SFLOAT") << static_cast<int>(VK_FORMAT_R16G16B16A16_SFLOAT) << true;
-    QTest::newRow("R32G32B32A32_SFLOAT") << static_cast<int>(VK_FORMAT_R32G32B32A32_SFLOAT) << true;
-    QTest::newRow("A2R10G10B10_UNORM") << static_cast<int>(VK_FORMAT_A2R10G10B10_UNORM_PACK32) << true;
-    QTest::newRow("R8G8B8_UNORM (no alpha)") << static_cast<int>(VK_FORMAT_R8G8B8_UNORM) << false;
-    QTest::newRow("B8G8R8_UNORM (no alpha)") << static_cast<int>(VK_FORMAT_B8G8R8_UNORM) << false;
-    QTest::newRow("R5G6B5_UNORM (no alpha)") << static_cast<int>(VK_FORMAT_R5G6B5_UNORM_PACK16) << false;
-    QTest::newRow("R8_UNORM (no alpha)") << static_cast<int>(VK_FORMAT_R8_UNORM) << false;
-#endif
 }
-
-void VulkanFormatTest::testFormatHasAlpha()
+void VulkanFormatTest::testDrmFormatToVkFormat()
 {
-#if HAVE_VULKAN
-    QFETCH(int, vkFormat);
-    QFETCH(bool, expectedHasAlpha);
-
-    QCOMPARE(vkFormatHasAlpha(static_cast<VkFormat>(vkFormat)), expectedHasAlpha);
-#else
     QSKIP("Vulkan support not available");
-#endif
 }
+void VulkanFormatTest::testQImageFormatToVkFormat_data()
+{
+}
+void VulkanFormatTest::testQImageFormatToVkFormat()
+{
+    QSKIP("Vulkan support not available");
+}
+
+#endif // HAVE_VULKAN
 
 QTEST_GUILESS_MAIN(VulkanFormatTest)
 #include "vulkan_format_test.moc"

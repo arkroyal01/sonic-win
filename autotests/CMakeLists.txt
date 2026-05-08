@@ -333,6 +333,19 @@ if(HAVE_VULKAN)
 endif()
 
 ########################################################
+# Test Vulkan Offscreen Effect (regression: Fix 1-4)
+########################################################
+if(HAVE_VULKAN)
+    add_executable(testVulkanOffscreenEffect vulkan_offscreen_effect_test.cpp)
+    target_link_libraries(testVulkanOffscreenEffect
+        Qt::Test
+        kwin
+    )
+    add_test(NAME kwin-testVulkanOffscreenEffect COMMAND testVulkanOffscreenEffect)
+    ecm_mark_as_test(testVulkanOffscreenEffect)
+endif()
+
+########################################################
 # Test RenderTarget
 ########################################################
 add_executable(testRenderTarget render_target_test.cpp)
