@@ -849,7 +849,7 @@ public:
     }
     static CompositingType defaultCompositingMode()
     {
-        return OpenGLCompositing;
+        return VulkanCompositing;
     }
     static bool defaultUseCompositing()
     {
