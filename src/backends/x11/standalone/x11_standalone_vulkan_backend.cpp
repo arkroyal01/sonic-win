@@ -57,9 +57,11 @@ std::optional<OutputLayerBeginFrameInfo> VulkanLayer::doBeginFrame()
     }
 
     // Wait for the previous frame's fence to complete (CPU wait is still needed
-    // to ensure the command buffer from the previous frame is not in use)
+    // to ensure the command buffer from the previous frame is not in use).
+    // Reset is deferred until after a successful acquire: if we reset before
+    // acquiring and the acquire fails, the fence stays unsignaled and the next
+    // waitForFence() will block forever (UINT64_MAX timeout → freeze).
     swapchain->waitForFence();
-    swapchain->resetFence();
 
     // Acquire the next swapchain image
     // This signals imageAvailableSemaphore when the image is ready
@@ -74,6 +76,10 @@ std::optional<OutputLayerBeginFrameInfo> VulkanLayer::doBeginFrame()
         qCWarning(KWIN_X11STANDALONE) << "VulkanLayer::doBeginFrame() - failed to acquire image";
         return std::nullopt;
     }
+
+    // Reset only after a successful acquire, so a failed acquire leaves the
+    // fence signaled and the next frame's wait passes immediately.
+    swapchain->resetFence();
 
     // Get the framebuffer for this image
     auto *framebuffer = swapchain->currentFramebuffer();
