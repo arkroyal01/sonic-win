@@ -151,8 +151,10 @@ OffscreenQuickView::OffscreenQuickView(ExportMode exportMode, bool alpha)
             } else {
                 d->m_glcontext->doneCurrent();
 
-                if (shareContext && !d->m_glcontext->shareContext()) {
-                    qCDebug(LIBKWINEFFECTS) << "Failed to create a shared context, falling back to raster rendering";
+                // If the GL context is not sharing with kwin's main context the
+                // FBO texture cannot be passed to the compositor directly.
+                // Force blit mode so the QImage path is always populated.
+                if (!d->m_glcontext->shareContext()) {
                     d->m_useBlit = true;
                 }
             }

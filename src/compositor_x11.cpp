@@ -339,7 +339,12 @@ void X11Compositor::start()
             qCDebug(KWIN_CORE) << "Attempting to load the Vulkan scene";
             stop = attemptVulkanCompositing();
             if (stop) {
-                QQuickWindow::setGraphicsApi(QSGRendererInterface::Vulkan);
+                // Keep Qt Quick on OpenGL even with the Vulkan compositor.
+                // kwin's Vulkan compositing uses its own backend independently
+                // of Qt Quick. OffscreenQuickView renders QML to GL FBOs and
+                // blits to Vulkan textures via QImage — it does not need Qt
+                // Quick's scene graph backend to match the compositor.
+                QQuickWindow::setGraphicsApi(QSGRendererInterface::OpenGL);
             }
             break;
         case NoCompositing:
