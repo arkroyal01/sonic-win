@@ -170,7 +170,6 @@ bool VulkanSurfaceTextureX11::create()
     // 1. We have a valid texture
     // 2. The size hasn't changed
     if (m_texture.isValid() && m_size == currentSize) {
-        qCDebug(KWIN_VULKAN) << "VulkanSurfaceTextureX11::create() - reusing cached texture for pixmap" << currentPixmapId;
         return true;
     }
 

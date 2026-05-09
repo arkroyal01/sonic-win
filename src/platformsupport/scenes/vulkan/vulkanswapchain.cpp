@@ -466,7 +466,6 @@ bool VulkanSwapchain::present()
         qCWarning(KWIN_VULKAN) << "Failed to present swapchain image:" << result << "(" << getVulkanResultString(result) << ")";
         return false;
     } else {
-        qCDebug(KWIN_VULKAN) << "Successfully presented swapchain image" << m_currentImageIndex;
     }
 
     return true;

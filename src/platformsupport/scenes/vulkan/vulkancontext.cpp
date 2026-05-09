@@ -449,7 +449,6 @@ void VulkanContext::queueSamplerForDestruction(VkSampler sampler)
     // The sampler will be destroyed when the fence is signaled
     VkFence fence = m_fence != VK_NULL_HANDLE ? m_fence : VK_NULL_HANDLE;
     m_pendingSamplerDestructions.append({sampler, fence});
-    qCDebug(KWIN_VULKAN) << "Queued sampler for deferred destruction, pending count:" << m_pendingSamplerDestructions.size();
 }
 
 void VulkanContext::cleanupPendingResources()
@@ -458,7 +457,6 @@ void VulkanContext::cleanupPendingResources()
 
     // Clean up pending samplers
     if (!m_pendingSamplerDestructions.isEmpty()) {
-        qCDebug(KWIN_VULKAN) << "Cleaning up" << m_pendingSamplerDestructions.size() << "pending samplers";
         for (auto it = m_pendingSamplerDestructions.begin(); it != m_pendingSamplerDestructions.end();) {
             VkSampler sampler = it->first;
             VkFence fence = it->second;
@@ -478,12 +476,10 @@ void VulkanContext::cleanupPendingResources()
                 ++it;
             }
         }
-        qCDebug(KWIN_VULKAN) << "After cleanup:" << m_pendingSamplerDestructions.size() << "samplers still pending";
     }
 
     // Clean up pending image views (must be done before images)
     if (!m_pendingImageViewDestructions.isEmpty()) {
-        qCDebug(KWIN_VULKAN) << "Cleaning up" << m_pendingImageViewDestructions.size() << "pending image views";
         for (auto it = m_pendingImageViewDestructions.begin(); it != m_pendingImageViewDestructions.end();) {
             VkImageView imageView = it->imageView;
             VkFence fence = it->fence;
@@ -503,12 +499,10 @@ void VulkanContext::cleanupPendingResources()
                 ++it;
             }
         }
-        qCDebug(KWIN_VULKAN) << "After cleanup:" << m_pendingImageViewDestructions.size() << "image views still pending";
     }
 
     // Clean up pending images (only after their views are destroyed)
     if (!m_pendingImageDestructions.isEmpty()) {
-        qCDebug(KWIN_VULKAN) << "Cleaning up" << m_pendingImageDestructions.size() << "pending images";
         for (auto it = m_pendingImageDestructions.begin(); it != m_pendingImageDestructions.end();) {
             VkImage image = it->image;
             VkFence fence = it->fence;
@@ -540,12 +534,10 @@ void VulkanContext::cleanupPendingResources()
                 ++it;
             }
         }
-        qCDebug(KWIN_VULKAN) << "After cleanup:" << m_pendingImageDestructions.size() << "images still pending";
     }
 
     // Clean up pending buffers
     if (!m_pendingBufferDestructions.isEmpty()) {
-        qCDebug(KWIN_VULKAN) << "Cleaning up" << m_pendingBufferDestructions.size() << "pending buffers";
         for (auto it = m_pendingBufferDestructions.begin(); it != m_pendingBufferDestructions.end();) {
             VkBuffer buffer = it->buffer;
             VmaAllocation allocation = it->allocation;
@@ -566,7 +558,6 @@ void VulkanContext::cleanupPendingResources()
                 ++it;
             }
         }
-        qCDebug(KWIN_VULKAN) << "After cleanup:" << m_pendingBufferDestructions.size() << "buffers still pending";
     }
 }
 
@@ -584,7 +575,6 @@ void VulkanContext::queueImageViewForDestruction(VkImageView imageView)
 
     VkFence fence = m_fence != VK_NULL_HANDLE ? m_fence : VK_NULL_HANDLE;
     m_pendingImageViewDestructions.append({imageView, fence, VK_NULL_HANDLE});
-    qCDebug(KWIN_VULKAN) << "Queued image view for deferred destruction, pending count:" << m_pendingImageViewDestructions.size();
 }
 
 void VulkanContext::queueImageForDestruction(VkImage image, VmaAllocation allocation, VkDeviceMemory deviceMemory)
@@ -610,7 +600,6 @@ void VulkanContext::queueImageForDestruction(VkImage image, VmaAllocation alloca
 
     VkFence fence = m_fence != VK_NULL_HANDLE ? m_fence : VK_NULL_HANDLE;
     m_pendingImageDestructions.append({image, fence, allocation, deviceMemory});
-    qCDebug(KWIN_VULKAN) << "Queued image for deferred destruction, pending count:" << m_pendingImageDestructions.size();
 }
 
 void VulkanContext::queueImageAndViewForDestruction(VkImageView imageView, VkImage image)
@@ -636,13 +625,11 @@ void VulkanContext::queueImageAndViewForDestruction(VkImageView imageView, VkIma
     // Queue image view first (must be destroyed before image)
     if (imageView != VK_NULL_HANDLE) {
         m_pendingImageViewDestructions.append({imageView, fence, image});
-        qCDebug(KWIN_VULKAN) << "Queued image view for deferred destruction, pending count:" << m_pendingImageViewDestructions.size();
     }
 
     // Queue image second (will be destroyed after view)
     if (image != VK_NULL_HANDLE) {
         m_pendingImageDestructions.append({image, fence, nullptr, VK_NULL_HANDLE});
-        qCDebug(KWIN_VULKAN) << "Queued image for deferred destruction, pending count:" << m_pendingImageDestructions.size();
     }
 }
 
@@ -662,7 +649,6 @@ void VulkanContext::queueBufferForDestruction(VkBuffer buffer, VmaAllocation all
 
     VkFence fence = m_fence != VK_NULL_HANDLE ? m_fence : VK_NULL_HANDLE;
     m_pendingBufferDestructions.append({buffer, allocation, fence});
-    qCDebug(KWIN_VULKAN) << "Queued buffer for deferred destruction, pending count:" << m_pendingBufferDestructions.size();
 }
 
 std::unique_ptr<VulkanTexture> VulkanContext::importDmaBufAsTexture(const DmaBufAttributes &attributes)

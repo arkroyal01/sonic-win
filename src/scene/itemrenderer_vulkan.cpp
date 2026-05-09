@@ -134,7 +134,6 @@ void ItemRendererVulkan::beginFrame(const RenderTarget &renderTarget, const Rend
         qCWarning(KWIN_CORE) << "Failed to begin command buffer recording";
         return;
     }
-    qCDebug(KWIN_CORE) << "Successfully began command buffer recording";
 
     // Get the framebuffer from render target
     // Extract the VulkanRenderTarget from the RenderTarget
@@ -163,10 +162,8 @@ void ItemRendererVulkan::beginFrame(const RenderTarget &renderTarget, const Rend
             clearValues[1].depthStencil = {1.0f, 0};
         }
 
-        qCDebug(KWIN_CORE) << "Beginning render pass with" << (m_currentFramebuffer->renderPass()->config().hasDepth ? 2 : 1) << "clear values";
         m_currentFramebuffer->beginRenderPass(m_currentCommandBuffer, clearValues.data(),
                                               m_currentFramebuffer->renderPass()->config().hasDepth ? 2 : 1);
-        qCDebug(KWIN_CORE) << "Render pass begun successfully";
     }
 
     // Set viewport with Y-flip to match OpenGL coordinate conventions
@@ -181,17 +178,11 @@ void ItemRendererVulkan::beginFrame(const RenderTarget &renderTarget, const Rend
     vkViewport.maxDepth = 1.0f;
     vkCmdSetViewport(m_currentCommandBuffer, 0, 1, &vkViewport);
 
-    qCDebug(KWIN_CORE) << "beginFrame: Set viewport to" << size.width() << "x" << size.height();
-
     // Set scissor
     VkRect2D scissor{};
     scissor.offset = {0, 0};
     scissor.extent = {static_cast<uint32_t>(size.width()), static_cast<uint32_t>(size.height())};
     vkCmdSetScissor(m_currentCommandBuffer, 0, 1, &scissor);
-
-    qCDebug(KWIN_CORE) << "beginFrame: Set scissor to" << size.width() << "x" << size.height();
-
-    qCDebug(KWIN_CORE) << "ItemRendererVulkan::beginFrame() - viewport:" << size;
 }
 
 void ItemRendererVulkan::endFrame()
@@ -203,11 +194,7 @@ void ItemRendererVulkan::endFrame()
 
     // End render pass if we were rendering to a framebuffer
     if (m_currentFramebuffer) {
-        qCDebug(KWIN_CORE) << "Ending render pass";
         m_currentFramebuffer->endRenderPass(m_currentCommandBuffer);
-        qCDebug(KWIN_CORE) << "Render pass ended successfully";
-    } else {
-        qCDebug(KWIN_CORE) << "endFrame: No framebuffer to end render pass";
     }
 
     // End command buffer recording
@@ -216,7 +203,6 @@ void ItemRendererVulkan::endFrame()
         qCWarning(KWIN_CORE) << "Failed to end command buffer recording:" << result;
         return;
     }
-    qCDebug(KWIN_CORE) << "Successfully ended command buffer recording";
 
     // Submit command buffer to graphics queue
     VkSubmitInfo submitInfo{};
@@ -226,10 +212,6 @@ void ItemRendererVulkan::endFrame()
 
     // Check if we have GPU-GPU synchronization info (swapchain rendering)
     const bool hasGpuSync = m_currentSyncInfo.imageAvailableSemaphore != VK_NULL_HANDLE && m_currentSyncInfo.renderFinishedSemaphore != VK_NULL_HANDLE;
-
-    qCDebug(KWIN_CORE) << "GPU-GPU sync check:" << (hasGpuSync ? "enabled" : "disabled")
-                       << "imageAvailableSemaphore:" << m_currentSyncInfo.imageAvailableSemaphore
-                       << "renderFinishedSemaphore:" << m_currentSyncInfo.renderFinishedSemaphore;
 
     if (hasGpuSync) {
         // GPU-GPU semaphore synchronization (no CPU blocking needed for render-present sync)
@@ -261,7 +243,6 @@ void ItemRendererVulkan::endFrame()
             m_currentSyncInfo = VulkanSyncInfo{};
             return;
         }
-        qCDebug(KWIN_CORE) << "Successfully submitted command buffer with GPU-GPU sync, waiting for fence" << fence;
 
         // No blocking wait here! The GPU-GPU synchronization handles the timing:
         // - Render waits on imageAvailableSemaphore (signaled by acquireNextImage)
@@ -296,14 +277,11 @@ void ItemRendererVulkan::endFrame()
         }
         m_releasePoints.clear();
 
-        qCDebug(KWIN_CORE) << "ItemRendererVulkan::endFrame() - GPU-GPU semaphore sync";
-
         // Descriptor sets are not explicitly freed here - they will be freed when
         // the descriptor pool is reset at the start of the next frame when
         // m_outputsInFlight reaches 0. This avoids CPU stalls from vkDeviceWaitIdle.
         m_frameDescriptorSets.clear();
     } else {
-        qCDebug(KWIN_CORE) << "Using fallback path: no swapchain semaphores, use non-blocking synchronization";
         // Fallback: no swapchain semaphores, use non-blocking synchronization
         // This path is used for:
         // - Rendering to offscreen textures
@@ -321,7 +299,6 @@ void ItemRendererVulkan::endFrame()
                                 releasePoint->addReleaseFence(syncFd);
                             }
                         }
-                        qCDebug(KWIN_CORE) << "ItemRendererVulkan::endFrame() - non-blocking sync with export fence";
                     }
                     m_releasePoints.clear();
                     // Wait for the fence so the command buffer is safe to free immediately.
@@ -350,7 +327,6 @@ void ItemRendererVulkan::endFrame()
             m_currentSyncInfo = VulkanSyncInfo{};
             return;
         }
-        qCDebug(KWIN_CORE) << "Successfully submitted command buffer without blocking";
         m_releasePoints.clear();
 
         // Wait for the fence so the command buffer can be freed immediately rather than
@@ -359,8 +335,6 @@ void ItemRendererVulkan::endFrame()
         vkWaitForFences(m_backend->device(), 1, &fence, VK_TRUE, UINT64_MAX);
         m_context->freeCommandBuffer(m_currentCommandBuffer);
         m_currentCommandBuffer = VK_NULL_HANDLE;
-
-        qCDebug(KWIN_CORE) << "ItemRendererVulkan::endFrame() - non-blocking sync (optimized fallback)";
 
         // Descriptor sets will be freed when the descriptor pool is reset at the start
         // of the next frame (when m_outputsInFlight reaches 0), avoiding CPU stalls
@@ -389,8 +363,6 @@ void ItemRendererVulkan::renderBackground(const RenderTarget &renderTarget, cons
     // The render pass already clears the framebuffer with the clear color
     // If we need to render a specific background color or pattern, we'd do it here
     // For now, the clear in beginFrame handles this
-
-    qCDebug(KWIN_CORE) << "ItemRendererVulkan::renderBackground() - region:" << region.boundingRect();
 }
 
 QVector4D ItemRendererVulkan::modulate(float opacity, float brightness) const
@@ -760,7 +732,6 @@ void ItemRendererVulkan::renderNodes(const RenderContext &context, VkCommandBuff
             qCWarning(KWIN_CORE) << "Vertex buffer is null, skipping vertex buffer binding";
         } else {
             vkCmdBindVertexBuffers(cmd, 0, 1, vertexBuffers, offsets);
-            qCDebug(KWIN_CORE) << "Bound vertex buffer at offset 0, using firstVertex for actual position";
         }
     }
 
@@ -805,7 +776,6 @@ void ItemRendererVulkan::renderNodes(const RenderContext &context, VkCommandBuff
             if (pipeline->pipeline() != VK_NULL_HANDLE) {
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->pipeline());
                 currentPipeline = pipeline;
-                qCDebug(KWIN_CORE) << "Bound pipeline with traits:" << static_cast<int>(node.traits);
             } else {
                 qCWarning(KWIN_CORE) << "Skipping null pipeline binding for traits:" << static_cast<int>(node.traits);
                 continue;
@@ -916,7 +886,6 @@ void ItemRendererVulkan::renderNodes(const RenderContext &context, VkCommandBuff
                                descriptorWrites.data(), 0, nullptr);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                 pipeline->layout(), 0, 1, &descriptorSet, 0, nullptr);
-        qCDebug(KWIN_CORE) << "Bound descriptor set with" << slot << "textures and UBO";
 
         // Draw (descriptor set is guaranteed bound since we continue above if not)
         if (node.vertexCount > 0) {
@@ -978,8 +947,6 @@ void ItemRendererVulkan::renderItem(const RenderTarget &renderTarget, const Rend
 
     // Render all nodes using the appropriate command buffer
     renderNodes(context, cmd);
-
-    qCDebug(KWIN_CORE) << "ItemRendererVulkan::renderItem() - rendered" << context.renderNodes.size() << "nodes for item:" << item;
 }
 
 } // namespace KWin
