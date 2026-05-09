@@ -94,13 +94,13 @@ OffscreenQuickView::OffscreenQuickView(ExportMode exportMode, bool alpha)
         d->m_useBlit = true;
     }
 
-    const bool usingGl = d->m_view->rendererInterface()->graphicsApi() == QSGRendererInterface::OpenGL;
-
-    if (!usingGl) {
-        qCDebug(LIBKWINEFFECTS) << "QtQuick Software rendering mode detected";
-        d->m_useBlit = true;
-        // explicilty do not call QQuickRenderControl::initialize, see Qt docs
-    } else {
+    // Always try to create an OpenGL context for Qt Quick rendering.
+    // On X11, GLX is available independently of the compositor's backend,
+    // so a standalone GL context works even when kwin uses Vulkan.
+    // Checking graphicsApi() == OpenGL is not reliable here: under a Vulkan
+    // compositor Qt Quick reports Vulkan as its API, causing the old code to
+    // skip GL setup and call sync() with a null QRhi → SIGSEGV.
+    {
         QSurfaceFormat format;
         format.setOption(QSurfaceFormat::ResetNotification);
         format.setDepthBufferSize(16);
@@ -112,26 +112,40 @@ OffscreenQuickView::OffscreenQuickView(ExportMode exportMode, bool alpha)
         d->m_view->setFormat(format);
 
         auto shareContext = QOpenGLContext::globalShareContext();
-        d->m_glcontext = std::make_unique<QOpenGLContext>();
-        d->m_glcontext->setShareContext(shareContext);
-        d->m_glcontext->setFormat(format);
-        d->m_glcontext->create();
+        auto glcontext = std::make_unique<QOpenGLContext>();
+        glcontext->setShareContext(shareContext);
+        glcontext->setFormat(format);
 
-        // and the offscreen surface
-        d->m_offscreenSurface = std::make_unique<QOffscreenSurface>();
-        d->m_offscreenSurface->setFormat(d->m_glcontext->format());
-        d->m_offscreenSurface->create();
+        if (glcontext->create()) {
+            d->m_glcontext = std::move(glcontext);
 
-        d->m_glcontext->makeCurrent(d->m_offscreenSurface.get());
-        d->m_view->setGraphicsDevice(QQuickGraphicsDevice::fromOpenGLContext(d->m_glcontext.get()));
-        d->m_renderControl->initialize();
-        d->m_glcontext->doneCurrent();
+            d->m_offscreenSurface = std::make_unique<QOffscreenSurface>();
+            d->m_offscreenSurface->setFormat(d->m_glcontext->format());
+            d->m_offscreenSurface->create();
 
-        // On Wayland, contexts are implicitly shared and QOpenGLContext::globalShareContext() is null.
-        if (shareContext && !d->m_glcontext->shareContext()) {
-            qCDebug(LIBKWINEFFECTS) << "Failed to create a shared context, falling back to raster rendering";
-            // still render via GL, but blit for presentation
-            d->m_useBlit = true;
+            d->m_glcontext->makeCurrent(d->m_offscreenSurface.get());
+            d->m_view->setGraphicsDevice(QQuickGraphicsDevice::fromOpenGLContext(d->m_glcontext.get()));
+            d->m_renderControl->initialize();
+            d->m_glcontext->doneCurrent();
+
+            // On Wayland, contexts are implicitly shared and QOpenGLContext::globalShareContext() is null.
+            if (shareContext && !d->m_glcontext->shareContext()) {
+                qCDebug(LIBKWINEFFECTS) << "Failed to create a shared context, falling back to raster rendering";
+                // still render via GL, but blit for presentation
+                d->m_useBlit = true;
+            }
+        } else {
+            // GL context creation failed — only the software backend works without it.
+            const auto api = d->m_view->rendererInterface()->graphicsApi();
+            if (api == QSGRendererInterface::Software) {
+                qCDebug(LIBKWINEFFECTS) << "No GL context available, using Qt Quick software renderer";
+                d->m_useBlit = true;
+                // explicitly do not call QQuickRenderControl::initialize for software mode
+            } else {
+                qCWarning(LIBKWINEFFECTS) << "No GL context and Qt Quick is not in software mode (api=" << api
+                                          << "), Qt Quick effects will be disabled";
+                d->m_useBlit = true;
+            }
         }
     }
 
@@ -216,6 +230,17 @@ void OffscreenQuickView::update()
 
     bool usingGl = d->m_glcontext != nullptr;
     OpenGlContext *previousContext = OpenGlContext::currentContext();
+
+    if (!usingGl) {
+        // No GL context. Only the software backend can render without one;
+        // any hardware backend (Vulkan, RHI) requires initialize() to have
+        // been called, which we skip when there is no GL context. Guard here
+        // so that sync() never reaches QSGBatchRenderer with a null QRhi.
+        const auto api = d->m_view->rendererInterface()->graphicsApi();
+        if (api != QSGRendererInterface::Software) {
+            return;
+        }
+    }
 
     if (usingGl) {
         if (!d->m_glcontext->makeCurrent(d->m_offscreenSurface.get())) {
