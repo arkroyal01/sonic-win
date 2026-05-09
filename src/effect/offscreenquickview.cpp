@@ -125,14 +125,27 @@ OffscreenQuickView::OffscreenQuickView(ExportMode exportMode, bool alpha)
 
             d->m_glcontext->makeCurrent(d->m_offscreenSurface.get());
             d->m_view->setGraphicsDevice(QQuickGraphicsDevice::fromOpenGLContext(d->m_glcontext.get()));
-            d->m_renderControl->initialize();
-            d->m_glcontext->doneCurrent();
+            const bool initialized = d->m_renderControl->initialize();
 
-            // On Wayland, contexts are implicitly shared and QOpenGLContext::globalShareContext() is null.
-            if (shareContext && !d->m_glcontext->shareContext()) {
-                qCDebug(LIBKWINEFFECTS) << "Failed to create a shared context, falling back to raster rendering";
-                // still render via GL, but blit for presentation
+            // Under a Vulkan compositor Qt Quick may ignore our setGraphicsDevice()
+            // and use Vulkan anyway, leaving QSGRenderContext::rhi() null. Verify
+            // the result is actually OpenGL before committing to the GL path.
+            const auto actualApi = d->m_view->rendererInterface()->graphicsApi();
+            if (!initialized || actualApi != QSGRendererInterface::OpenGL) {
+                qCWarning(LIBKWINEFFECTS) << "Qt Quick render control did not initialize with OpenGL (initialized="
+                                          << initialized << "api=" << actualApi
+                                          << "), Qt Quick effects will be disabled";
+                d->m_glcontext->doneCurrent();
+                d->m_glcontext.reset();
+                d->m_offscreenSurface.reset();
                 d->m_useBlit = true;
+            } else {
+                d->m_glcontext->doneCurrent();
+
+                if (shareContext && !d->m_glcontext->shareContext()) {
+                    qCDebug(LIBKWINEFFECTS) << "Failed to create a shared context, falling back to raster rendering";
+                    d->m_useBlit = true;
+                }
             }
         } else {
             // GL context creation failed — only the software backend works without it.
