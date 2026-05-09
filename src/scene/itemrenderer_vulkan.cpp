@@ -30,6 +30,7 @@
 #include "scene/itemgeometry.h"
 
 #include "scene/outlinedborderitem.h"
+#include "scene/rootitem.h"
 #include "scene/shadowitem.h"
 #include "scene/surfaceitem.h"
 #include "scene/windowitem.h"
@@ -654,10 +655,8 @@ void ItemRendererVulkan::createRenderNode(Item *item, RenderContext *context)
 
             context->renderNodes.append(node);
         }
-    } else if (qobject_cast<WindowItem *>(item)) {
-        // WindowItem (including WindowItemX11, WindowItemInternal) is a container item
-        // with no geometry of its own - it just holds child items (SurfaceItem, DecorationItem, ShadowItem)
-        // This is expected behavior, no warning needed
+    } else if (qobject_cast<WindowItem *>(item) || qobject_cast<RootItem *>(item)) {
+        // Container items with no geometry of their own — children are rendered separately
     } else {
         qCWarning(KWIN_VULKAN) << "Unhandled item type:" << item->metaObject()->className();
     }

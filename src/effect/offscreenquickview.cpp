@@ -82,6 +82,15 @@ public:
 OffscreenQuickView::OffscreenQuickView(ExportMode exportMode, bool alpha)
     : d(new OffscreenQuickView::Private)
 {
+    // When the compositor uses Vulkan there is no global OpenGL share context,
+    // so Qt Quick would pick Vulkan as its scene graph backend.  Force OpenGL
+    // here (before the QQuickWindow is created) so that initialize() later
+    // creates an OpenGL QRhi compatible with our FBO-based render path.
+    if (!QOpenGLContext::globalShareContext()
+        && QQuickWindow::sceneGraphBackend() != QLatin1String("opengl")) {
+        QQuickWindow::setSceneGraphBackend(QStringLiteral("opengl"));
+    }
+
     d->m_renderControl = std::make_unique<QQuickRenderControl>();
 
     d->m_view = std::make_unique<QQuickWindow>(d->m_renderControl.get());
