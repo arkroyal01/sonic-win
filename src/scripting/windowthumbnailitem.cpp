@@ -22,6 +22,16 @@
 
 #include "opengl/gltexture.h"
 
+#if HAVE_VULKAN
+#include "platformsupport/scenes/vulkan/vulkancontext.h"
+#include "platformsupport/scenes/vulkan/vulkanframebuffer.h"
+#include "platformsupport/scenes/vulkan/vulkanrenderpass.h"
+#include "platformsupport/scenes/vulkan/vulkanrendertarget.h"
+#include "platformsupport/scenes/vulkan/vulkantexture.h"
+#include "scene/itemrenderer_vulkan.h"
+#include "scene/workspacescene_vulkan.h"
+#endif
+
 #include <QOpenGLContext>
 #include <QQuickWindow>
 #include <QRunnable>
@@ -35,6 +45,15 @@ static bool useGlThumbnails()
 {
     static bool qtQuickIsSoftware = QStringList({QStringLiteral("software"), QStringLiteral("softwarecontext")}).contains(QQuickWindow::sceneGraphBackend());
     return Compositor::self()->backend() && Compositor::self()->backend()->compositingType() == OpenGLCompositing && !qtQuickIsSoftware;
+}
+
+static bool useVulkanThumbnails()
+{
+#if HAVE_VULKAN
+    return Compositor::self()->backend() && Compositor::self()->backend()->compositingType() == VulkanCompositing;
+#else
+    return false;
+#endif
 }
 
 WindowThumbnailSource::WindowThumbnailSource(QQuickWindow *view, Window *handle)
@@ -115,6 +134,13 @@ void WindowThumbnailSource::update()
     }
     Q_ASSERT(m_view);
 
+#if HAVE_VULKAN
+    if (useVulkanThumbnails()) {
+        updateVulkan();
+        return;
+    }
+#endif
+
     const QRectF geometry = m_handle->visibleGeometry();
     const qreal devicePixelRatio = m_view->devicePixelRatio();
     const QSize textureSize = geometry.toAlignedRect().size() * devicePixelRatio;
@@ -150,6 +176,99 @@ void WindowThumbnailSource::update()
 
     Q_EMIT changed();
 }
+
+QImage WindowThumbnailSource::acquireImage() const
+{
+#if HAVE_VULKAN
+    return m_cachedImage;
+#else
+    return QImage();
+#endif
+}
+
+#if HAVE_VULKAN
+void WindowThumbnailSource::updateVulkan()
+{
+    Q_ASSERT(m_view);
+
+    auto *vkScene = dynamic_cast<WorkspaceSceneVulkan *>(Compositor::self()->scene());
+    if (!vkScene) {
+        return;
+    }
+    auto *vkRenderer = static_cast<ItemRendererVulkan *>(vkScene->renderer());
+    VulkanContext *ctx = vkScene->backend()->vulkanContext();
+
+    const QRectF geometry = m_handle->visibleGeometry();
+    const qreal dpr = m_view->devicePixelRatio();
+    const QSize textureSize = geometry.toAlignedRect().size() * dpr;
+
+    if (textureSize.isEmpty()) {
+        return;
+    }
+
+    const VkFormat fmt = vkScene->backend()->colorFormat();
+
+    if (!m_vulkanFbo || m_vulkanFbo->size() != textureSize) {
+        m_vulkanRenderPass = VulkanRenderPass::createForOffscreen(ctx, fmt, false);
+        if (!m_vulkanRenderPass || !m_vulkanRenderPass->isValid()) {
+            return;
+        }
+        m_vulkanFbo = VulkanFramebuffer::createWithTexture(ctx, m_vulkanRenderPass.get(), textureSize, fmt);
+        if (!m_vulkanFbo || !m_vulkanFbo->isValid()) {
+            return;
+        }
+    }
+
+    VkCommandBuffer cmd = ctx->beginSingleTimeCommands();
+    if (cmd == VK_NULL_HANDLE) {
+        return;
+    }
+
+    auto vkRT = std::make_unique<VulkanRenderTarget>(m_vulkanFbo.get());
+    vkRT->setCommandBuffer(cmd);
+    RenderTarget renderTarget(vkRT.get());
+    RenderViewport viewport(geometry, dpr, renderTarget);
+
+    VkClearValue clearValue{};
+    const VkRect2D renderArea{{0, 0}, {(uint32_t)textureSize.width(), (uint32_t)textureSize.height()}};
+    m_vulkanRenderPass->begin(cmd, m_vulkanFbo->framebuffer(), renderArea, &clearValue, 1);
+
+    VkViewport vp{};
+    vp.x = 0.0f;
+    vp.y = float(textureSize.height());
+    vp.width = float(textureSize.width());
+    vp.height = -float(textureSize.height());
+    vp.minDepth = 0.0f;
+    vp.maxDepth = 1.0f;
+    vkCmdSetViewport(cmd, 0, 1, &vp);
+
+    VkRect2D scissor{{0, 0}, {(uint32_t)textureSize.width(), (uint32_t)textureSize.height()}};
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+    const size_t savedOffset = vkRenderer->vertexBufferOffset();
+    const int mask = Scene::PAINT_WINDOW_TRANSFORMED;
+    Compositor::self()->scene()->renderer()->renderItem(renderTarget, viewport,
+                                                        m_handle->windowItem(), mask,
+                                                        infiniteRegion(), WindowPaintData{});
+    vkRenderer->setVertexBufferOffset(savedOffset);
+
+    m_vulkanRenderPass->end(cmd);
+
+    if (VulkanTexture *tex = m_vulkanFbo->colorTexture()) {
+        tex->setCurrentLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+
+    ctx->endSingleTimeCommands(cmd);
+
+    if (VulkanTexture *tex = m_vulkanFbo->colorTexture()) {
+        m_cachedImage = ctx->readTextureToImage(tex);
+        m_cachedImage.setDevicePixelRatio(dpr);
+    }
+
+    m_dirty = false;
+    Q_EMIT changed();
+}
+#endif
 
 class ThumbnailTextureProvider : public QSGTextureProvider
 {
@@ -280,7 +399,7 @@ void WindowThumbnailItem::resetSource()
 
 void WindowThumbnailItem::updateSource()
 {
-    if (useGlThumbnails() && window() && m_client) {
+    if ((useGlThumbnails() || useVulkanThumbnails()) && window() && m_client) {
         m_source = WindowThumbnailSource::getOrCreate(window(), m_client);
         connect(m_source.get(), &WindowThumbnailSource::changed, this, &WindowThumbnailItem::update);
     } else {
@@ -295,21 +414,35 @@ QSGNode *WindowThumbnailItem::updatePaintNode(QSGNode *oldNode, QQuickItem::Upda
             return oldNode;
         }
 
-        auto [texture, acquireFence] = m_source->acquire();
-        if (!texture) {
-            return oldNode;
-        }
+#if HAVE_VULKAN
+        if (useVulkanThumbnails()) {
+            const QImage img = m_source->acquireImage();
+            if (img.isNull()) {
+                return oldNode;
+            }
+            if (!m_provider) {
+                m_provider = new ThumbnailTextureProvider(window());
+            }
+            m_provider->setTexture(window()->createTextureFromImage(img));
+        } else
+#endif
+        {
+            auto [texture, acquireFence] = m_source->acquire();
+            if (!texture) {
+                return oldNode;
+            }
 
-        // Wait for rendering commands to the offscreen texture complete if there are any.
-        if (acquireFence) {
-            glWaitSync(acquireFence, 0, GL_TIMEOUT_IGNORED);
-            glDeleteSync(acquireFence);
-        }
+            // Wait for rendering commands to the offscreen texture complete if there are any.
+            if (acquireFence) {
+                glWaitSync(acquireFence, 0, GL_TIMEOUT_IGNORED);
+                glDeleteSync(acquireFence);
+            }
 
-        if (!m_provider) {
-            m_provider = new ThumbnailTextureProvider(window());
+            if (!m_provider) {
+                m_provider = new ThumbnailTextureProvider(window());
+            }
+            m_provider->setTexture(texture);
         }
-        m_provider->setTexture(texture);
     } else {
         if (!m_provider) {
             m_provider = new ThumbnailTextureProvider(window());

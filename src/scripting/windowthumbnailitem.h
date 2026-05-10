@@ -7,6 +7,9 @@
 
 #pragma once
 
+#include "config-kwin.h"
+
+#include <QImage>
 #include <QQuickItem>
 #include <QUuid>
 
@@ -19,6 +22,10 @@ class GLFramebuffer;
 class GLTexture;
 class ThumbnailTextureProvider;
 class WindowThumbnailSource;
+#if HAVE_VULKAN
+class VulkanFramebuffer;
+class VulkanRenderPass;
+#endif
 
 class WindowThumbnailSource : public QObject
 {
@@ -37,12 +44,16 @@ public:
     };
 
     Frame acquire();
+    QImage acquireImage() const;
 
 Q_SIGNALS:
     void changed();
 
 private:
     void update();
+#if HAVE_VULKAN
+    void updateVulkan();
+#endif
 
     QPointer<QQuickWindow> m_view;
     QPointer<Window> m_handle;
@@ -51,6 +62,12 @@ private:
     std::unique_ptr<GLFramebuffer> m_offscreenTarget;
     GLsync m_acquireFence = 0;
     bool m_dirty = true;
+
+#if HAVE_VULKAN
+    std::unique_ptr<VulkanFramebuffer> m_vulkanFbo;
+    std::unique_ptr<VulkanRenderPass> m_vulkanRenderPass;
+    QImage m_cachedImage;
+#endif
 };
 
 class WindowThumbnailItem : public QQuickItem
