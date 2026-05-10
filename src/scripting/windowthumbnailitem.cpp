@@ -193,6 +193,7 @@ void WindowThumbnailSource::updateVulkan()
 
     auto *vkScene = dynamic_cast<WorkspaceSceneVulkan *>(Compositor::self()->scene());
     if (!vkScene) {
+        qCWarning(KWIN_SCRIPTING) << "VulkanThumbnail: no WorkspaceSceneVulkan";
         return;
     }
     auto *vkRenderer = static_cast<ItemRendererVulkan *>(vkScene->renderer());
@@ -203,6 +204,7 @@ void WindowThumbnailSource::updateVulkan()
     const QSize textureSize = geometry.toAlignedRect().size() * dpr;
 
     if (textureSize.isEmpty()) {
+        qCWarning(KWIN_SCRIPTING) << "VulkanThumbnail: empty texture size for window" << m_handle->caption();
         return;
     }
 
@@ -211,16 +213,19 @@ void WindowThumbnailSource::updateVulkan()
     if (!m_vulkanFbo || m_vulkanFbo->size() != textureSize) {
         m_vulkanRenderPass = VulkanRenderPass::createForOffscreen(ctx, fmt, false);
         if (!m_vulkanRenderPass || !m_vulkanRenderPass->isValid()) {
+            qCWarning(KWIN_SCRIPTING) << "VulkanThumbnail: failed to create render pass";
             return;
         }
         m_vulkanFbo = VulkanFramebuffer::createWithTexture(ctx, m_vulkanRenderPass.get(), textureSize, fmt);
         if (!m_vulkanFbo || !m_vulkanFbo->isValid()) {
+            qCWarning(KWIN_SCRIPTING) << "VulkanThumbnail: failed to create framebuffer";
             return;
         }
     }
 
     VkCommandBuffer cmd = ctx->beginSingleTimeCommands();
     if (cmd == VK_NULL_HANDLE) {
+        qCWarning(KWIN_SCRIPTING) << "VulkanThumbnail: failed to begin single-time commands";
         return;
     }
 
@@ -263,6 +268,7 @@ void WindowThumbnailSource::updateVulkan()
     if (VulkanTexture *tex = m_vulkanFbo->colorTexture()) {
         m_cachedImage = ctx->readTextureToImage(tex);
         m_cachedImage.setDevicePixelRatio(dpr);
+        qCDebug(KWIN_SCRIPTING) << "VulkanThumbnail: readback" << m_cachedImage.size() << "null=" << m_cachedImage.isNull();
     }
 
     m_dirty = false;
@@ -399,7 +405,10 @@ void WindowThumbnailItem::resetSource()
 
 void WindowThumbnailItem::updateSource()
 {
-    if ((useGlThumbnails() || useVulkanThumbnails()) && window() && m_client) {
+    const bool gl = useGlThumbnails();
+    const bool vulkan = useVulkanThumbnails();
+    qCDebug(KWIN_SCRIPTING) << "VulkanThumbnail: updateSource gl=" << gl << "vulkan=" << vulkan << "window=" << (window() != nullptr) << "client=" << (m_client != nullptr);
+    if ((gl || vulkan) && window() && m_client) {
         m_source = WindowThumbnailSource::getOrCreate(window(), m_client);
         connect(m_source.get(), &WindowThumbnailSource::changed, this, &WindowThumbnailItem::update);
     } else {
@@ -418,6 +427,7 @@ QSGNode *WindowThumbnailItem::updatePaintNode(QSGNode *oldNode, QQuickItem::Upda
         if (useVulkanThumbnails()) {
             const QImage img = m_source->acquireImage();
             if (img.isNull()) {
+                qCDebug(KWIN_SCRIPTING) << "VulkanThumbnail: updatePaintNode: image still null";
                 return oldNode;
             }
             if (!m_provider) {
