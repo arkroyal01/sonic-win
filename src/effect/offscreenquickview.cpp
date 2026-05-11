@@ -151,10 +151,10 @@ OffscreenQuickView::OffscreenQuickView(ExportMode exportMode, bool alpha)
             } else {
                 d->m_glcontext->doneCurrent();
 
-                // If the GL context is not sharing with kwin's main context the
-                // FBO texture cannot be passed to the compositor directly.
-                // Force blit mode so the QImage path is always populated.
-                if (!d->m_glcontext->shareContext()) {
+                // If the GL context is not sharing with kwin's main context, or if
+                // the compositor is not OpenGL (Vulkan reads via bufferAsImage(), not
+                // bufferAsTexture()), force blit mode so the QImage path is populated.
+                if (!d->m_glcontext->shareContext() || effects->compositingType() != OpenGLCompositing) {
                     d->m_useBlit = true;
                 }
             }
