@@ -22,11 +22,6 @@ class GLFramebuffer;
 class GLTexture;
 class ThumbnailTextureProvider;
 class WindowThumbnailSource;
-#if HAVE_VULKAN
-class VulkanFramebuffer;
-class VulkanRenderPass;
-#endif
-
 class WindowThumbnailSource : public QObject
 {
     Q_OBJECT
@@ -64,8 +59,6 @@ private:
     bool m_dirty = true;
 
 #if HAVE_VULKAN
-    std::unique_ptr<VulkanFramebuffer> m_vulkanFbo;
-    std::unique_ptr<VulkanRenderPass> m_vulkanRenderPass;
     QImage m_cachedImage;
 #endif
 };

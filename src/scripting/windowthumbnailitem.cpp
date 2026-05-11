@@ -24,11 +24,9 @@
 
 #if HAVE_VULKAN
 #include "platformsupport/scenes/vulkan/vulkancontext.h"
-#include "platformsupport/scenes/vulkan/vulkanframebuffer.h"
-#include "platformsupport/scenes/vulkan/vulkanrenderpass.h"
-#include "platformsupport/scenes/vulkan/vulkanrendertarget.h"
+#include "platformsupport/scenes/vulkan/vulkansurfacetexture.h"
 #include "platformsupport/scenes/vulkan/vulkantexture.h"
-#include "scene/itemrenderer_vulkan.h"
+#include "scene/surfaceitem.h"
 #include "scene/workspacescene_vulkan.h"
 #endif
 
@@ -196,80 +194,34 @@ void WindowThumbnailSource::updateVulkan()
         qCWarning(KWIN_SCRIPTING) << "VulkanThumbnail: no WorkspaceSceneVulkan";
         return;
     }
-    auto *vkRenderer = static_cast<ItemRendererVulkan *>(vkScene->renderer());
+    SurfaceItem *surfaceItem = m_handle->windowItem()->surfaceItem();
+    if (!surfaceItem) {
+        qCWarning(KWIN_SCRIPTING) << "VulkanThumbnail: no surfaceItem";
+        return;
+    }
+
+    SurfacePixmap *pixmap = surfaceItem->pixmap();
+    if (!pixmap) {
+        // not yet uploaded; will retry next frame
+        return;
+    }
+
+    auto *vulkanSurfaceTex = dynamic_cast<VulkanSurfaceTexture *>(pixmap->texture());
+    if (!vulkanSurfaceTex || !vulkanSurfaceTex->isValid()) {
+        qCWarning(KWIN_SCRIPTING) << "VulkanThumbnail: surface texture not valid";
+        return;
+    }
+
+    VulkanTexture *tex = vulkanSurfaceTex->texture().firstPlane();
+    if (!tex) {
+        qCWarning(KWIN_SCRIPTING) << "VulkanThumbnail: no texture plane";
+        return;
+    }
+
     VulkanContext *ctx = vkScene->backend()->vulkanContext();
-
-    const QRectF geometry = m_handle->visibleGeometry();
-    const qreal dpr = m_view->devicePixelRatio();
-    const QSize textureSize = geometry.toAlignedRect().size() * dpr;
-
-    if (textureSize.isEmpty()) {
-        qCWarning(KWIN_SCRIPTING) << "VulkanThumbnail: empty texture size for window" << m_handle->caption();
-        return;
-    }
-
-    const VkFormat fmt = vkScene->backend()->colorFormat();
-
-    if (!m_vulkanFbo || m_vulkanFbo->size() != textureSize) {
-        m_vulkanRenderPass = VulkanRenderPass::createForOffscreen(ctx, fmt, false);
-        if (!m_vulkanRenderPass || !m_vulkanRenderPass->isValid()) {
-            qCWarning(KWIN_SCRIPTING) << "VulkanThumbnail: failed to create render pass";
-            return;
-        }
-        m_vulkanFbo = VulkanFramebuffer::createWithTexture(ctx, m_vulkanRenderPass.get(), textureSize, fmt);
-        if (!m_vulkanFbo || !m_vulkanFbo->isValid()) {
-            qCWarning(KWIN_SCRIPTING) << "VulkanThumbnail: failed to create framebuffer";
-            return;
-        }
-    }
-
-    VkCommandBuffer cmd = ctx->beginSingleTimeCommands();
-    if (cmd == VK_NULL_HANDLE) {
-        qCWarning(KWIN_SCRIPTING) << "VulkanThumbnail: failed to begin single-time commands";
-        return;
-    }
-
-    auto vkRT = std::make_unique<VulkanRenderTarget>(m_vulkanFbo.get());
-    vkRT->setCommandBuffer(cmd);
-    RenderTarget renderTarget(vkRT.get());
-    RenderViewport viewport(geometry, dpr, renderTarget);
-
-    VkClearValue clearValue{};
-    const VkRect2D renderArea{{0, 0}, {(uint32_t)textureSize.width(), (uint32_t)textureSize.height()}};
-    m_vulkanRenderPass->begin(cmd, m_vulkanFbo->framebuffer(), renderArea, &clearValue, 1);
-
-    VkViewport vp{};
-    vp.x = 0.0f;
-    vp.y = float(textureSize.height());
-    vp.width = float(textureSize.width());
-    vp.height = -float(textureSize.height());
-    vp.minDepth = 0.0f;
-    vp.maxDepth = 1.0f;
-    vkCmdSetViewport(cmd, 0, 1, &vp);
-
-    VkRect2D scissor{{0, 0}, {(uint32_t)textureSize.width(), (uint32_t)textureSize.height()}};
-    vkCmdSetScissor(cmd, 0, 1, &scissor);
-
-    const size_t savedOffset = vkRenderer->vertexBufferOffset();
-    const int mask = Scene::PAINT_WINDOW_TRANSFORMED;
-    Compositor::self()->scene()->renderer()->renderItem(renderTarget, viewport,
-                                                        m_handle->windowItem(), mask,
-                                                        infiniteRegion(), WindowPaintData{});
-    vkRenderer->setVertexBufferOffset(savedOffset);
-
-    m_vulkanRenderPass->end(cmd);
-
-    if (VulkanTexture *tex = m_vulkanFbo->colorTexture()) {
-        tex->setCurrentLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    }
-
-    ctx->endSingleTimeCommands(cmd);
-
-    if (VulkanTexture *tex = m_vulkanFbo->colorTexture()) {
-        m_cachedImage = ctx->readTextureToImage(tex);
-        m_cachedImage.setDevicePixelRatio(dpr);
-        qCDebug(KWIN_SCRIPTING) << "VulkanThumbnail: readback" << m_cachedImage.size() << "null=" << m_cachedImage.isNull();
-    }
+    m_cachedImage = ctx->readTextureToImage(tex);
+    m_cachedImage.setDevicePixelRatio(m_view->devicePixelRatio());
+    qCWarning(KWIN_SCRIPTING) << "VulkanThumbnail: direct readback" << m_cachedImage.size() << "null=" << m_cachedImage.isNull();
 
     m_dirty = false;
     Q_EMIT changed();
