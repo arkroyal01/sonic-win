@@ -221,7 +221,6 @@ void WindowThumbnailSource::updateVulkan()
     VulkanContext *ctx = vkScene->backend()->vulkanContext();
     m_cachedImage = ctx->readTextureToImage(tex);
     m_cachedImage.setDevicePixelRatio(m_view->devicePixelRatio());
-    qCWarning(KWIN_SCRIPTING) << "VulkanThumbnail: direct readback" << m_cachedImage.size() << "null=" << m_cachedImage.isNull();
 
     m_dirty = false;
     Q_EMIT changed();
