@@ -23,6 +23,8 @@ namespace KWin
 {
 class VulkanTexture;
 class VulkanContext;
+class VulkanRenderPass;
+class VulkanFramebuffer;
 }
 #endif
 
@@ -35,8 +37,10 @@ class BlurManagerInterface;
 struct BlurVulkanRenderData
 {
     std::vector<std::unique_ptr<VulkanTexture>> textures;
+    std::vector<std::unique_ptr<VulkanFramebuffer>> framebuffers;
     QSize capturedSize;
     size_t iterationCount = 0;
+    bool needsInit = true;
 };
 #endif
 
@@ -113,6 +117,12 @@ private:
     bool initVulkanResources();
     VkRenderPass m_vulkanResumePass = VK_NULL_HANDLE;
     VulkanContext *m_vulkanCtx = nullptr;
+    std::unique_ptr<VulkanRenderPass> m_vulkanBlurPass;
+    VkDescriptorSetLayout m_vulkanBlurDsLayout = VK_NULL_HANDLE;
+    VkPipelineLayout m_vulkanBlurPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline m_vulkanDownsamplePipeline = VK_NULL_HANDLE;
+    VkPipeline m_vulkanUpsamplePipeline = VK_NULL_HANDLE;
+    VkSampler m_vulkanBlurSampler = VK_NULL_HANDLE;
 #endif
 
 private:
