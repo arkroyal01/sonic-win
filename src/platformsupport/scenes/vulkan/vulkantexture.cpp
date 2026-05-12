@@ -330,7 +330,8 @@ std::unique_ptr<VulkanTexture> VulkanTexture::createRenderTarget(VulkanContext *
     auto texture = std::unique_ptr<VulkanTexture>(new VulkanTexture(context));
 
     if (!texture->createImage(size, format,
-                              VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                              VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
+                                  | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                               VK_IMAGE_TILING_OPTIMAL)) {
         return nullptr;
     }

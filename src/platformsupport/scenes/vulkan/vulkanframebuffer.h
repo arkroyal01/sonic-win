@@ -150,6 +150,25 @@ public:
     void blitFrom(VkCommandBuffer cmd, VulkanFramebuffer *source, const QRect &sourceRect,
                   const QRect &destRect, VkFilter filter = VK_FILTER_LINEAR);
 
+    /**
+     * @brief Set the raw VkImage for the color attachment (e.g., swapchain image).
+     * Used when the framebuffer was not created with createWithTexture().
+     */
+    void setColorImage(VkImage image)
+    {
+        m_colorImage = image;
+    }
+
+    /**
+     * @brief Get the raw VkImage for the color attachment.
+     * For swapchain framebuffers (created from a swapchain image view), returns the swapchain image.
+     * Returns VK_NULL_HANDLE if not set (use colorTexture()->image() for owned-texture framebuffers).
+     */
+    VkImage colorImage() const
+    {
+        return m_colorImage;
+    }
+
 private:
     VulkanFramebuffer(VulkanContext *context, VulkanRenderPass *renderPass, const QSize &size);
 
@@ -161,6 +180,9 @@ private:
     QSize m_size;
 
     VkFramebuffer m_framebuffer = VK_NULL_HANDLE;
+
+    // Raw VkImage for swapchain framebuffers (not owned — owned by the swapchain)
+    VkImage m_colorImage = VK_NULL_HANDLE;
 
     // Owned textures (if created with createWithTexture)
     std::unique_ptr<VulkanTexture> m_colorTexture;

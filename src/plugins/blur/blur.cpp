@@ -10,6 +10,8 @@
 // KConfigSkeleton
 #include "blurconfig.h"
 
+#include "config-kwin.h"
+
 #include "core/pixelgrid.h"
 #include "core/rendertarget.h"
 #include "core/renderviewport.h"
@@ -21,6 +23,16 @@
 #include "window.h"
 
 #include "utils/xcbutils.h"
+
+#if HAVE_VULKAN
+#include "compositor.h"
+#include "platformsupport/scenes/vulkan/vulkanbackend.h"
+#include "platformsupport/scenes/vulkan/vulkancontext.h"
+#include "platformsupport/scenes/vulkan/vulkanframebuffer.h"
+#include "platformsupport/scenes/vulkan/vulkantexture.h"
+#include "scene/itemrenderer_vulkan.h"
+#include "scene/workspacescene.h"
+#endif
 
 #include <QGuiApplication>
 #include <QMatrix4x4>
@@ -56,6 +68,19 @@ BlurEffect::BlurEffect()
 {
     BlurConfig::instance(effects->config());
     ensureResources();
+
+#if HAVE_VULKAN
+    if (effects->isVulkanCompositing()) {
+        initBlurStrengthValues();
+        reconfigure(ReconfigureAll);
+        if (!initVulkanResources()) {
+            qCWarning(KWIN_BLUR) << "Failed to initialise Vulkan blur resources";
+            return;
+        }
+        // Skip GL shader loading below
+        goto skip_gl_init;
+    }
+#endif
 
     m_contrastPass.shader = GLShaderManager::instance()->generateShaderFromFile(GLShaderTrait::MapTexture,
                                                                                 QStringLiteral(":/effects/blur/shaders/vertex.vert"),
@@ -123,6 +148,10 @@ BlurEffect::BlurEffect()
     initBlurStrengthValues();
     reconfigure(ReconfigureAll);
 
+#if HAVE_VULKAN
+skip_gl_init:
+#endif
+
     if (effects->xcbConnection()) {
         net_wm_blur_region = effects->announceSupportProperty(s_blurAtomName, this);
     }
@@ -145,6 +174,11 @@ BlurEffect::BlurEffect()
 
 BlurEffect::~BlurEffect()
 {
+#if HAVE_VULKAN
+    if (m_vulkanResumePass != VK_NULL_HANDLE && m_vulkanCtx) {
+        vkDestroyRenderPass(m_vulkanCtx->backend()->device(), m_vulkanResumePass, nullptr);
+    }
+#endif
 }
 
 void BlurEffect::initBlurStrengthValues()
@@ -324,6 +358,11 @@ bool BlurEffect::eventFilter(QObject *watched, QEvent *event)
 
 bool BlurEffect::enabledByDefault()
 {
+#if HAVE_VULKAN
+    if (effects->isVulkanCompositing()) {
+        return true;
+    }
+#endif
     const auto context = effects->openglContext();
     if (!context || context->isSoftwareRenderer()) {
         return false;
@@ -345,11 +384,11 @@ bool BlurEffect::enabledByDefault()
 
 bool BlurEffect::supported()
 {
-    // Blur effect requires OpenGL - it uses GLTexture and GLFramebuffer which don't work in Vulkan
-    // Return false for Vulkan backend to prevent 1/4 scale rendering issue
-    if (!effects->isOpenGLCompositing()) {
-        return false;
+#if HAVE_VULKAN
+    if (effects->isVulkanCompositing()) {
+        return true;
     }
+#endif
     return effects->openglContext() && effects->openglContext()->supportsBlits();
 }
 
@@ -514,6 +553,13 @@ GLTexture *BlurEffect::ensureNoiseTexture()
 
 void BlurEffect::blur(const RenderTarget &renderTarget, const RenderViewport &viewport, EffectWindow *w, int mask, const QRegion &region, WindowPaintData &data)
 {
+#if HAVE_VULKAN
+    if (effects->isVulkanCompositing()) {
+        blurVulkan(renderTarget, viewport, w, mask, region, data);
+        return;
+    }
+#endif
+
     auto it = m_windows.find(w);
     if (it == m_windows.end()) {
         return;
@@ -868,6 +914,279 @@ void BlurEffect::blur(const RenderTarget &renderTarget, const RenderViewport &vi
 
     vbo->unbindArrays();
 }
+
+#if HAVE_VULKAN
+
+bool BlurEffect::initVulkanResources()
+{
+    auto *scene = Compositor::self()->scene();
+    if (!scene) {
+        return false;
+    }
+    auto *renderer = static_cast<ItemRendererVulkan *>(scene->renderer());
+    if (!renderer) {
+        return false;
+    }
+    m_vulkanCtx = renderer->context();
+    if (!m_vulkanCtx) {
+        return false;
+    }
+
+    VkDevice device = m_vulkanCtx->backend()->device();
+    VkFormat colorFormat = m_vulkanCtx->backend()->colorFormat();
+
+    VkAttachmentDescription colorAttachment{};
+    colorAttachment.format = colorFormat;
+    colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    colorAttachment.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    colorAttachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+    VkAttachmentReference colorRef{};
+    colorRef.attachment = 0;
+    colorRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+    VkSubpassDescription subpass{};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 1;
+    subpass.pColorAttachments = &colorRef;
+
+    // Ensure the transfer writes are visible before we read them as color attachments
+    VkSubpassDependency dependency{};
+    dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+    dependency.dstSubpass = 0;
+    dependency.srcStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dependency.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
+    VkRenderPassCreateInfo rpInfo{};
+    rpInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    rpInfo.attachmentCount = 1;
+    rpInfo.pAttachments = &colorAttachment;
+    rpInfo.subpassCount = 1;
+    rpInfo.pSubpasses = &subpass;
+    rpInfo.dependencyCount = 1;
+    rpInfo.pDependencies = &dependency;
+
+    return vkCreateRenderPass(device, &rpInfo, nullptr, &m_vulkanResumePass) == VK_SUCCESS;
+}
+
+void BlurEffect::blurVulkan(const RenderTarget &renderTarget, const RenderViewport &viewport,
+                            EffectWindow *w, int mask, const QRegion &region, WindowPaintData &data)
+{
+    auto it = m_windows.find(w);
+    if (it == m_windows.end()) {
+        return;
+    }
+    BlurEffectData &blurInfo = it->second;
+    if (!shouldBlur(w, mask, data)) {
+        return;
+    }
+
+    auto *scene = Compositor::self()->scene();
+    if (!scene) {
+        return;
+    }
+    auto *renderer = static_cast<ItemRendererVulkan *>(scene->renderer());
+
+    VkCommandBuffer cmd = renderer->currentCommandBuffer();
+    VulkanFramebuffer *fb = renderer->currentFramebuffer();
+    if (!cmd || !fb) {
+        return;
+    }
+
+    VkImage swapchainImage = fb->colorImage();
+    if (swapchainImage == VK_NULL_HANDLE) {
+        return;
+    }
+
+    // Compute blur region in logical and device pixels
+    QRegion blurShape = blurRegion(w).translated(w->pos().toPoint());
+    const QRect backgroundRect = blurShape.boundingRect();
+    if (backgroundRect.isEmpty()) {
+        return;
+    }
+    const QRect deviceRect = snapToPixelGrid(scaledRect(backgroundRect, viewport.scale()));
+    if (deviceRect.isEmpty()) {
+        return;
+    }
+
+    // Ensure blur texture chain is allocated and sized correctly
+    BlurVulkanRenderData &vkData = blurInfo.vulkanRender;
+    const size_t neededTextures = m_iterationCount + 1;
+    const QSize tex0Size = deviceRect.size();
+
+    if (vkData.textures.size() != neededTextures
+        || vkData.capturedSize != tex0Size
+        || vkData.iterationCount != m_iterationCount) {
+        vkData.textures.clear();
+        VkFormat fmt = m_vulkanCtx->backend()->colorFormat();
+        for (size_t i = 0; i <= m_iterationCount; ++i) {
+            QSize sz(std::max(1, tex0Size.width() >> i),
+                     std::max(1, tex0Size.height() >> i));
+            auto tex = VulkanTexture::createRenderTarget(m_vulkanCtx, sz, fmt);
+            if (!tex) {
+                qCWarning(KWIN_BLUR) << "Failed to allocate Vulkan blur texture";
+                vkData.textures.clear();
+                return;
+            }
+            vkData.textures.push_back(std::move(tex));
+        }
+        vkData.capturedSize = tex0Size;
+        vkData.iterationCount = m_iterationCount;
+    }
+
+    // Helper: insert an image memory barrier
+    auto barrier = [&](VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout,
+                       VkAccessFlags srcAccess, VkAccessFlags dstAccess,
+                       VkPipelineStageFlags srcStage, VkPipelineStageFlags dstStage) {
+        VkImageMemoryBarrier b{};
+        b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        b.oldLayout = oldLayout;
+        b.newLayout = newLayout;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = image;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        b.srcAccessMask = srcAccess;
+        b.dstAccessMask = dstAccess;
+        vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &b);
+    };
+
+    // End the active render pass so we can use the swapchain image as a transfer source/dest
+    vkCmdEndRenderPass(cmd);
+
+    // Swapchain image: PRESENT_SRC_KHR → TRANSFER_SRC_OPTIMAL (capture)
+    barrier(swapchainImage,
+            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+    // tex[0]: UNDEFINED → TRANSFER_DST_OPTIMAL
+    barrier(vkData.textures[0]->image(),
+            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            0, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+    // Capture: blit swapchain blur region → tex[0]
+    {
+        VkImageBlit blit{};
+        blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        blit.srcOffsets[0] = {deviceRect.x(), deviceRect.y(), 0};
+        blit.srcOffsets[1] = {deviceRect.x() + deviceRect.width(), deviceRect.y() + deviceRect.height(), 1};
+        blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        blit.dstOffsets[0] = {0, 0, 0};
+        blit.dstOffsets[1] = {vkData.textures[0]->width(), vkData.textures[0]->height(), 1};
+        vkCmdBlitImage(cmd,
+                       swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       vkData.textures[0]->image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       1, &blit, VK_FILTER_LINEAR);
+    }
+
+    // Downsample: tex[i-1] → tex[i], halving each dimension
+    for (size_t i = 1; i <= m_iterationCount; ++i) {
+        // tex[i-1]: DST → SRC (first iteration: after capture blit; subsequent: after previous downsample)
+        barrier(vkData.textures[i - 1]->image(),
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+        // tex[i]: UNDEFINED → DST
+        barrier(vkData.textures[i]->image(),
+                VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+        VkImageBlit blit{};
+        blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        blit.srcOffsets[0] = {0, 0, 0};
+        blit.srcOffsets[1] = {vkData.textures[i - 1]->width(), vkData.textures[i - 1]->height(), 1};
+        blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        blit.dstOffsets[0] = {0, 0, 0};
+        blit.dstOffsets[1] = {vkData.textures[i]->width(), vkData.textures[i]->height(), 1};
+        vkCmdBlitImage(cmd,
+                       vkData.textures[i - 1]->image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       vkData.textures[i]->image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       1, &blit, VK_FILTER_LINEAR);
+    }
+    // State: tex[0..N-1] = TRANSFER_SRC_OPTIMAL, tex[N] = TRANSFER_DST_OPTIMAL
+
+    // tex[N]: DST → SRC (to use as upsample source)
+    barrier(vkData.textures[m_iterationCount]->image(),
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+    // Upsample: tex[i] → tex[i-1], doubling each dimension
+    for (size_t i = m_iterationCount; i > 0; --i) {
+        // tex[i-1]: SRC → DST (was a downsample source, now becomes upsample destination)
+        barrier(vkData.textures[i - 1]->image(),
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+        VkImageBlit blit{};
+        blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        blit.srcOffsets[0] = {0, 0, 0};
+        blit.srcOffsets[1] = {vkData.textures[i]->width(), vkData.textures[i]->height(), 1};
+        blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        blit.dstOffsets[0] = {0, 0, 0};
+        blit.dstOffsets[1] = {vkData.textures[i - 1]->width(), vkData.textures[i - 1]->height(), 1};
+        vkCmdBlitImage(cmd,
+                       vkData.textures[i]->image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       vkData.textures[i - 1]->image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       1, &blit, VK_FILTER_LINEAR);
+
+        // tex[i-1]: DST → SRC (so it can be used as source in next iteration or for final blit)
+        barrier(vkData.textures[i - 1]->image(),
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    }
+    // tex[0] = TRANSFER_SRC_OPTIMAL with fully blurred content
+
+    // Swapchain: TRANSFER_SRC_OPTIMAL → TRANSFER_DST_OPTIMAL (blit blurred result back)
+    barrier(swapchainImage,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+    // Blit blurred tex[0] → swapchain blur region
+    {
+        VkImageBlit blit{};
+        blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        blit.srcOffsets[0] = {0, 0, 0};
+        blit.srcOffsets[1] = {vkData.textures[0]->width(), vkData.textures[0]->height(), 1};
+        blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        blit.dstOffsets[0] = {deviceRect.x(), deviceRect.y(), 0};
+        blit.dstOffsets[1] = {deviceRect.x() + deviceRect.width(), deviceRect.y() + deviceRect.height(), 1};
+        vkCmdBlitImage(cmd,
+                       vkData.textures[0]->image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       1, &blit, VK_FILTER_LINEAR);
+    }
+
+    // Swapchain: TRANSFER_DST_OPTIMAL → COLOR_ATTACHMENT_OPTIMAL (ready for resumed rendering)
+    barrier(swapchainImage,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+
+    // Resume rendering with LOAD_OP_LOAD so subsequent drawWindow() renders on top of the blur
+    VkRenderPassBeginInfo rpBegin{};
+    rpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    rpBegin.renderPass = m_vulkanResumePass;
+    rpBegin.framebuffer = fb->framebuffer();
+    rpBegin.renderArea.offset = {0, 0};
+    rpBegin.renderArea.extent = {static_cast<uint32_t>(fb->width()), static_cast<uint32_t>(fb->height())};
+    vkCmdBeginRenderPass(cmd, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
+}
+
+#endif // HAVE_VULKAN
 
 bool BlurEffect::isActive() const
 {

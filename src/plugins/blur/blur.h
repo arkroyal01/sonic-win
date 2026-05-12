@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include "config-kwin.h"
+
 #include "effect/effect.h"
 #include "opengl/glutils.h"
 #include "scene/item.h"
@@ -15,10 +17,28 @@
 
 #include <unordered_map>
 
+#if HAVE_VULKAN
+#include <vulkan/vulkan.h>
+namespace KWin
+{
+class VulkanTexture;
+class VulkanContext;
+}
+#endif
+
 namespace KWin
 {
 
 class BlurManagerInterface;
+
+#if HAVE_VULKAN
+struct BlurVulkanRenderData
+{
+    std::vector<std::unique_ptr<VulkanTexture>> textures;
+    QSize capturedSize;
+    size_t iterationCount = 0;
+};
+#endif
 
 struct BlurRenderData
 {
@@ -38,6 +58,9 @@ struct BlurEffectData
 
     /// The render data. On X11, all screens share a single framebuffer.
     BlurRenderData render;
+#if HAVE_VULKAN
+    BlurVulkanRenderData vulkanRender;
+#endif
 
     ItemEffect windowEffect;
 };
@@ -85,6 +108,12 @@ private:
     void updateBlurRegion(EffectWindow *w);
     void blur(const RenderTarget &renderTarget, const RenderViewport &viewport, EffectWindow *w, int mask, const QRegion &region, WindowPaintData &data);
     GLTexture *ensureNoiseTexture();
+#if HAVE_VULKAN
+    void blurVulkan(const RenderTarget &renderTarget, const RenderViewport &viewport, EffectWindow *w, int mask, const QRegion &region, WindowPaintData &data);
+    bool initVulkanResources();
+    VkRenderPass m_vulkanResumePass = VK_NULL_HANDLE;
+    VulkanContext *m_vulkanCtx = nullptr;
+#endif
 
 private:
     struct

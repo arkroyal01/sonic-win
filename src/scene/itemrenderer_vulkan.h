@@ -117,6 +117,16 @@ public:
     }
 
     /**
+     * Returns the current Vulkan framebuffer being rendered to.
+     * This is valid only during a frame (between beginFrame and endFrame).
+     * For swapchain framebuffers, colorImage() returns the raw VkImage.
+     */
+    VulkanFramebuffer *currentFramebuffer() const
+    {
+        return m_currentFramebuffer;
+    }
+
+    /**
      * Snapshot / restore the streaming-buffer write position.
      *
      * Offscreen effects call effects->drawWindow() which flows through renderNodes()

@@ -376,6 +376,7 @@ bool VulkanSwapchain::createFramebuffers()
             qCWarning(KWIN_VULKAN) << "Failed to create framebuffer" << i;
             return false;
         }
+        m_framebuffers[i]->setColorImage(m_images[i]);
     }
 
     return true;
