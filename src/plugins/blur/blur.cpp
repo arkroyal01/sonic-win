@@ -1621,6 +1621,23 @@ void BlurEffect::blurVulkan(const RenderTarget &renderTarget, const RenderViewpo
                VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
 
+    // Restore full-screen viewport/scissor — our Kawase passes set these to the intermediate
+    // texture sizes and dynamic state persists across render passes in the command buffer.
+    // The main renderer set the viewport in beginFrame() and expects it to remain unchanged.
+    {
+        VkViewport fullVp{};
+        fullVp.x = 0.0f;
+        fullVp.y = static_cast<float>(fb->height());
+        fullVp.width = static_cast<float>(fb->width());
+        fullVp.height = -static_cast<float>(fb->height());
+        fullVp.minDepth = 0.0f;
+        fullVp.maxDepth = 1.0f;
+        VkRect2D fullSc{};
+        fullSc.extent = {static_cast<uint32_t>(fb->width()), static_cast<uint32_t>(fb->height())};
+        vkCmdSetViewport(cmd, 0, 1, &fullVp);
+        vkCmdSetScissor(cmd, 0, 1, &fullSc);
+    }
+
     // Resume rendering with LOAD_OP_LOAD so subsequent drawWindow() renders on top of the blur
     VkRenderPassBeginInfo rpBegin{};
     rpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
