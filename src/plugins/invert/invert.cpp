@@ -108,6 +108,14 @@ InvertEffect::InvertEffect()
             effects->addRepaintFull();
         }
     });
+    // Repaint only when the cursor actually moves, not every frame.
+    connect(effects, &EffectsHandler::mouseChanged, this,
+            [this](const QPointF &, const QPointF &, Qt::MouseButtons, Qt::MouseButtons,
+                   Qt::KeyboardModifiers, Qt::KeyboardModifiers) {
+        if (m_allWindows && m_valid) {
+            effects->addRepaintFull();
+        }
+    });
 
     effects->addRepaintFull();
 }

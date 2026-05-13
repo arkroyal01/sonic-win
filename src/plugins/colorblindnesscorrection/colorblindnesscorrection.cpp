@@ -70,6 +70,12 @@ ColorBlindnessCorrectionEffect::ColorBlindnessCorrectionEffect()
         m_cursorDirty = true;
         effects->addRepaintFull();
     });
+    // Repaint only when the cursor actually moves, not every frame.
+    connect(effects, &EffectsHandler::mouseChanged, this,
+            [](const QPointF &, const QPointF &, Qt::MouseButtons, Qt::MouseButtons,
+               Qt::KeyboardModifiers, Qt::KeyboardModifiers) {
+        effects->addRepaintFull();
+    });
 }
 
 ColorBlindnessCorrectionEffect::~ColorBlindnessCorrectionEffect()
