@@ -27,3 +27,9 @@ CMakeLists.txt.user*
 /cmake-build*
 .cache
 .directory
+
+# Arch packaging (local only)
+PKGBUILD
+pkg/
+*.pkg.tar.zst
+src/build/
