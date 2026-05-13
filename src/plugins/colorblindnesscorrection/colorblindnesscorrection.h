@@ -12,11 +12,17 @@
 #include "effect/offscreeneffect.h"
 #include "opengl/glshadermanager.h"
 
+#include <QImage>
+#include <QPoint>
+
 namespace KWin
 {
 
+class GLTexture;
 #if HAVE_VULKAN
+class VulkanBuffer;
 class VulkanPipeline;
+class VulkanTexture;
 #endif
 
 /**
@@ -42,6 +48,7 @@ public:
     void reconfigure(ReconfigureFlags flags) override;
     int requestedEffectChainPosition() const override;
     void apply(EffectWindow *window, int mask, WindowPaintData &data, WindowQuadList &quads) override;
+    void paintScreen(const RenderTarget &, const RenderViewport &, int, const QRegion &, Output *) override;
 
     static bool supported();
 
@@ -53,16 +60,27 @@ private Q_SLOTS:
 
 private:
     void loadData();
+    void rebuildCursorImage();
+#if HAVE_VULKAN
+    void paintVulkanCursor(const RenderTarget &, const RenderViewport &);
+#endif
 
     Mode m_mode = Protanopia;
     float m_intensity = 1.0f;
 
     std::unordered_set<KWin::EffectWindow *> m_windows;
     std::unique_ptr<GLShader> m_shader;
+
+    QImage m_cursorImage;
+    QPoint m_cursorHotspot;
+    bool m_cursorDirty = true;
+    std::unique_ptr<GLTexture> m_glCursorTexture;
 #if HAVE_VULKAN
-    VulkanPipeline *m_vkPipeline = nullptr; // ColorBlindnessCorrect pipeline
-    VulkanPipeline *m_vkGreyscalePipeline = nullptr; // Default pipeline with saturation=0
-    float m_defectMatrix[12] = {}; // std140: 3 columns × 4 floats (3 data + 1 pad each)
+    VulkanPipeline *m_vkPipeline = nullptr;
+    VulkanPipeline *m_vkGreyscalePipeline = nullptr;
+    VulkanPipeline *m_vkCursorPipeline = nullptr;
+    float m_defectMatrix[12] = {};
+    std::unique_ptr<VulkanTexture> m_vkCursorTexture;
 #endif
 };
 
