@@ -45,7 +45,7 @@ InvertEffect::InvertEffect()
     : m_inited(false)
     , m_valid(true)
     , m_shader(nullptr)
-    , m_allWindows(false)
+    , m_allWindows(true)
 {
     QAction *a = new QAction(this);
     a->setAutoRepeat(false);
@@ -72,6 +72,12 @@ InvertEffect::InvertEffect()
 
     connect(effects, &EffectsHandler::windowAdded, this, &InvertEffect::slotWindowAdded);
     connect(effects, &EffectsHandler::windowClosed, this, &InvertEffect::slotWindowClosed);
+
+    // Invert all windows that exist at load time (plugin enabled in KCM).
+    for (EffectWindow *window : effects->stackingOrder()) {
+        invert(window);
+    }
+    effects->addRepaintFull();
 }
 
 InvertEffect::~InvertEffect() = default;
