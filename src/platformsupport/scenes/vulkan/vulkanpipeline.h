@@ -158,15 +158,13 @@ struct VulkanUniforms
     float _pad3[3];
     float borderColor[4];
 
-    // Color management
+    // Color management (std140: vec2 has align 8, so 4 bytes after each int)
     int sourceTransferFunction;
-    float _pad4[3];
+    float _pad4[1];
     float sourceTransferParams[2];
-    float _pad5[2];
     int destTransferFunction;
-    float _pad6[3];
+    float _pad6[1];
     float destTransferParams[2];
-    float _pad7[2];
     float colorimetryTransform[16];
     float sourceReferenceLuminance;
     float maxTonemappingLuminance;

@@ -22,9 +22,12 @@
 #include <QMatrix4x4>
 
 #if HAVE_VULKAN
+#include "compositor.h"
 #include "platformsupport/scenes/vulkan/vulkancontext.h"
 #include "platformsupport/scenes/vulkan/vulkanpipeline.h"
 #include "platformsupport/scenes/vulkan/vulkanpipelinemanager.h"
+#include "scene/itemrenderer_vulkan.h"
+#include "scene/workspacescene_vulkan.h"
 #endif
 
 Q_LOGGING_CATEGORY(KWIN_INVERT, "kwin_effect_invert", QtWarningMsg)
@@ -97,7 +100,9 @@ void InvertEffect::invert(EffectWindow *window)
 #if HAVE_VULKAN
     else if (effects->isVulkanCompositing()) {
         if (!m_vkPipeline) {
-            auto *ctx = VulkanContext::currentContext();
+            auto *scene = dynamic_cast<WorkspaceSceneVulkan *>(Compositor::self()->scene());
+            auto *renderer = scene ? static_cast<ItemRendererVulkan *>(scene->renderer()) : nullptr;
+            auto *ctx = renderer ? renderer->context() : nullptr;
             if (ctx && ctx->pipelineManager()) {
                 m_vkPipeline = ctx->pipelineManager()->pipeline(
                     VulkanShaderTrait::MapTexture | VulkanShaderTrait::Modulate | VulkanShaderTrait::Invert);
@@ -120,10 +125,12 @@ bool InvertEffect::loadData()
     ensureResources();
     m_inited = true;
 
-    m_shader = GLShaderManager::instance()->generateShaderFromFile(GLShaderTrait::MapTexture, QString(), QStringLiteral(":/effects/invert/shaders/invert.frag"));
-    if (!m_shader->isValid()) {
-        qCCritical(KWIN_INVERT) << "The shader failed to load!";
-        return false;
+    if (effects->isOpenGLCompositing()) {
+        m_shader = GLShaderManager::instance()->generateShaderFromFile(GLShaderTrait::MapTexture, QString(), QStringLiteral(":/effects/invert/shaders/invert.frag"));
+        if (!m_shader->isValid()) {
+            qCCritical(KWIN_INVERT) << "The shader failed to load!";
+            return false;
+        }
     }
 
     return true;

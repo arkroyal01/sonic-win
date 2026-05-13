@@ -31,6 +31,7 @@ public:
         Protanopia = 0, //<Greatly reduced reds
         Deuteranopia, //<Greatly reduced greens
         Tritanopia, //<Greatly reduced blues
+        Greyscale, //<Desaturate to greyscale
     };
 
     explicit ColorBlindnessCorrectionEffect();
@@ -40,6 +41,7 @@ public:
     bool provides(Feature) override;
     void reconfigure(ReconfigureFlags flags) override;
     int requestedEffectChainPosition() const override;
+    void apply(EffectWindow *window, int mask, WindowPaintData &data, WindowQuadList &quads) override;
 
     static bool supported();
 
@@ -58,7 +60,8 @@ private:
     std::unordered_set<KWin::EffectWindow *> m_windows;
     std::unique_ptr<GLShader> m_shader;
 #if HAVE_VULKAN
-    VulkanPipeline *m_vkPipeline = nullptr;
+    VulkanPipeline *m_vkPipeline = nullptr; // ColorBlindnessCorrect pipeline
+    VulkanPipeline *m_vkGreyscalePipeline = nullptr; // Default pipeline with saturation=0
     float m_defectMatrix[12] = {}; // std140: 3 columns × 4 floats (3 data + 1 pad each)
 #endif
 };

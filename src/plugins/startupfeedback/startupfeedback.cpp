@@ -609,7 +609,10 @@ void StartupFeedbackEffect::paintVulkan(const RenderTarget &renderTarget, const 
     const ColorDescription dstColor = renderTarget.colorDescription();
     const QMatrix4x4 colorimetryTransform = srcColor.toOther(dstColor, RenderingIntent::Perceptual);
     memcpy(uniforms.colorimetryTransform, colorimetryTransform.data(), sizeof(uniforms.colorimetryTransform));
-    uniforms.sourceTransferFunction = srcColor.transferFunction().type;
+    // The texture is VK_FORMAT_B8G8R8A8_SRGB — GPU hardware decodes sRGB→linear during
+    // sampling, so the shader receives linear light. Use linear TF to avoid a second
+    // pow(x,2.2) decode inside encodingToNits().
+    uniforms.sourceTransferFunction = TransferFunction::linear;
     uniforms.sourceTransferParams[0] = srcColor.transferFunction().minLuminance;
     uniforms.sourceTransferParams[1] = srcColor.transferFunction().maxLuminance - srcColor.transferFunction().minLuminance;
     uniforms.sourceReferenceLuminance = srcColor.referenceLuminance();
