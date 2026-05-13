@@ -531,6 +531,10 @@ void BlurEffect::slotWindowDeleted(EffectWindow *w)
 {
     if (auto it = m_windows.find(w); it != m_windows.end()) {
         effects->makeOpenGLContextCurrent();
+        const QRegion blurArea = blurRegion(w).translated(w->pos().toPoint());
+        if (!blurArea.isEmpty()) {
+            effects->addRepaint(blurArea.boundingRect());
+        }
         m_windows.erase(it);
     }
 }
@@ -797,6 +801,11 @@ void BlurEffect::blur(const RenderTarget &renderTarget, const RenderViewport &vi
         blurShape = scaledShape;
     } else if (data.xTranslation() || data.yTranslation()) {
         blurShape.translate(std::round(data.xTranslation()), std::round(data.yTranslation()));
+    }
+
+    blurShape &= region;
+    if (blurShape.isEmpty()) {
+        return;
     }
 
     const QRect backgroundRect = blurShape.boundingRect();
@@ -1382,6 +1391,10 @@ void BlurEffect::blurVulkan(const RenderTarget &renderTarget, const RenderViewpo
 
     // Compute blur region in device pixels
     QRegion blurShape = blurRegion(w).translated(w->pos().toPoint());
+    blurShape &= region;
+    if (blurShape.isEmpty()) {
+        return;
+    }
     const QRect backgroundRect = blurShape.boundingRect();
     if (backgroundRect.isEmpty()) {
         return;
