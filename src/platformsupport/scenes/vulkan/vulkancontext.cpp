@@ -787,6 +787,19 @@ std::unique_ptr<VulkanTexture> VulkanContext::importDmaBufAsTexture(const DmaBuf
     viewInfo.subresourceRange.baseArrayLayer = 0;
     viewInfo.subresourceRange.layerCount = 1;
 
+    // XRGB DRM formats have an undefined/zero X byte in the alpha position of the DMA-BUF.
+    // Swizzle alpha to ONE so the texture samples as fully opaque, matching CPU upload behaviour.
+    switch (attributes.format) {
+    case DRM_FORMAT_XRGB8888:
+    case DRM_FORMAT_XBGR8888:
+    case DRM_FORMAT_XRGB2101010:
+    case DRM_FORMAT_XBGR2101010:
+        viewInfo.components.a = VK_COMPONENT_SWIZZLE_ONE;
+        break;
+    default:
+        break;
+    }
+
     VkImageView imageView;
     result = vkCreateImageView(m_backend->device(), &viewInfo, nullptr, &imageView);
     if (result != VK_SUCCESS) {
