@@ -712,6 +712,15 @@ bool BlurEffect::shouldBlur(const EffectWindow *w, int mask, const WindowPaintDa
         return false;
     }
 
+    // Don't render blur under closing windows unless an effect explicitly forces it.
+    // Without this, effects like fadingpopups fade the window while blur remains at full
+    // intensity, then the blur snaps away when the window finally leaves the stacking order.
+    // Effects that want blur during their close animation (e.g. slidingpopups) set
+    // WindowForceBlurRole to opt back in.
+    if (w->isDeleted() && !w->data(WindowForceBlurRole).toBool()) {
+        return false;
+    }
+
     bool scaled = !qFuzzyCompare(data.xScale(), 1.0) && !qFuzzyCompare(data.yScale(), 1.0);
     bool translated = data.xTranslation() || data.yTranslation();
 
