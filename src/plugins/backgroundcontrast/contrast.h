@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include "config-kwin.h"
+
 #include "effect/effect.h"
 #include "opengl/glplatform.h"
 #include "opengl/glutils.h"
@@ -16,11 +18,20 @@
 #include <QVector2D>
 #include <unordered_map>
 
+#if HAVE_VULKAN
+#include <vulkan/vulkan.h>
+#endif
+
 namespace KWin
 {
 
 class ContrastManagerInterface;
 class ContrastShader;
+
+#if HAVE_VULKAN
+class VulkanTexture;
+class VulkanContext;
+#endif
 
 class ContrastEffect : public KWin::Effect
 {
@@ -61,6 +72,11 @@ private:
     void uploadRegion(std::span<QVector2D> map, const QRegion &region, qreal scale);
     Q_REQUIRED_RESULT bool uploadGeometry(GLVertexBuffer *vbo, const QRegion &region, qreal scale);
 
+#if HAVE_VULKAN
+    bool initVulkanResources();
+    void doContrastVulkan(const RenderViewport &viewport, EffectWindow *w, const QRegion &shape, float opacity);
+#endif
+
 private:
     std::unique_ptr<ContrastShader> m_shader;
 
@@ -73,10 +89,25 @@ private:
         std::unique_ptr<GLTexture> texture;
         std::unique_ptr<GLFramebuffer> fbo;
         ItemEffect windowEffect;
+#if HAVE_VULKAN
+        std::unique_ptr<VulkanTexture> vkTexture;
+        QSize vkCaptureSize;
+        bool vkNeedsInit = true;
+#endif
     };
     std::unordered_map<const EffectWindow *, Data> m_windowData;
     static ContrastManagerInterface *s_contrastManager;
     static QTimer *s_contrastManagerRemoveTimer;
+
+#if HAVE_VULKAN
+    VulkanContext *m_vulkanCtx = nullptr;
+    bool m_vulkanValid = false;
+    VkSampler m_vulkanSampler = VK_NULL_HANDLE;
+    VkDescriptorSetLayout m_vulkanDsLayout = VK_NULL_HANDLE;
+    VkPipelineLayout m_vulkanPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline m_vulkanPipeline = VK_NULL_HANDLE;
+    VkRenderPass m_vulkanRenderPass = VK_NULL_HANDLE;
+#endif
 };
 
 inline bool ContrastEffect::provides(Effect::Feature feature)
