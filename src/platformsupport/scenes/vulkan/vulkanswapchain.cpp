@@ -297,7 +297,16 @@ bool VulkanSwapchain::createSwapchain(const QSize &size)
     createInfo.imageColorSpace = surfaceFormat.colorSpace;
     createInfo.imageExtent = extent;
     createInfo.imageArrayLayers = 1;
-    createInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    // TRANSFER_SRC is needed by the blur effect to blit from the swapchain when capturing
+    // the background. Check surface capabilities before requesting it — it's supported on
+    // virtually all desktop GPUs/drivers but the spec doesn't guarantee it.
+    VkImageUsageFlags imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    if (capabilities.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) {
+        imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    } else {
+        qCWarning(KWIN_VULKAN) << "Surface does not support TRANSFER_SRC; blur effect will not work";
+    }
+    createInfo.imageUsage = imageUsage;
     createInfo.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     createInfo.preTransform = capabilities.currentTransform;
     createInfo.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
