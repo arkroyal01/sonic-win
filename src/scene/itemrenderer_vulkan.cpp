@@ -214,14 +214,22 @@ void ItemRendererVulkan::endFrame()
     // Check if we have GPU-GPU synchronization info (swapchain rendering)
     const bool hasGpuSync = m_currentSyncInfo.imageAvailableSemaphore != VK_NULL_HANDLE && m_currentSyncInfo.renderFinishedSemaphore != VK_NULL_HANDLE;
 
+    // Aggregate wait semaphores: the swapchain's imageAvailable (when present) plus any
+    // external semaphores attached this frame (e.g. ZoomEffect's offscreen submission).
+    std::vector<VkSemaphore> waitSemaphores;
+    std::vector<VkPipelineStageFlags> waitStages;
+    if (hasGpuSync) {
+        waitSemaphores.push_back(m_currentSyncInfo.imageAvailableSemaphore);
+        waitStages.push_back(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+    }
+    waitSemaphores.insert(waitSemaphores.end(), m_externalWaitSemaphores.begin(), m_externalWaitSemaphores.end());
+    waitStages.insert(waitStages.end(), m_externalWaitStages.begin(), m_externalWaitStages.end());
+
     if (hasGpuSync) {
         // GPU-GPU semaphore synchronization (no CPU blocking needed for render-present sync)
-        // Wait on imageAvailableSemaphore before writing to the swapchain image
-        VkSemaphore waitSemaphores[] = {m_currentSyncInfo.imageAvailableSemaphore};
-        VkPipelineStageFlags waitStages[] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
-        submitInfo.waitSemaphoreCount = 1;
-        submitInfo.pWaitSemaphores = waitSemaphores;
-        submitInfo.pWaitDstStageMask = waitStages;
+        submitInfo.waitSemaphoreCount = static_cast<uint32_t>(waitSemaphores.size());
+        submitInfo.pWaitSemaphores = waitSemaphores.data();
+        submitInfo.pWaitDstStageMask = waitStages.data();
 
         // Signal renderFinishedSemaphore when rendering is done (for present to wait on)
         VkSemaphore signalSemaphores[] = {m_currentSyncInfo.renderFinishedSemaphore};
@@ -242,6 +250,8 @@ void ItemRendererVulkan::endFrame()
             m_currentCommandBuffer = VK_NULL_HANDLE;
             m_currentFramebuffer = nullptr;
             m_currentSyncInfo = VulkanSyncInfo{};
+            m_externalWaitSemaphores.clear();
+            m_externalWaitStages.clear();
             return;
         }
 
@@ -288,6 +298,13 @@ void ItemRendererVulkan::endFrame()
         // - Rendering to offscreen textures
         // - Backends without proper semaphore support
 
+        // Apply external wait semaphores (e.g. ZoomEffect's offscreen-render signal).
+        if (!waitSemaphores.empty()) {
+            submitInfo.waitSemaphoreCount = static_cast<uint32_t>(waitSemaphores.size());
+            submitInfo.pWaitSemaphores = waitSemaphores.data();
+            submitInfo.pWaitDstStageMask = waitStages.data();
+        }
+
         // Try external fence fd for non-blocking client sync if supported
         if (m_context->supportsExternalFenceFd() && !m_releasePoints.empty()) {
             VkFence exportableFence = m_context->createExportableFence();
@@ -326,6 +343,8 @@ void ItemRendererVulkan::endFrame()
             m_currentCommandBuffer = VK_NULL_HANDLE;
             m_currentFramebuffer = nullptr;
             m_currentSyncInfo = VulkanSyncInfo{};
+            m_externalWaitSemaphores.clear();
+            m_externalWaitStages.clear();
             return;
         }
         m_releasePoints.clear();
@@ -348,6 +367,8 @@ void ItemRendererVulkan::endFrame()
     m_currentCommandBuffer = VK_NULL_HANDLE;
     m_currentFramebuffer = nullptr;
     m_currentSyncInfo = VulkanSyncInfo{};
+    m_externalWaitSemaphores.clear();
+    m_externalWaitStages.clear();
 
     // Decrement output counter - when it reaches 0, next beginFrame can reset pool
     if (m_outputsInFlight > 0) {

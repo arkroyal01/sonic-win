@@ -143,6 +143,20 @@ public:
         return m_defaultWhiteTexture.get();
     }
 
+    /**
+     * Queue an external semaphore to wait on before the main command buffer
+     * executes. Used by effects that submit their own auxiliary command buffers
+     * (e.g. ZoomEffect rendering the scene into an offscreen image) and need the
+     * main submission to wait without a CPU-side vkQueueWaitIdle.
+     *
+     * Cleared automatically each frame after endFrame() submits.
+     */
+    void addExternalWaitSemaphore(VkSemaphore sem, VkPipelineStageFlags stage)
+    {
+        m_externalWaitSemaphores.push_back(sem);
+        m_externalWaitStages.push_back(stage);
+    }
+
 private:
     QVector4D modulate(float opacity, float brightness) const;
     void createRenderNode(Item *item, RenderContext *context);
@@ -176,6 +190,10 @@ private:
 
     // Track descriptor sets allocated during frame for cleanup
     std::vector<VkDescriptorSet> m_frameDescriptorSets;
+
+    // External wait semaphores attached by effects this frame (cleared in endFrame).
+    std::vector<VkSemaphore> m_externalWaitSemaphores;
+    std::vector<VkPipelineStageFlags> m_externalWaitStages;
 };
 
 } // namespace KWin

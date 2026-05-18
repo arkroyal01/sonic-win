@@ -35,6 +35,7 @@ class GLVertexBuffer;
 class GLShader;
 
 #if HAVE_VULKAN
+class VulkanContext;
 class VulkanFramebuffer;
 class VulkanRenderPass;
 class VulkanTexture;
@@ -133,6 +134,19 @@ private:
         std::unique_ptr<VulkanRenderPass> renderPass;
         QSize size;
         VkFormat format = VK_FORMAT_UNDEFINED;
+        // Persistent per-output resources for async offscreen submission so the
+        // main render pass can wait on the offscreen completion via a semaphore
+        // instead of a CPU-side vkQueueWaitIdle.
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        VkSemaphore semaphore = VK_NULL_HANDLE;
+        VulkanContext *ctx = nullptr;
+
+        VulkanOffscreenData() = default;
+        VulkanOffscreenData(const VulkanOffscreenData &) = delete;
+        VulkanOffscreenData &operator=(const VulkanOffscreenData &) = delete;
+        VulkanOffscreenData(VulkanOffscreenData &&other) noexcept;
+        VulkanOffscreenData &operator=(VulkanOffscreenData &&other) noexcept;
+        ~VulkanOffscreenData();
     };
 
     VulkanOffscreenData *ensureVulkanOffscreenData(const RenderTarget &renderTarget, const RenderViewport &viewport, Output *screen);

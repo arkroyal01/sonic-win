@@ -125,6 +125,19 @@ ZoomEffect::ZoomEffect()
     connect(effects, &EffectsHandler::windowAdded, this, &ZoomEffect::slotWindowAdded);
     connect(effects, &EffectsHandler::screenRemoved, this, &ZoomEffect::slotScreenRemoved);
 
+#if HAVE_VULKAN
+    // Vulkan resources (command buffers, semaphores) must be released before the
+    // context goes away. Effects can outlive the compositor object in the destruction
+    // order, so tear down explicitly when the compositor announces its demise.
+    if (Compositor *c = Compositor::self()) {
+        connect(c, &Compositor::aboutToDestroy, this, [this]() {
+            m_vkOffscreenData.clear();
+            m_vkCursorTexture.reset();
+            m_vkCursorImageCache = QImage();
+        });
+    }
+#endif
+
 #if HAVE_ACCESSIBILITY
     m_accessibilityIntegration = new ZoomAccessibilityIntegration(this);
     connect(m_accessibilityIntegration, &ZoomAccessibilityIntegration::focusPointChanged, this, &ZoomEffect::moveFocus);
@@ -320,6 +333,46 @@ GLShader *ZoomEffect::shaderForZoom(double zoom)
 }
 
 #if HAVE_VULKAN
+ZoomEffect::VulkanOffscreenData::VulkanOffscreenData(VulkanOffscreenData &&other) noexcept
+    : framebuffer(std::move(other.framebuffer))
+    , renderPass(std::move(other.renderPass))
+    , size(other.size)
+    , format(other.format)
+    , cmd(other.cmd)
+    , semaphore(other.semaphore)
+    , ctx(other.ctx)
+{
+    other.cmd = VK_NULL_HANDLE;
+    other.semaphore = VK_NULL_HANDLE;
+    other.ctx = nullptr;
+}
+
+ZoomEffect::VulkanOffscreenData &ZoomEffect::VulkanOffscreenData::operator=(VulkanOffscreenData &&other) noexcept
+{
+    if (this != &other) {
+        this->~VulkanOffscreenData();
+        new (this) VulkanOffscreenData(std::move(other));
+    }
+    return *this;
+}
+
+ZoomEffect::VulkanOffscreenData::~VulkanOffscreenData()
+{
+    if (!ctx) {
+        return;
+    }
+    VkDevice device = ctx->backend()->device();
+    if (device == VK_NULL_HANDLE) {
+        return;
+    }
+    if (cmd != VK_NULL_HANDLE) {
+        ctx->freeCommandBuffer(cmd);
+    }
+    if (semaphore != VK_NULL_HANDLE) {
+        vkDestroySemaphore(device, semaphore, nullptr);
+    }
+}
+
 ZoomEffect::VulkanOffscreenData *ZoomEffect::ensureVulkanOffscreenData(const RenderTarget &renderTarget, const RenderViewport &viewport, Output *screen)
 {
     auto *scene = dynamic_cast<WorkspaceSceneVulkan *>(Compositor::self()->scene());
@@ -416,12 +469,38 @@ void ZoomEffect::paintScreenVulkan(const RenderTarget &renderTarget, const Rende
 
     // === 1. Render the scene at native resolution into the offscreen FB. ===
     //
-    // Uses a separate single-time command buffer so the recursive paintScreen
-    // descent records into the offscreen render pass, while the main render
-    // pass on the swapchain remains active and is resumed afterwards.
+    // Uses a persistent per-output command buffer + binary semaphore. cmd2 is
+    // submitted asynchronously; the main command buffer waits on the semaphore
+    // at FRAGMENT_SHADER_BIT so the upscale sample can't run until the
+    // offscreen render is done — without a CPU vkQueueWaitIdle.
+    //
+    // doBeginFrame() waits on the previous frame's main inFlightFence before
+    // entering beginFrame(), so by the time we get here cmd2's prior
+    // submission is also finished (transitive: main waited on its semaphore),
+    // making vkResetCommandBuffer safe.
     {
-        VkCommandBuffer cmd2 = ctx->beginSingleTimeCommands();
-        if (cmd2 == VK_NULL_HANDLE) {
+        if (offscreen->cmd == VK_NULL_HANDLE) {
+            offscreen->cmd = ctx->allocateCommandBuffer();
+            offscreen->ctx = ctx;
+            if (offscreen->cmd == VK_NULL_HANDLE) {
+                return;
+            }
+        } else {
+            vkResetCommandBuffer(offscreen->cmd, 0);
+        }
+        if (offscreen->semaphore == VK_NULL_HANDLE) {
+            VkSemaphoreCreateInfo si{};
+            si.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+            if (vkCreateSemaphore(ctx->backend()->device(), &si, nullptr, &offscreen->semaphore) != VK_SUCCESS) {
+                return;
+            }
+        }
+
+        VkCommandBuffer cmd2 = offscreen->cmd;
+        VkCommandBufferBeginInfo begin{};
+        begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        if (vkBeginCommandBuffer(cmd2, &begin) != VK_SUCCESS) {
             return;
         }
 
@@ -452,11 +531,13 @@ void ZoomEffect::paintScreenVulkan(const RenderTarget &renderTarget, const Rende
         VkRect2D scissor{renderArea};
         vkCmdSetScissor(cmd2, 0, 1, &scissor);
 
-        // The recursive paintScreen flows through ItemRendererVulkan::renderItem,
-        // which advances m_vertexBufferOffset in the shared streaming buffer.
-        // endSingleTimeCommands() blocks on vkQueueWaitIdle, so the GPU has
-        // finished using the buffer region before we return — restoring the
-        // offset is safe and lets the main frame reuse the same region.
+        // Snapshot the streaming-buffer offset: the recursive paintScreen flows
+        // through ItemRendererVulkan::renderItem which advances it. The main
+        // command buffer (recorded next) is also issued on the same renderer,
+        // so the GPU must not see the offscreen and main draws overlap into
+        // the same buffer region. The semaphore wait at FRAGMENT_SHADER_BIT
+        // serializes execution between cmd2 and the main submit, so reusing
+        // the same offset is safe.
         const size_t savedVertexOffset = renderer->vertexBufferOffset();
         effects->paintScreen(offscreenRenderTarget, offscreenViewport, mask, region, screen);
         renderer->setVertexBufferOffset(savedVertexOffset);
@@ -464,10 +545,24 @@ void ZoomEffect::paintScreenVulkan(const RenderTarget &renderTarget, const Rende
         offscreen->renderPass->end(cmd2);
 
         // The render pass's finalLayout transitions the image to SHADER_READ_ONLY_OPTIMAL.
-        // Update the CPU-side tracking accordingly.
         offscreenTex->setCurrentLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
-        ctx->endSingleTimeCommands(cmd2);
+        if (vkEndCommandBuffer(cmd2) != VK_SUCCESS) {
+            return;
+        }
+
+        // Async submit: signal offscreen->semaphore; the main submission will
+        // wait on it at FRAGMENT_SHADER_BIT.
+        VkSubmitInfo submit{};
+        submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &cmd2;
+        submit.signalSemaphoreCount = 1;
+        submit.pSignalSemaphores = &offscreen->semaphore;
+        if (vkQueueSubmit(ctx->backend()->graphicsQueue(), 1, &submit, VK_NULL_HANDLE) != VK_SUCCESS) {
+            return;
+        }
+        renderer->addExternalWaitSemaphore(offscreen->semaphore, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
     }
 
     // === 2. Compute mouse-tracking translation (same math as OpenGL path). ===
@@ -645,7 +740,10 @@ void ZoomEffect::paintScreenVulkan(const RenderTarget &renderTarget, const Rende
     vkCmdDraw(mainCmd, static_cast<uint32_t>(verts.size()), 1, 0, 0);
 
     // === 4. Cursor draw. ===
-    if (m_mousePointer != MousePointerHide) {
+    // Only draw the fake cursor if we actually hid the OS one; otherwise
+    // (e.g. Proportional+Keep) the OS cursor is still visible and drawing
+    // another over it would double up.
+    if (m_mousePointer != MousePointerHide && m_isMouseHidden) {
         VulkanTexture *cursorTex = ensureVulkanCursorTexture();
         if (cursorTex) {
             const auto cursor = effects->cursorImage();
@@ -858,7 +956,7 @@ void ZoomEffect::paintScreen(const RenderTarget &renderTarget, const RenderViewp
     }
     GLShaderManager::instance()->popShader();
 
-    if (m_mousePointer != MousePointerHide) {
+    if (m_mousePointer != MousePointerHide && m_isMouseHidden) {
         // Draw the mouse-texture at the position matching to zoomed-in image of the desktop. Hiding the
         // previous mouse-cursor and drawing our own fake mouse-cursor is needed to be able to scale the
         // mouse-cursor up and to re-position those mouse-cursor to match to the chosen zoom-level.
