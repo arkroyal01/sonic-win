@@ -19,6 +19,7 @@ layout(constant_id = 6) const bool TRAIT_BORDER = false;
 layout(constant_id = 7) const bool TRAIT_YUV = false;
 layout(constant_id = 8) const bool TRAIT_INVERT = false;
 layout(constant_id = 9) const bool TRAIT_COLORBLINDNESS = false;
+layout(constant_id = 10) const bool TRAIT_PIXEL_GRID = false;
 
 // Input from vertex shader
 layout(location = 0) in vec2 fragTexCoord;
@@ -258,6 +259,13 @@ void main() {
             float v = texture(texSampler[2], fragTexCoord).r - 0.5;
             color.rgb = yuvToRgb(vec3(y, u, v));
             color.a = 1.0;
+        } else if (TRAIT_PIXEL_GRID) {
+            vec2 texSize = vec2(textureSize(texSampler[0], 0));
+            vec2 samplePosition = fragTexCoord * texSize;
+            vec2 pixelCenter = floor(samplePosition) + vec2(0.5);
+            vec2 dist = abs(samplePosition - pixelCenter);
+            float t = smoothstep(0.4, 0.5, max(dist.x, dist.y));
+            color = mix(texture(texSampler[0], pixelCenter / texSize), vec4(0.0, 0.0, 0.0, 1.0), t);
         } else {
             color = texture(texSampler[0], fragTexCoord);
         }

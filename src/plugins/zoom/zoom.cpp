@@ -9,6 +9,7 @@
 */
 
 #include "zoom.h"
+#include "config-kwin.h"
 #include "core/rendertarget.h"
 #include "core/renderviewport.h"
 #include "effect/effecthandler.h"
@@ -17,6 +18,24 @@
 
 #if HAVE_ACCESSIBILITY
 #include "accessibilityintegration.h"
+#endif
+
+#if HAVE_VULKAN
+#include "compositor.h"
+#include "platformsupport/scenes/vulkan/vulkanbackend.h"
+#include "platformsupport/scenes/vulkan/vulkanbuffer.h"
+#include "platformsupport/scenes/vulkan/vulkancontext.h"
+#include "platformsupport/scenes/vulkan/vulkanframebuffer.h"
+#include "platformsupport/scenes/vulkan/vulkanpipeline.h"
+#include "platformsupport/scenes/vulkan/vulkanpipelinemanager.h"
+#include "platformsupport/scenes/vulkan/vulkanrenderpass.h"
+#include "platformsupport/scenes/vulkan/vulkanrendertarget.h"
+#include "platformsupport/scenes/vulkan/vulkantexture.h"
+#include "scene/itemrenderer_vulkan.h"
+#include "scene/workspacescene_vulkan.h"
+#include <array>
+#include <cmath>
+#include <cstring>
 #endif
 
 #include <KConfigGroup>
@@ -180,6 +199,10 @@ void ZoomEffect::showCursor()
         // show the previously hidden mouse-pointer again and free the loaded texture/picture.
         effects->showCursor();
         m_cursorTexture.reset();
+#if HAVE_VULKAN
+        m_vkCursorTexture.reset();
+        m_vkCursorImageCache = QImage();
+#endif
         m_isMouseHidden = false;
     }
 }
@@ -191,11 +214,18 @@ void ZoomEffect::hideCursor()
     }
     if (!m_isMouseHidden) {
         // try to load the cursor-theme into a OpenGL texture and if successful then hide the mouse-pointer
-        GLTexture *texture = nullptr;
+        bool haveTexture = false;
         if (effects->isOpenGLCompositing()) {
-            texture = ensureCursorTexture();
+            haveTexture = ensureCursorTexture() != nullptr;
         }
-        if (texture) {
+#if HAVE_VULKAN
+        else if (effects->isVulkanCompositing()) {
+            // The Vulkan cursor texture is uploaded lazily in paintScreenVulkan,
+            // but the OS cursor needs to be hidden up-front to avoid a double cursor.
+            haveTexture = !effects->cursorImage().image().isNull();
+        }
+#endif
+        if (haveTexture) {
             effects->hideCursor();
             connect(effects, &EffectsHandler::cursorShapeChanged, this, &ZoomEffect::markCursorTextureDirty);
             m_isMouseHidden = true;
@@ -289,89 +319,428 @@ GLShader *ZoomEffect::shaderForZoom(double zoom)
     }
 }
 
+#if HAVE_VULKAN
+ZoomEffect::VulkanOffscreenData *ZoomEffect::ensureVulkanOffscreenData(const RenderTarget &renderTarget, const RenderViewport &viewport, Output *screen)
+{
+    auto *scene = dynamic_cast<WorkspaceSceneVulkan *>(Compositor::self()->scene());
+    if (!scene) {
+        return nullptr;
+    }
+    VulkanContext *ctx = scene->backend()->vulkanContext();
+    if (!ctx) {
+        return nullptr;
+    }
+
+    const QSize nativeSize = renderTarget.size();
+    const VkFormat format = ctx->backend()->colorFormat();
+
+    VulkanOffscreenData &data = m_vkOffscreenData[screen];
+    if (!data.framebuffer || data.size != nativeSize || data.format != format) {
+        data.framebuffer.reset();
+        data.renderPass = VulkanRenderPass::createForOffscreen(ctx, format, false);
+        if (!data.renderPass || !data.renderPass->isValid()) {
+            return nullptr;
+        }
+        data.framebuffer = VulkanFramebuffer::createWithTexture(ctx, data.renderPass.get(), nativeSize, format);
+        if (!data.framebuffer || !data.framebuffer->isValid()) {
+            return nullptr;
+        }
+        if (VulkanTexture *tex = data.framebuffer->colorTexture()) {
+            tex->setFilter(VK_FILTER_LINEAR);
+            tex->setWrapMode(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+        }
+        data.size = nativeSize;
+        data.format = format;
+    }
+    return &data;
+}
+
+VulkanTexture *ZoomEffect::ensureVulkanCursorTexture()
+{
+    auto *scene = dynamic_cast<WorkspaceSceneVulkan *>(Compositor::self()->scene());
+    if (!scene) {
+        return nullptr;
+    }
+    VulkanContext *ctx = scene->backend()->vulkanContext();
+    if (!ctx) {
+        return nullptr;
+    }
+
+    const auto cursor = effects->cursorImage();
+    const QImage img = cursor.image();
+    if (img.isNull()) {
+        m_vkCursorTexture.reset();
+        m_vkCursorImageCache = QImage();
+        return nullptr;
+    }
+
+    if (m_cursorTextureDirty || !m_vkCursorTexture || m_vkCursorImageCache.cacheKey() != img.cacheKey()) {
+        m_vkCursorTexture = VulkanTexture::upload(ctx, img);
+        if (!m_vkCursorTexture || !m_vkCursorTexture->isValid()) {
+            m_vkCursorTexture.reset();
+            return nullptr;
+        }
+        m_vkCursorTexture->setFilter(VK_FILTER_LINEAR);
+        m_vkCursorTexture->setWrapMode(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+        m_vkCursorImageCache = img;
+        m_cursorTextureDirty = false;
+    }
+    return m_vkCursorTexture.get();
+}
+
+void ZoomEffect::paintScreenVulkan(const RenderTarget &renderTarget, const RenderViewport &viewport, int mask, const QRegion &region, Output *screen)
+{
+    auto *scene = dynamic_cast<WorkspaceSceneVulkan *>(Compositor::self()->scene());
+    if (!scene) {
+        return;
+    }
+    auto *renderer = static_cast<ItemRendererVulkan *>(scene->renderer());
+    VulkanContext *ctx = renderer->context();
+    VkCommandBuffer mainCmd = renderer->currentCommandBuffer();
+    if (!ctx || mainCmd == VK_NULL_HANDLE) {
+        return;
+    }
+
+    VulkanOffscreenData *offscreen = ensureVulkanOffscreenData(renderTarget, viewport, screen);
+    if (!offscreen) {
+        return;
+    }
+    VulkanTexture *offscreenTex = offscreen->framebuffer->colorTexture();
+    if (!offscreenTex || !offscreenTex->isValid()) {
+        return;
+    }
+
+    const QSize nativeSize = offscreen->size;
+    const qreal scale = viewport.scale();
+    const QRectF viewportRect = viewport.renderRect();
+
+    // === 1. Render the scene at native resolution into the offscreen FB. ===
+    //
+    // Uses a separate single-time command buffer so the recursive paintScreen
+    // descent records into the offscreen render pass, while the main render
+    // pass on the swapchain remains active and is resumed afterwards.
+    {
+        VkCommandBuffer cmd2 = ctx->beginSingleTimeCommands();
+        if (cmd2 == VK_NULL_HANDLE) {
+            return;
+        }
+
+        VulkanRenderTarget vulkanOffscreenRT(offscreen->framebuffer.get(), renderTarget.colorDescription());
+        vulkanOffscreenRT.setCommandBuffer(cmd2);
+        RenderTarget offscreenRenderTarget(&vulkanOffscreenRT, renderTarget.colorDescription());
+        RenderViewport offscreenViewport(viewportRect, scale, offscreenRenderTarget);
+
+        VkClearValue clearValue{};
+        clearValue.color.float32[0] = 0.0f;
+        clearValue.color.float32[1] = 0.0f;
+        clearValue.color.float32[2] = 0.0f;
+        clearValue.color.float32[3] = 0.0f;
+        VkRect2D renderArea{};
+        renderArea.offset = {0, 0};
+        renderArea.extent = {static_cast<uint32_t>(nativeSize.width()), static_cast<uint32_t>(nativeSize.height())};
+        offscreen->renderPass->begin(cmd2, offscreen->framebuffer->framebuffer(), renderArea, &clearValue, 1);
+
+        // Negative-height viewport for Y-flip, matching ItemRendererVulkan::beginFrame().
+        VkViewport vp{};
+        vp.x = 0.0f;
+        vp.y = static_cast<float>(nativeSize.height());
+        vp.width = static_cast<float>(nativeSize.width());
+        vp.height = -static_cast<float>(nativeSize.height());
+        vp.minDepth = 0.0f;
+        vp.maxDepth = 1.0f;
+        vkCmdSetViewport(cmd2, 0, 1, &vp);
+        VkRect2D scissor{renderArea};
+        vkCmdSetScissor(cmd2, 0, 1, &scissor);
+
+        // The recursive paintScreen flows through ItemRendererVulkan::renderItem,
+        // which advances m_vertexBufferOffset in the shared streaming buffer.
+        // endSingleTimeCommands() blocks on vkQueueWaitIdle, so the GPU has
+        // finished using the buffer region before we return — restoring the
+        // offset is safe and lets the main frame reuse the same region.
+        const size_t savedVertexOffset = renderer->vertexBufferOffset();
+        effects->paintScreen(offscreenRenderTarget, offscreenViewport, mask, region, screen);
+        renderer->setVertexBufferOffset(savedVertexOffset);
+
+        offscreen->renderPass->end(cmd2);
+
+        // The render pass's finalLayout transitions the image to SHADER_READ_ONLY_OPTIMAL.
+        // Update the CPU-side tracking accordingly.
+        offscreenTex->setCurrentLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+        ctx->endSingleTimeCommands(cmd2);
+    }
+
+    // === 2. Compute mouse-tracking translation (same math as OpenGL path). ===
+    const QSize screenSize = effects->virtualScreenSize();
+    qreal xTranslation = 0;
+    qreal yTranslation = 0;
+    switch (m_mouseTracking) {
+    case MouseTrackingProportional:
+        xTranslation = -int(m_cursorPoint.x() * (m_zoom - 1.0));
+        yTranslation = -int(m_cursorPoint.y() * (m_zoom - 1.0));
+        m_prevPoint = m_cursorPoint;
+        break;
+    case MouseTrackingCentered:
+        m_prevPoint = m_cursorPoint;
+        // fall through
+    case MouseTrackingDisabled:
+        xTranslation = std::min(0, std::max(int(screenSize.width() - screenSize.width() * m_zoom), int(screenSize.width() / 2 - m_prevPoint.x() * m_zoom)));
+        yTranslation = std::min(0, std::max(int(screenSize.height() - screenSize.height() * m_zoom), int(screenSize.height() / 2 - m_prevPoint.y() * m_zoom)));
+        break;
+    case MouseTrackingPush: {
+        const int x = m_cursorPoint.x() * m_zoom - m_prevPoint.x() * (m_zoom - 1.0);
+        const int y = m_cursorPoint.y() * m_zoom - m_prevPoint.y() * (m_zoom - 1.0);
+        const int threshold = 4;
+        const QRectF currScreen = effects->screenAt(QPoint(x, y))->geometry();
+        const int screenTop = currScreen.top();
+        const int screenLeft = currScreen.left();
+        const int screenRight = currScreen.right();
+        const int screenBottom = currScreen.bottom();
+        const int screenCenterX = currScreen.center().x();
+        const int screenCenterY = currScreen.center().y();
+        const bool adjacentLeft = screenExistsAt(QPoint(screenLeft - 1, screenCenterY));
+        const bool adjacentRight = screenExistsAt(QPoint(screenRight + 1, screenCenterY));
+        const bool adjacentTop = screenExistsAt(QPoint(screenCenterX, screenTop - 1));
+        const bool adjacentBottom = screenExistsAt(QPoint(screenCenterX, screenBottom + 1));
+        m_xMove = m_yMove = 0;
+        if (x < screenLeft + threshold && !adjacentLeft) {
+            m_xMove = (x - threshold - screenLeft) / m_zoom;
+        } else if (x > screenRight - threshold && !adjacentRight) {
+            m_xMove = (x + threshold - screenRight) / m_zoom;
+        }
+        if (y < screenTop + threshold && !adjacentTop) {
+            m_yMove = (y - threshold - screenTop) / m_zoom;
+        } else if (y > screenBottom - threshold && !adjacentBottom) {
+            m_yMove = (y + threshold - screenBottom) / m_zoom;
+        }
+        if (m_xMove) {
+            m_prevPoint.setX(m_prevPoint.x() + m_xMove);
+        }
+        if (m_yMove) {
+            m_prevPoint.setY(m_prevPoint.y() + m_yMove);
+        }
+        xTranslation = -int(m_prevPoint.x() * (m_zoom - 1.0));
+        yTranslation = -int(m_prevPoint.y() * (m_zoom - 1.0));
+        break;
+    }
+    }
+    if (isFocusTrackingEnabled() || isTextCaretTrackingEnabled()) {
+        bool acceptFocus = true;
+        if (m_mouseTracking != MouseTrackingDisabled && m_focusDelay > 0) {
+            const int msecs = m_lastMouseEvent.msecsTo(m_lastFocusEvent);
+            acceptFocus = msecs > m_focusDelay;
+        }
+        if (acceptFocus) {
+            xTranslation = -int(m_focusPoint.x() * (m_zoom - 1.0));
+            yTranslation = -int(m_focusPoint.y() * (m_zoom - 1.0));
+            m_prevPoint = m_focusPoint;
+        }
+    }
+
+    // === 3. Draw upscaled offscreen quad on the main command buffer. ===
+    auto *pipelineManager = ctx->pipelineManager();
+    if (!pipelineManager) {
+        return;
+    }
+    VulkanShaderTraits zoomTraits = VulkanShaderTrait::MapTexture | VulkanShaderTrait::TransformColorspace;
+    if (m_zoom >= m_pixelGridZoom) {
+        zoomTraits |= VulkanShaderTrait::PixelGrid;
+    }
+    VulkanPipeline *zoomPipeline = pipelineManager->pipeline(zoomTraits);
+    if (!zoomPipeline || !zoomPipeline->isValid()) {
+        return;
+    }
+
+    const float w = static_cast<float>(nativeSize.width());
+    const float h = static_cast<float>(nativeSize.height());
+    std::array<VulkanVertex2D, 6> verts = {{
+        {{w, 0.0f}, {1.0f, 0.0f}},
+        {{0.0f, 0.0f}, {0.0f, 0.0f}},
+        {{0.0f, h}, {0.0f, 1.0f}},
+        {{0.0f, h}, {0.0f, 1.0f}},
+        {{w, h}, {1.0f, 1.0f}},
+        {{w, 0.0f}, {1.0f, 0.0f}},
+    }};
+    auto vertBuf = VulkanBuffer::createStreamingBuffer(ctx, sizeof(verts));
+    if (!vertBuf || !vertBuf->isValid()) {
+        return;
+    }
+    vertBuf->upload(verts.data(), sizeof(verts));
+
+    QMatrix4x4 mvp = viewport.projectionMatrix();
+    mvp.translate(xTranslation * scale, yTranslation * scale);
+    mvp.scale(m_zoom, m_zoom);
+    mvp.translate(viewportRect.x() * scale, viewportRect.y() * scale);
+
+    VulkanPushConstants pc{};
+    memcpy(pc.mvp, mvp.constData(), sizeof(pc.mvp));
+    pc.textureMatrix[0] = pc.textureMatrix[5] = pc.textureMatrix[10] = pc.textureMatrix[15] = 1.0f;
+
+    VulkanUniforms ubo{};
+    ubo.uniformColor[0] = ubo.uniformColor[1] = ubo.uniformColor[2] = ubo.uniformColor[3] = 1.0f;
+    ubo.opacity = 1.0f;
+    ubo.brightness = 1.0f;
+    ubo.saturation = 1.0f;
+    const ColorDescription srcColor = renderTarget.colorDescription();
+    const ColorDescription dstColor = renderTarget.colorDescription();
+    QMatrix4x4 colorimetryTransform = srcColor.toOther(dstColor, RenderingIntent::Perceptual);
+    memcpy(ubo.colorimetryTransform, colorimetryTransform.data(), sizeof(ubo.colorimetryTransform));
+    ubo.sourceTransferFunction = srcColor.transferFunction().type;
+    ubo.sourceTransferParams[0] = srcColor.transferFunction().minLuminance;
+    ubo.sourceTransferParams[1] = srcColor.transferFunction().maxLuminance - srcColor.transferFunction().minLuminance;
+    ubo.sourceReferenceLuminance = srcColor.referenceLuminance();
+    ubo.destTransferFunction = dstColor.transferFunction().type;
+    ubo.destTransferParams[0] = dstColor.transferFunction().minLuminance;
+    ubo.destTransferParams[1] = dstColor.transferFunction().maxLuminance - dstColor.transferFunction().minLuminance;
+    ubo.destReferenceLuminance = dstColor.referenceLuminance();
+    ubo.maxDestLuminance = dstColor.maxHdrLuminance().value_or(10000.0f);
+    ubo.maxTonemappingLuminance = dstColor.referenceLuminance();
+    QMatrix4x4 destToLMS = dstColor.containerColorimetry().toLMS();
+    QMatrix4x4 lmsToDest = dstColor.containerColorimetry().fromLMS();
+    memcpy(ubo.destToLMS, destToLMS.data(), sizeof(ubo.destToLMS));
+    memcpy(ubo.lmsToDest, lmsToDest.data(), sizeof(ubo.lmsToDest));
+    const auto toXYZ = dstColor.containerColorimetry().toXYZ();
+    ubo.primaryBrightness[0] = toXYZ(1, 0);
+    ubo.primaryBrightness[1] = toXYZ(1, 1);
+    ubo.primaryBrightness[2] = toXYZ(1, 2);
+
+    auto uboBuf = VulkanBuffer::createUniformBuffer(ctx, sizeof(VulkanUniforms));
+    if (!uboBuf || !uboBuf->isValid()) {
+        return;
+    }
+    uboBuf->upload(&ubo, sizeof(ubo));
+
+    VkDescriptorSet ds = ctx->allocateDescriptorSet(zoomPipeline->descriptorSetLayout());
+    if (ds == VK_NULL_HANDLE) {
+        return;
+    }
+    VkDescriptorImageInfo imgInfo{offscreenTex->sampler(), offscreenTex->imageView(),
+                                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    std::array<VkDescriptorImageInfo, 4> imageInfos{imgInfo, imgInfo, imgInfo, imgInfo};
+    VkDescriptorBufferInfo bufInfo{uboBuf->buffer(), 0, sizeof(VulkanUniforms)};
+    std::array<VkWriteDescriptorSet, 2> writes{};
+    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[0].dstSet = ds;
+    writes[0].dstBinding = 0;
+    writes[0].descriptorCount = 4;
+    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[0].pImageInfo = imageInfos.data();
+    writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[1].dstSet = ds;
+    writes[1].dstBinding = 1;
+    writes[1].descriptorCount = 1;
+    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    writes[1].pBufferInfo = &bufInfo;
+    vkUpdateDescriptorSets(ctx->backend()->device(), writes.size(), writes.data(), 0, nullptr);
+
+    vkCmdBindPipeline(mainCmd, VK_PIPELINE_BIND_POINT_GRAPHICS, zoomPipeline->pipeline());
+    vkCmdPushConstants(mainCmd, zoomPipeline->layout(),
+                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                       0, sizeof(VulkanPushConstants), &pc);
+    vkCmdBindDescriptorSets(mainCmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            zoomPipeline->layout(), 0, 1, &ds, 0, nullptr);
+    VkBuffer vb = vertBuf->buffer();
+    VkDeviceSize vbOffset = 0;
+    vkCmdBindVertexBuffers(mainCmd, 0, 1, &vb, &vbOffset);
+    vkCmdDraw(mainCmd, static_cast<uint32_t>(verts.size()), 1, 0, 0);
+
+    // === 4. Cursor draw. ===
+    if (m_mousePointer != MousePointerHide) {
+        VulkanTexture *cursorTex = ensureVulkanCursorTexture();
+        if (cursorTex) {
+            const auto cursor = effects->cursorImage();
+            QSizeF cursorSize = QSizeF(cursor.image().size()) / cursor.image().devicePixelRatio();
+            if (m_mousePointer == MousePointerScale) {
+                cursorSize *= m_zoom;
+            }
+            const QPointF p = (effects->cursorPos() - cursor.hotSpot()) * m_zoom + QPoint(xTranslation, yTranslation);
+
+            VulkanPipeline *cursorPipeline = pipelineManager->pipeline(VulkanShaderTrait::MapTexture | VulkanShaderTrait::TransformColorspace);
+            if (!cursorPipeline || !cursorPipeline->isValid()) {
+                return;
+            }
+
+            const float cw = static_cast<float>(cursorSize.width() * scale);
+            const float ch = static_cast<float>(cursorSize.height() * scale);
+            std::array<VulkanVertex2D, 6> cverts = {{
+                {{cw, 0.0f}, {1.0f, 0.0f}},
+                {{0.0f, 0.0f}, {0.0f, 0.0f}},
+                {{0.0f, ch}, {0.0f, 1.0f}},
+                {{0.0f, ch}, {0.0f, 1.0f}},
+                {{cw, ch}, {1.0f, 1.0f}},
+                {{cw, 0.0f}, {1.0f, 0.0f}},
+            }};
+            auto cVertBuf = VulkanBuffer::createStreamingBuffer(ctx, sizeof(cverts));
+            if (!cVertBuf || !cVertBuf->isValid()) {
+                return;
+            }
+            cVertBuf->upload(cverts.data(), sizeof(cverts));
+
+            QMatrix4x4 cmvp = viewport.projectionMatrix();
+            cmvp.translate(p.x() * scale, p.y() * scale);
+            VulkanPushConstants cpc{};
+            memcpy(cpc.mvp, cmvp.constData(), sizeof(cpc.mvp));
+            cpc.textureMatrix[0] = cpc.textureMatrix[5] = cpc.textureMatrix[10] = cpc.textureMatrix[15] = 1.0f;
+
+            VulkanUniforms cubo = ubo; // reuse the colorspace setup; opacity/brightness/saturation already 1
+            // The cursor image is sRGB; switch the source description for the colorspace transform.
+            const ColorDescription cursorSrc = ColorDescription::sRGB;
+            QMatrix4x4 cursorColorimetry = cursorSrc.toOther(dstColor, RenderingIntent::Perceptual);
+            memcpy(cubo.colorimetryTransform, cursorColorimetry.data(), sizeof(cubo.colorimetryTransform));
+            cubo.sourceTransferFunction = cursorSrc.transferFunction().type;
+            cubo.sourceTransferParams[0] = cursorSrc.transferFunction().minLuminance;
+            cubo.sourceTransferParams[1] = cursorSrc.transferFunction().maxLuminance - cursorSrc.transferFunction().minLuminance;
+            cubo.sourceReferenceLuminance = cursorSrc.referenceLuminance();
+
+            auto cUboBuf = VulkanBuffer::createUniformBuffer(ctx, sizeof(VulkanUniforms));
+            if (!cUboBuf || !cUboBuf->isValid()) {
+                return;
+            }
+            cUboBuf->upload(&cubo, sizeof(cubo));
+
+            VkDescriptorSet cds = ctx->allocateDescriptorSet(cursorPipeline->descriptorSetLayout());
+            if (cds == VK_NULL_HANDLE) {
+                return;
+            }
+            VkDescriptorImageInfo cImg{cursorTex->sampler(), cursorTex->imageView(),
+                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+            std::array<VkDescriptorImageInfo, 4> cImageInfos{cImg, cImg, cImg, cImg};
+            VkDescriptorBufferInfo cBufInfo{cUboBuf->buffer(), 0, sizeof(VulkanUniforms)};
+            std::array<VkWriteDescriptorSet, 2> cWrites{};
+            cWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            cWrites[0].dstSet = cds;
+            cWrites[0].dstBinding = 0;
+            cWrites[0].descriptorCount = 4;
+            cWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            cWrites[0].pImageInfo = cImageInfos.data();
+            cWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            cWrites[1].dstSet = cds;
+            cWrites[1].dstBinding = 1;
+            cWrites[1].descriptorCount = 1;
+            cWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            cWrites[1].pBufferInfo = &cBufInfo;
+            vkUpdateDescriptorSets(ctx->backend()->device(), cWrites.size(), cWrites.data(), 0, nullptr);
+
+            vkCmdBindPipeline(mainCmd, VK_PIPELINE_BIND_POINT_GRAPHICS, cursorPipeline->pipeline());
+            vkCmdPushConstants(mainCmd, cursorPipeline->layout(),
+                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                               0, sizeof(VulkanPushConstants), &cpc);
+            vkCmdBindDescriptorSets(mainCmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                    cursorPipeline->layout(), 0, 1, &cds, 0, nullptr);
+            VkBuffer cvb = cVertBuf->buffer();
+            VkDeviceSize cvbOffset = 0;
+            vkCmdBindVertexBuffers(mainCmd, 0, 1, &cvb, &cvbOffset);
+            vkCmdDraw(mainCmd, static_cast<uint32_t>(cverts.size()), 1, 0, 0);
+        }
+    }
+}
+#endif
+
 void ZoomEffect::paintScreen(const RenderTarget &renderTarget, const RenderViewport &viewport, int mask, const QRegion &region, Output *screen)
 {
 #if HAVE_VULKAN
     if (effects->isVulkanCompositing()) {
-        const QSize screenSize = effects->virtualScreenSize();
-        const qreal scale = viewport.scale();
-        const QRectF &viewportRect = viewport.renderRect();
-
-        qreal xTranslation = 0;
-        qreal yTranslation = 0;
-        switch (m_mouseTracking) {
-        case MouseTrackingProportional:
-            xTranslation = -int(m_cursorPoint.x() * (m_zoom - 1.0));
-            yTranslation = -int(m_cursorPoint.y() * (m_zoom - 1.0));
-            m_prevPoint = m_cursorPoint;
-            break;
-        case MouseTrackingCentered:
-            m_prevPoint = m_cursorPoint;
-            // fall through
-        case MouseTrackingDisabled:
-            xTranslation = std::min(0, std::max(int(screenSize.width() - screenSize.width() * m_zoom), int(screenSize.width() / 2 - m_prevPoint.x() * m_zoom)));
-            yTranslation = std::min(0, std::max(int(screenSize.height() - screenSize.height() * m_zoom), int(screenSize.height() / 2 - m_prevPoint.y() * m_zoom)));
-            break;
-        case MouseTrackingPush: {
-            const int x = m_cursorPoint.x() * m_zoom - m_prevPoint.x() * (m_zoom - 1.0);
-            const int y = m_cursorPoint.y() * m_zoom - m_prevPoint.y() * (m_zoom - 1.0);
-            const int threshold = 4;
-            const QRectF currScreen = effects->screenAt(QPoint(x, y))->geometry();
-            const int screenTop = currScreen.top();
-            const int screenLeft = currScreen.left();
-            const int screenRight = currScreen.right();
-            const int screenBottom = currScreen.bottom();
-            const int screenCenterX = currScreen.center().x();
-            const int screenCenterY = currScreen.center().y();
-            const bool adjacentLeft = screenExistsAt(QPoint(screenLeft - 1, screenCenterY));
-            const bool adjacentRight = screenExistsAt(QPoint(screenRight + 1, screenCenterY));
-            const bool adjacentTop = screenExistsAt(QPoint(screenCenterX, screenTop - 1));
-            const bool adjacentBottom = screenExistsAt(QPoint(screenCenterX, screenBottom + 1));
-            m_xMove = m_yMove = 0;
-            if (x < screenLeft + threshold && !adjacentLeft) {
-                m_xMove = (x - threshold - screenLeft) / m_zoom;
-            } else if (x > screenRight - threshold && !adjacentRight) {
-                m_xMove = (x + threshold - screenRight) / m_zoom;
-            }
-            if (y < screenTop + threshold && !adjacentTop) {
-                m_yMove = (y - threshold - screenTop) / m_zoom;
-            } else if (y > screenBottom - threshold && !adjacentBottom) {
-                m_yMove = (y + threshold - screenBottom) / m_zoom;
-            }
-            if (m_xMove) {
-                m_prevPoint.setX(m_prevPoint.x() + m_xMove);
-            }
-            if (m_yMove) {
-                m_prevPoint.setY(m_prevPoint.y() + m_yMove);
-            }
-            xTranslation = -int(m_prevPoint.x() * (m_zoom - 1.0));
-            yTranslation = -int(m_prevPoint.y() * (m_zoom - 1.0));
-            break;
-        }
-        }
-
-        if (isFocusTrackingEnabled() || isTextCaretTrackingEnabled()) {
-            bool acceptFocus = true;
-            if (m_mouseTracking != MouseTrackingDisabled && m_focusDelay > 0) {
-                const int msecs = m_lastMouseEvent.msecsTo(m_lastFocusEvent);
-                acceptFocus = msecs > m_focusDelay;
-            }
-            if (acceptFocus) {
-                xTranslation = -int(m_focusPoint.x() * (m_zoom - 1.0));
-                yTranslation = -int(m_focusPoint.y() * (m_zoom - 1.0));
-                m_prevPoint = m_focusPoint;
-            }
-        }
-
-        // Zoom by shrinking the visible logical rect by m_zoom and adjusting the scale.
-        // The projection matrix then maps this smaller visible area to fill the full display.
-        QRectF visibleRect(
-            viewportRect.x() - xTranslation / m_zoom,
-            viewportRect.y() - yTranslation / m_zoom,
-            viewportRect.width() / m_zoom,
-            viewportRect.height() / m_zoom);
-        RenderViewport zoomedViewport(visibleRect, scale * m_zoom, renderTarget);
-        effects->paintScreen(renderTarget, zoomedViewport, mask, region, screen);
+        paintScreenVulkan(renderTarget, viewport, mask, region, screen);
         return;
     }
 #endif
@@ -679,6 +1048,11 @@ void ZoomEffect::slotScreenRemoved(Output *screen)
         }
         m_offscreenData.erase(it);
     }
+#if HAVE_VULKAN
+    if (auto it = m_vkOffscreenData.find(screen); it != m_vkOffscreenData.end()) {
+        m_vkOffscreenData.erase(it);
+    }
+#endif
 }
 
 void ZoomEffect::moveFocus(const QPoint &point)

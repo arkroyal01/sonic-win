@@ -177,8 +177,8 @@ bool VulkanPipeline::createPipeline(VkRenderPass renderPass,
     vertShaderStageInfo.pName = "main";
 
     // Specialization constants for fragment shader
-    std::array<VkSpecializationMapEntry, 10> specEntries{};
-    std::array<VkBool32, 10> specData{};
+    std::array<VkSpecializationMapEntry, 11> specEntries{};
+    std::array<VkBool32, 11> specData{};
 
     specData[0] = (m_traits & VulkanShaderTrait::MapTexture) ? VK_TRUE : VK_FALSE;
     specData[1] = (m_traits & VulkanShaderTrait::UniformColor) ? VK_TRUE : VK_FALSE;
@@ -190,8 +190,9 @@ bool VulkanPipeline::createPipeline(VkRenderPass renderPass,
     specData[7] = (m_traits & VulkanShaderTrait::YUV) ? VK_TRUE : VK_FALSE;
     specData[8] = (m_traits & VulkanShaderTrait::Invert) ? VK_TRUE : VK_FALSE;
     specData[9] = (m_traits & VulkanShaderTrait::ColorBlindnessCorrect) ? VK_TRUE : VK_FALSE;
+    specData[10] = (m_traits & VulkanShaderTrait::PixelGrid) ? VK_TRUE : VK_FALSE;
 
-    for (uint32_t i = 0; i < 10; ++i) {
+    for (uint32_t i = 0; i < specEntries.size(); ++i) {
         specEntries[i].constantID = i;
         specEntries[i].offset = i * sizeof(VkBool32);
         specEntries[i].size = sizeof(VkBool32);

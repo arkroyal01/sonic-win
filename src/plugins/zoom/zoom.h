@@ -14,8 +14,13 @@
 #include "core/colorspace.h"
 #include "effect/effect.h"
 
+#include <QImage>
 #include <QTime>
 #include <QTimeLine>
+
+#if HAVE_VULKAN
+#include <vulkan/vulkan.h>
+#endif
 
 namespace KWin
 {
@@ -28,6 +33,12 @@ class GLFramebuffer;
 class GLTexture;
 class GLVertexBuffer;
 class GLShader;
+
+#if HAVE_VULKAN
+class VulkanFramebuffer;
+class VulkanRenderPass;
+class VulkanTexture;
+#endif
 
 class ZoomEffect : public Effect
 {
@@ -115,6 +126,20 @@ private:
 
     GLShader *shaderForZoom(double zoom);
 
+#if HAVE_VULKAN
+    struct VulkanOffscreenData
+    {
+        std::unique_ptr<VulkanFramebuffer> framebuffer;
+        std::unique_ptr<VulkanRenderPass> renderPass;
+        QSize size;
+        VkFormat format = VK_FORMAT_UNDEFINED;
+    };
+
+    VulkanOffscreenData *ensureVulkanOffscreenData(const RenderTarget &renderTarget, const RenderViewport &viewport, Output *screen);
+    VulkanTexture *ensureVulkanCursorTexture();
+    void paintScreenVulkan(const RenderTarget &renderTarget, const RenderViewport &viewport, int mask, const QRegion &region, Output *screen);
+#endif
+
 #if HAVE_ACCESSIBILITY
     ZoomAccessibilityIntegration *m_accessibilityIntegration = nullptr;
 #endif
@@ -141,6 +166,11 @@ private:
     std::map<Output *, OffscreenData> m_offscreenData;
     std::unique_ptr<GLShader> m_pixelGridShader;
     double m_pixelGridZoom;
+#if HAVE_VULKAN
+    std::map<Output *, VulkanOffscreenData> m_vkOffscreenData;
+    std::unique_ptr<VulkanTexture> m_vkCursorTexture;
+    QImage m_vkCursorImageCache;
+#endif
 };
 
 } // namespace

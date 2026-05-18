@@ -36,6 +36,7 @@ enum class VulkanShaderTrait {
     YUV = 1 << 7, ///< YUV to RGB conversion (for multi-plane textures)
     Invert = 1 << 8, ///< Invert colors
     ColorBlindnessCorrect = 1 << 9, ///< Color blindness simulation correction
+    PixelGrid = 1 << 10, ///< Snap-to-pixel-center sampling with black grid lines (zoom effect)
 };
 
 Q_DECLARE_FLAGS(VulkanShaderTraits, VulkanShaderTrait)
