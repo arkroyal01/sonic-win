@@ -304,6 +304,71 @@ std::unique_ptr<VulkanTexture> VulkanTexture::upload(VulkanContext *context, con
     return texture;
 }
 
+VulkanTexture::AsyncUploadResult VulkanTexture::uploadAsync(VulkanContext *context, const QImage &image, VkCommandBuffer cmd)
+{
+    AsyncUploadResult result;
+    if (image.isNull() || cmd == VK_NULL_HANDLE) {
+        return result;
+    }
+
+    VkFormat format = qImageFormatToVkFormat(image.format());
+    if (format == VK_FORMAT_UNDEFINED) {
+        QImage converted = image.convertToFormat(QImage::Format_RGBA8888);
+        return uploadAsync(context, converted, cmd);
+    }
+
+    auto texture = std::unique_ptr<VulkanTexture>(new VulkanTexture(context));
+    if (!texture->createImage(image.size(), format,
+                              VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                              VK_IMAGE_TILING_OPTIMAL)) {
+        return result;
+    }
+    if (!texture->createImageView() || !texture->createSampler()) {
+        return result;
+    }
+
+    VkDeviceSize imageSize = image.sizeInBytes();
+    auto staging = VulkanBuffer::createStagingBuffer(context, imageSize);
+    if (!staging) {
+        return result;
+    }
+    void *mapped = staging->map();
+    if (!mapped) {
+        return result;
+    }
+    std::memcpy(mapped, image.constBits(), imageSize);
+    staging->unmap();
+
+    // Record the transitions + copy on the caller's command buffer. The caller is
+    // responsible for submitting cmd and for keeping `staging` alive until that
+    // submission completes — typically by stashing it somewhere that survives at
+    // least one frame so the deferred-destruction queue can free it after the
+    // next beginFrame's previous-frame fence wait.
+    texture->transitionLayout(cmd, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                              VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+    VkBufferImageCopy region{};
+    region.bufferOffset = 0;
+    region.bufferRowLength = 0;
+    region.bufferImageHeight = 0;
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.mipLevel = 0;
+    region.imageSubresource.baseArrayLayer = 0;
+    region.imageSubresource.layerCount = 1;
+    region.imageOffset = {0, 0, 0};
+    region.imageExtent = {static_cast<uint32_t>(image.width()), static_cast<uint32_t>(image.height()), 1};
+
+    vkCmdCopyBufferToImage(cmd, staging->buffer(), texture->m_image,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    texture->transitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                              VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+
+    result.texture = std::move(texture);
+    result.staging = std::move(staging);
+    return result;
+}
+
 std::unique_ptr<VulkanTexture> VulkanTexture::allocate(VulkanContext *context, const QSize &size, VkFormat format)
 {
     auto texture = std::unique_ptr<VulkanTexture>(new VulkanTexture(context));

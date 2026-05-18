@@ -133,7 +133,8 @@ ZoomEffect::ZoomEffect()
         connect(c, &Compositor::aboutToDestroy, this, [this]() {
             m_vkOffscreenData.clear();
             m_vkCursorTexture.reset();
-            m_vkCursorImageCache = QImage();
+            m_vkCursorStaging.reset();
+            m_vkCursorImageCacheKey = 0;
         });
     }
 #endif
@@ -214,7 +215,8 @@ void ZoomEffect::showCursor()
         m_cursorTexture.reset();
 #if HAVE_VULKAN
         m_vkCursorTexture.reset();
-        m_vkCursorImageCache = QImage();
+        m_vkCursorStaging.reset();
+        m_vkCursorImageCacheKey = 0;
 #endif
         m_isMouseHidden = false;
     }
@@ -408,37 +410,36 @@ ZoomEffect::VulkanOffscreenData *ZoomEffect::ensureVulkanOffscreenData(const Ren
     return &data;
 }
 
-VulkanTexture *ZoomEffect::ensureVulkanCursorTexture()
+bool ZoomEffect::prepareVulkanCursorUpload(VulkanContext *ctx, VkCommandBuffer cmd)
 {
-    auto *scene = dynamic_cast<WorkspaceSceneVulkan *>(Compositor::self()->scene());
-    if (!scene) {
-        return nullptr;
-    }
-    VulkanContext *ctx = scene->backend()->vulkanContext();
-    if (!ctx) {
-        return nullptr;
-    }
-
     const auto cursor = effects->cursorImage();
     const QImage img = cursor.image();
     if (img.isNull()) {
         m_vkCursorTexture.reset();
-        m_vkCursorImageCache = QImage();
-        return nullptr;
+        m_vkCursorStaging.reset();
+        m_vkCursorImageCacheKey = 0;
+        return false;
     }
 
-    if (m_cursorTextureDirty || !m_vkCursorTexture || m_vkCursorImageCache.cacheKey() != img.cacheKey()) {
-        m_vkCursorTexture = VulkanTexture::upload(ctx, img);
-        if (!m_vkCursorTexture || !m_vkCursorTexture->isValid()) {
-            m_vkCursorTexture.reset();
-            return nullptr;
-        }
-        m_vkCursorTexture->setFilter(VK_FILTER_LINEAR);
-        m_vkCursorTexture->setWrapMode(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
-        m_vkCursorImageCache = img;
-        m_cursorTextureDirty = false;
+    if (!m_cursorTextureDirty && m_vkCursorTexture && m_vkCursorImageCacheKey == img.cacheKey()) {
+        return false; // current texture is still good
     }
-    return m_vkCursorTexture.get();
+
+    auto upload = VulkanTexture::uploadAsync(ctx, img, cmd);
+    if (!upload.texture || !upload.texture->isValid()) {
+        return false;
+    }
+    upload.texture->setFilter(VK_FILTER_LINEAR);
+    upload.texture->setWrapMode(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+
+    // The old staging buffer (if any) was used by a previous frame's cmd2 which has
+    // since completed. Replacing it queues the old one for deferred destruction,
+    // which fires after the next beginFrame's fence wait — safe.
+    m_vkCursorTexture = std::move(upload.texture);
+    m_vkCursorStaging = std::move(upload.staging);
+    m_vkCursorImageCacheKey = img.cacheKey();
+    m_cursorTextureDirty = false;
+    return true;
 }
 
 void ZoomEffect::paintScreenVulkan(const RenderTarget &renderTarget, const RenderViewport &viewport, int mask, const QRegion &region, Output *screen)
@@ -502,6 +503,15 @@ void ZoomEffect::paintScreenVulkan(const RenderTarget &renderTarget, const Rende
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         if (vkBeginCommandBuffer(cmd2, &begin) != VK_SUCCESS) {
             return;
+        }
+
+        // Cursor upload (if the shape changed) must happen before any render pass
+        // begins on cmd2 — vkCmdCopyBufferToImage and the layout barriers around it
+        // aren't allowed inside a render pass. The main cmd buffer's cursor read
+        // waits on offscreen->semaphore at FRAGMENT_SHADER_BIT, so the upload here
+        // is visible by the time the main quad samples it.
+        if (m_mousePointer != MousePointerHide && m_isMouseHidden) {
+            prepareVulkanCursorUpload(ctx, cmd2);
         }
 
         VulkanRenderTarget vulkanOffscreenRT(offscreen->framebuffer.get(), renderTarget.colorDescription());
@@ -744,7 +754,7 @@ void ZoomEffect::paintScreenVulkan(const RenderTarget &renderTarget, const Rende
     // (e.g. Proportional+Keep) the OS cursor is still visible and drawing
     // another over it would double up.
     if (m_mousePointer != MousePointerHide && m_isMouseHidden) {
-        VulkanTexture *cursorTex = ensureVulkanCursorTexture();
+        VulkanTexture *cursorTex = m_vkCursorTexture.get();
         if (cursorTex) {
             const auto cursor = effects->cursorImage();
             QSizeF cursorSize = QSizeF(cursor.image().size()) / cursor.image().devicePixelRatio();

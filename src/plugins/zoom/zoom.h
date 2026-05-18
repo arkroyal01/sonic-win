@@ -35,6 +35,7 @@ class GLVertexBuffer;
 class GLShader;
 
 #if HAVE_VULKAN
+class VulkanBuffer;
 class VulkanContext;
 class VulkanFramebuffer;
 class VulkanRenderPass;
@@ -150,7 +151,14 @@ private:
     };
 
     VulkanOffscreenData *ensureVulkanOffscreenData(const RenderTarget &renderTarget, const RenderViewport &viewport, Output *screen);
-    VulkanTexture *ensureVulkanCursorTexture();
+
+    /**
+     * Detect whether the cursor image has changed. If so, allocate a new
+     * VulkanTexture + staging buffer; the caller records the staging upload
+     * commands into a command buffer before its render pass begins.
+     */
+    bool prepareVulkanCursorUpload(VulkanContext *ctx, VkCommandBuffer cmd);
+
     void paintScreenVulkan(const RenderTarget &renderTarget, const RenderViewport &viewport, int mask, const QRegion &region, Output *screen);
 #endif
 
@@ -183,7 +191,8 @@ private:
 #if HAVE_VULKAN
     std::map<Output *, VulkanOffscreenData> m_vkOffscreenData;
     std::unique_ptr<VulkanTexture> m_vkCursorTexture;
-    QImage m_vkCursorImageCache;
+    std::unique_ptr<VulkanBuffer> m_vkCursorStaging; // alive until next frame's cleanup
+    qint64 m_vkCursorImageCacheKey = 0;
 #endif
 };
 

@@ -27,6 +27,7 @@ namespace KWin
 
 class VulkanContext;
 class VulkanBackend;
+class VulkanBuffer;
 
 /**
  * @brief Texture coordinate type for Vulkan textures.
@@ -59,6 +60,24 @@ public:
      * @brief Create a texture from a QImage.
      */
     static std::unique_ptr<VulkanTexture> upload(VulkanContext *context, const QImage &image);
+
+    /**
+     * @brief Async upload — records the staging copy + layout transitions into the
+     * caller-provided command buffer instead of doing its own submit + vkQueueWaitIdle.
+     *
+     * The caller is responsible for submitting @p cmd themselves and for keeping the
+     * returned staging buffer alive until that submission completes (typically by
+     * holding it past the next frame's begin, where deferred buffer destruction
+     * fires after the previous-frame fence is signaled).
+     *
+     * Returns nullptr texture on failure.
+     */
+    struct AsyncUploadResult
+    {
+        std::unique_ptr<VulkanTexture> texture;
+        std::unique_ptr<VulkanBuffer> staging;
+    };
+    static AsyncUploadResult uploadAsync(VulkanContext *context, const QImage &image, VkCommandBuffer cmd);
 
     /**
      * @brief Create an empty texture with the specified size and format.
