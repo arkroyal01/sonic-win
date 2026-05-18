@@ -10,13 +10,22 @@
 
 #pragma once
 
+#include "config-kwin.h"
 #include "effect/effect.h"
+
+#if HAVE_VULKAN
+#include <vulkan/vulkan.h>
+#endif
 
 namespace KWin
 {
 
 class GLFramebuffer;
 class GLTexture;
+#if HAVE_VULKAN
+class VulkanContext;
+class VulkanTexture;
+#endif
 
 class MagnifierEffect : public Effect
 {
@@ -55,6 +64,17 @@ private:
     QSize m_magnifierSize;
     std::unique_ptr<GLTexture> m_texture;
     std::unique_ptr<GLFramebuffer> m_fbo;
+
+#if HAVE_VULKAN
+    void paintVulkan(const RenderTarget &renderTarget, const RenderViewport &viewport);
+    bool ensureVulkanResumePass(VkFormat swapchainFormat);
+
+    VulkanContext *m_vkCtx = nullptr;
+    std::unique_ptr<VulkanTexture> m_vkCaptureTexture;
+    QSize m_vkCaptureSize;
+    VkRenderPass m_vkResumePass = VK_NULL_HANDLE;
+    VkFormat m_vkResumePassFormat = VK_FORMAT_UNDEFINED;
+#endif
 };
 
 } // namespace
