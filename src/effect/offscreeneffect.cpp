@@ -111,9 +111,13 @@ struct VulkanOffscreenData : public OffscreenData
     float m_cbDefectMatrix[12] = {};
     float m_cbIntensity = 0.0f;
 
+    // Custom uniform color override (alpha < 0 means disabled).
+    float m_uniformColorOverride[4] = {0.0f, 0.0f, 0.0f, -1.0f};
+
     void setShader(VulkanPipeline *pipeline);
     void setShader(VulkanPipeline *pipeline, float brightness, float saturation);
     void setColorBlindnessParams(const float cbMatrix[12], float cbIntensity);
+    void setUniformColor(const QColor &color);
 };
 
 class OffscreenEffectPrivate
@@ -225,6 +229,14 @@ void OffscreenEffect::setColorBlindnessParams(EffectWindow *window, const float 
     if (const auto it = d->windows.find(window); it != d->windows.end()) {
         auto *vulkanData = static_cast<VulkanOffscreenData *>(it->second.get());
         vulkanData->setColorBlindnessParams(cbMatrix, cbIntensity);
+    }
+}
+
+void OffscreenEffect::setUniformColor(EffectWindow *window, const QColor &color)
+{
+    if (const auto it = d->windows.find(window); it != d->windows.end()) {
+        auto *vulkanData = static_cast<VulkanOffscreenData *>(it->second.get());
+        vulkanData->setUniformColor(color);
     }
 }
 
@@ -428,6 +440,16 @@ void VulkanOffscreenData::setColorBlindnessParams(const float cbMatrix[12], floa
     m_cbIntensity = cbIntensity;
 }
 
+void VulkanOffscreenData::setUniformColor(const QColor &color)
+{
+    const float a = static_cast<float>(color.alphaF());
+    // Premultiply so the standard ONE / ONE_MINUS_SRC_ALPHA blend produces solid color.
+    m_uniformColorOverride[0] = static_cast<float>(color.redF()) * a;
+    m_uniformColorOverride[1] = static_cast<float>(color.greenF()) * a;
+    m_uniformColorOverride[2] = static_cast<float>(color.blueF()) * a;
+    m_uniformColorOverride[3] = a;
+}
+
 void VulkanOffscreenData::paint(const RenderTarget &renderTarget, const RenderViewport &viewport, EffectWindow *window, const QRegion &region,
                                 const WindowPaintData &data, const WindowQuadList &quads)
 {
@@ -563,10 +585,15 @@ void VulkanOffscreenData::paint(const RenderTarget &renderTarget, const RenderVi
     VulkanUniforms uniforms{};
     const qreal rgb = data.brightness() * data.opacity();
     const qreal a = data.opacity();
-    uniforms.uniformColor[0] = rgb;
-    uniforms.uniformColor[1] = rgb;
-    uniforms.uniformColor[2] = rgb;
-    uniforms.uniformColor[3] = a;
+    if (m_uniformColorOverride[3] >= 0.0f) {
+        // Caller (e.g. systembell color flash) wants a solid color via UniformColor trait.
+        memcpy(uniforms.uniformColor, m_uniformColorOverride, sizeof(uniforms.uniformColor));
+    } else {
+        uniforms.uniformColor[0] = rgb;
+        uniforms.uniformColor[1] = rgb;
+        uniforms.uniformColor[2] = rgb;
+        uniforms.uniformColor[3] = a;
+    }
     uniforms.opacity = data.opacity();
     uniforms.brightness = (m_brightness != 1.0f) ? m_brightness : data.brightness();
     uniforms.saturation = (m_saturation != 1.0f) ? m_saturation : data.saturation();

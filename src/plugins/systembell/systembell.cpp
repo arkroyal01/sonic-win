@@ -115,6 +115,9 @@ void SystemBellEffect::flash(EffectWindow *window)
     } else if (effects->isVulkanCompositing() && m_pipeline) {
         redirect(window);
         setPipeline(window, m_pipeline);
+        if (m_mode == Color) {
+            setUniformColor(window, m_color);
+        }
     }
 }
 
@@ -170,6 +173,10 @@ bool SystemBellEffect::loadData()
 
         if (m_mode == Invert) {
             traits |= VulkanShaderTrait::Invert;
+        } else {
+            // Color mode: flood the window with m_color. UniformColor overwrites the
+            // sampled texture color in main.frag, mirroring the GL color.frag shader.
+            traits |= VulkanShaderTrait::UniformColor;
         }
 
         m_pipeline = pipelineManager->pipeline(traits);

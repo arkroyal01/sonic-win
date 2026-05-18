@@ -88,6 +88,15 @@ protected:
     void setColorBlindnessParams(EffectWindow *window, const float cbMatrix[12], float cbIntensity);
 
     /**
+     * Override the uniform color for @p window's Vulkan paint. Used by effects that
+     * pair this with a pipeline carrying the @c VulkanShaderTrait::UniformColor trait
+     * to flood the window with a solid premultiplied color (e.g. systembell red flash).
+     * The color is interpreted as straight RGBA in [0,1] and converted to premultiplied
+     * RGBA on upload.
+     **/
+    void setUniformColor(EffectWindow *window, const QColor &color);
+
+    /**
      * Set what mode to use to snap the vertices of this effect.
      *
      * @see RenderGeometry::VertexSnappingMode
