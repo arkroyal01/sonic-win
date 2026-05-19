@@ -8,6 +8,7 @@
 */
 #pragma once
 
+#include "config-kwin.h"
 #include "effect/effect.h"
 #include <QColor>
 #include <QDBusContext>
@@ -42,6 +43,9 @@ private:
     void showInfoMessage();
     void hideInfoMessage();
     void setPicking(bool picking);
+#if HAVE_VULKAN
+    void scheduleVulkanPick(const RenderTarget &renderTarget, const RenderViewport &viewport);
+#endif
 
     QDBusMessage m_replyMessage;
     QPointF m_scheduledPosition;
