@@ -296,9 +296,22 @@ void main() {
                                ubo.destTransferParams.x, ubo.destTransferParams.y);
     }
 
-    // Apply invert effect
+    // Apply invert effect.
+    //
+    // - Premultiplied-aware so transparent shadow / expanded-geometry pixels stay
+    //   transparent instead of becoming opaque white halos around windows.
+    // - The inversion is done in gamma 2.2 (perceptual) space to match the GL
+    //   invert.frag's behaviour. Doing it in linear space (the hardware-decoded
+    //   sRGB sample) yields blown-out output: e.g. a dark grey byte 0x40 (linear
+    //   ~0.05) would invert to linear 0.95 ≈ byte 0xF9, when the perceptually
+    //   correct result is byte 0xBF.
     if (TRAIT_INVERT) {
-        color.rgb = vec3(1.0) - color.rgb;
+        float a = max(color.a, 0.001);
+        vec3 linear = color.rgb / a;
+        vec3 encoded = pow(max(linear, vec3(0.0)), vec3(1.0 / 2.2));
+        encoded = vec3(1.0) - encoded;
+        vec3 invertedLinear = pow(max(encoded, vec3(0.0)), vec3(2.2));
+        color.rgb = invertedLinear * color.a;
     }
 
     // Apply color blindness correction
