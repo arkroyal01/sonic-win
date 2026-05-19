@@ -23,10 +23,13 @@
 #include "opengl/gltexture.h"
 
 #if HAVE_VULKAN
+#include "platformsupport/scenes/vulkan/vulkanbackend.h"
 #include "platformsupport/scenes/vulkan/vulkancontext.h"
-#include "platformsupport/scenes/vulkan/vulkansurfacetexture.h"
+#include "platformsupport/scenes/vulkan/vulkanframebuffer.h"
+#include "platformsupport/scenes/vulkan/vulkanrenderpass.h"
+#include "platformsupport/scenes/vulkan/vulkanrendertarget.h"
 #include "platformsupport/scenes/vulkan/vulkantexture.h"
-#include "scene/surfaceitem.h"
+#include "scene/itemrenderer_vulkan.h"
 #include "scene/workspacescene_vulkan.h"
 #endif
 
@@ -194,33 +197,97 @@ void WindowThumbnailSource::updateVulkan()
         qCWarning(KWIN_SCRIPTING) << "VulkanThumbnail: no WorkspaceSceneVulkan";
         return;
     }
-    SurfaceItem *surfaceItem = m_handle->windowItem()->surfaceItem();
-    if (!surfaceItem) {
-        qCWarning(KWIN_SCRIPTING) << "VulkanThumbnail: no surfaceItem";
+    auto *vkRenderer = static_cast<ItemRendererVulkan *>(vkScene->renderer());
+    if (!vkRenderer) {
         return;
     }
-
-    SurfacePixmap *pixmap = surfaceItem->pixmap();
-    if (!pixmap) {
-        // not yet uploaded; will retry next frame
-        return;
-    }
-
-    auto *vulkanSurfaceTex = dynamic_cast<VulkanSurfaceTexture *>(pixmap->texture());
-    if (!vulkanSurfaceTex || !vulkanSurfaceTex->isValid()) {
-        qCWarning(KWIN_SCRIPTING) << "VulkanThumbnail: surface texture not valid";
-        return;
-    }
-
-    VulkanTexture *tex = vulkanSurfaceTex->texture().firstPlane();
-    if (!tex) {
-        qCWarning(KWIN_SCRIPTING) << "VulkanThumbnail: no texture plane";
-        return;
-    }
-
     VulkanContext *ctx = vkScene->backend()->vulkanContext();
-    m_cachedImage = ctx->readTextureToImage(tex);
-    m_cachedImage.setDevicePixelRatio(m_view->devicePixelRatio());
+    if (!ctx) {
+        return;
+    }
+
+    // Render the full WindowItem (surface + decoration children) into an offscreen
+    // framebuffer, matching the GL path. Sampling the surface alone would drop the
+    // decoration; that's the regression overview surfaced when window thumbnails
+    // appeared without titlebars or borders.
+    const QRectF geometry = m_handle->visibleGeometry();
+    const qreal devicePixelRatio = m_view->devicePixelRatio();
+    const QSize textureSize = (geometry.toAlignedRect().size() * devicePixelRatio).expandedTo(QSize(1, 1));
+
+    const VkFormat fmt = ctx->backend()->colorFormat();
+    if (!m_vkRenderPass) {
+        m_vkRenderPass = VulkanRenderPass::createForOffscreen(ctx, fmt, /*withDepth=*/false);
+        if (!m_vkRenderPass || !m_vkRenderPass->isValid()) {
+            qCWarning(KWIN_SCRIPTING) << "VulkanThumbnail: failed to create offscreen render pass";
+            m_vkRenderPass.reset();
+            return;
+        }
+    }
+    if (!m_vkOffscreenFbo || m_vkOffscreenFbo->size() != textureSize) {
+        m_vkOffscreenFbo = VulkanFramebuffer::createWithTexture(ctx, m_vkRenderPass.get(), textureSize, fmt);
+        if (!m_vkOffscreenFbo || !m_vkOffscreenFbo->isValid()) {
+            qCWarning(KWIN_SCRIPTING) << "VulkanThumbnail: failed to create offscreen framebuffer" << textureSize;
+            m_vkOffscreenFbo.reset();
+            return;
+        }
+    }
+    m_vkLastDpr = devicePixelRatio;
+
+    VkCommandBuffer cmd = ctx->beginSingleTimeCommands();
+    if (cmd == VK_NULL_HANDLE) {
+        return;
+    }
+
+    auto vkRT = std::make_unique<VulkanRenderTarget>(m_vkOffscreenFbo.get());
+    vkRT->setCommandBuffer(cmd);
+    RenderTarget offscreenRT(vkRT.get());
+    RenderViewport viewport(geometry, devicePixelRatio, offscreenRT);
+
+    VkClearValue clearVal{};
+    VkRect2D area{{0, 0}, {uint32_t(textureSize.width()), uint32_t(textureSize.height())}};
+    m_vkRenderPass->begin(cmd, m_vkOffscreenFbo->framebuffer(), area, &clearVal, 1);
+
+    // Y-flipped viewport (VK_KHR_maintenance1) matches the main render path and the
+    // screenshot effect, so the resulting framebuffer layout is canonical top-down.
+    VkViewport vp{};
+    vp.x = 0.0f;
+    vp.y = float(textureSize.height());
+    vp.width = float(textureSize.width());
+    vp.height = -float(textureSize.height());
+    vp.minDepth = 0.0f;
+    vp.maxDepth = 1.0f;
+    vkCmdSetViewport(cmd, 0, 1, &vp);
+    VkRect2D scissor{{0, 0}, {uint32_t(textureSize.width()), uint32_t(textureSize.height())}};
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+    // Save/restore vertex buffer offset: renderItem() advances the shared streaming
+    // buffer. beginSingleTimeCommands' vkQueueWaitIdle on end ensures the GPU has
+    // finished before the offset is reusable.
+    const size_t savedOffset = vkRenderer->vertexBufferOffset();
+    vkRenderer->renderItem(offscreenRT, viewport, m_handle->windowItem(),
+                           Scene::PAINT_WINDOW_TRANSFORMED, infiniteRegion(), WindowPaintData{});
+    vkRenderer->setVertexBufferOffset(savedOffset);
+
+    m_vkRenderPass->end(cmd);
+
+    // Transition the color attachment to SHADER_READ_ONLY_OPTIMAL so readTextureToImage
+    // can copy it out (it expects that as the starting layout).
+    m_vkOffscreenFbo->colorTexture()->transitionLayout(cmd,
+                                                       VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                                       VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                                       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+
+    ctx->endSingleTimeCommands(cmd);
+
+    // Read back into a QImage. Going through QSGVulkanTexture::fromNative looked
+    // appealing for zero-copy, but Qt's fromNative wrapper has no format parameter
+    // and treats the bytes as RGBA — when our render target is BGRA_SRGB (matching
+    // the swapchain's pipelines), red and blue end up swapped on display. The
+    // readback path lets readTextureToImage tag the QImage as ARGB32 for BGRA, which
+    // createTextureFromImage then converts canonically.
+    m_cachedImage = ctx->readTextureToImage(m_vkOffscreenFbo->colorTexture());
+    m_cachedImage.setDevicePixelRatio(devicePixelRatio);
 
     m_dirty = false;
     Q_EMIT changed();

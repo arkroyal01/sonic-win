@@ -22,6 +22,10 @@ class GLFramebuffer;
 class GLTexture;
 class ThumbnailTextureProvider;
 class WindowThumbnailSource;
+#if HAVE_VULKAN
+class VulkanRenderPass;
+class VulkanFramebuffer;
+#endif
 class WindowThumbnailSource : public QObject
 {
     Q_OBJECT
@@ -59,7 +63,10 @@ private:
     bool m_dirty = true;
 
 #if HAVE_VULKAN
-    QImage m_cachedImage;
+    QImage m_cachedImage; // legacy / fallback path; unused by the current Vulkan thumbnail flow
+    std::unique_ptr<VulkanRenderPass> m_vkRenderPass;
+    std::unique_ptr<VulkanFramebuffer> m_vkOffscreenFbo;
+    qreal m_vkLastDpr = 1.0;
 #endif
 };
 
