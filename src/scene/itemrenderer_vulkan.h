@@ -36,6 +36,7 @@ class VulkanTexture;
 class VulkanFramebuffer;
 class VulkanSwapchain;
 class VulkanRenderTarget;
+class RenderTarget;
 
 class KWIN_EXPORT ItemRendererVulkan : public ItemRenderer
 {
@@ -111,12 +112,51 @@ public:
 
     /**
      * Returns the current Vulkan command buffer being used for rendering.
-     * This is valid only during a frame (between beginFrame and endFrame).
+     *
+     * This is the swapchain (outer) frame's command buffer, valid only
+     * between beginFrame() and endFrame(). Effects participating in
+     * @c paintScreen / @c drawWindow should NOT use it directly: a parent
+     * effect may have invoked them recursively with an offscreen
+     * RenderTarget that carries its own command buffer (see ZoomEffect's
+     * fullscreen capture, ScreenShotEffect::scheduleVulkanScreenshot, etc.),
+     * in which case recording on the swapchain buffer puts draws into the
+     * wrong render pass and leaves the recursive target empty.
+     *
+     * Use @c activeCommandBuffer(renderTarget) inside such hooks instead.
+     * In debug builds this method asserts when called while a
+     * @c RecursivePaintScope is active.
      */
-    VkCommandBuffer currentCommandBuffer() const
+    VkCommandBuffer currentCommandBuffer() const;
+
+    /**
+     * Returns the command buffer that should be used to record draws for
+     * @p renderTarget. Prefers @c renderTarget.vulkanTarget()->commandBuffer()
+     * when set (recursive offscreen flow), falling back to the swapchain
+     * command buffer otherwise.
+     *
+     * This is the canonical API for effects that participate in the paint
+     * chain: it routes draws to the correct render pass even when invoked
+     * recursively from another effect's offscreen capture.
+     */
+    VkCommandBuffer activeCommandBuffer(const RenderTarget &renderTarget) const;
+
+    /**
+     * RAII scope that marks the enclosing block as "recording into a
+     * recursive offscreen RenderTarget". Effects that invoke
+     * @c effects->paintScreen() or @c effects->drawWindow() with their own
+     * offscreen target (zoom, screenshot, ...) must wrap the call so the
+     * renderer can flag misuse of @c currentCommandBuffer() in debug builds.
+     *
+     * The guard is reentrant and thread-local. Nested guards stack.
+     */
+    class KWIN_EXPORT RecursivePaintScope
     {
-        return m_currentCommandBuffer;
-    }
+    public:
+        RecursivePaintScope();
+        ~RecursivePaintScope();
+        RecursivePaintScope(const RecursivePaintScope &) = delete;
+        RecursivePaintScope &operator=(const RecursivePaintScope &) = delete;
+    };
 
     /**
      * Returns the current Vulkan framebuffer being rendered to.

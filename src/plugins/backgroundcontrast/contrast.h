@@ -74,7 +74,7 @@ private:
 
 #if HAVE_VULKAN
     bool initVulkanResources();
-    void doContrastVulkan(const RenderViewport &viewport, EffectWindow *w, const QRegion &shape, float opacity);
+    void doContrastVulkan(const RenderTarget &renderTarget, const RenderViewport &viewport, EffectWindow *w, const QRegion &shape, float opacity);
 #endif
 
 private:

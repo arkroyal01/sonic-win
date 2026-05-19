@@ -278,7 +278,10 @@ void InvertEffect::paintVulkanCursor(const RenderTarget &renderTarget, const Ren
     if (!vkRenderer) {
         return;
     }
-    VkCommandBuffer cmd = vkRenderer->currentCommandBuffer();
+    // Use activeCommandBuffer so the cursor lands in the caller's render pass
+    // (e.g. ZoomEffect's offscreen capture during fullscreen zoom) and not the
+    // swapchain pass.
+    VkCommandBuffer cmd = vkRenderer->activeCommandBuffer(renderTarget);
     if (cmd == VK_NULL_HANDLE) {
         return;
     }

@@ -352,7 +352,9 @@ void ColorBlindnessCorrectionEffect::paintVulkanCursor(const RenderTarget &rende
     if (!vkRenderer) {
         return;
     }
-    VkCommandBuffer cmd = vkRenderer->currentCommandBuffer();
+    // Use activeCommandBuffer so the cursor lands in the caller's render pass
+    // (e.g. ZoomEffect's offscreen capture) and not the swapchain one.
+    VkCommandBuffer cmd = vkRenderer->activeCommandBuffer(renderTarget);
     if (cmd == VK_NULL_HANDLE) {
         return;
     }

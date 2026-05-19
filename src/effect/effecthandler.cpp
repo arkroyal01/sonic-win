@@ -1545,7 +1545,10 @@ void EffectsHandler::renderOffscreenQuickView(const RenderTarget &renderTarget, 
         if (!vkRenderer) {
             return;
         }
-        VkCommandBuffer cmd = vkRenderer->currentCommandBuffer();
+        // Use activeCommandBuffer: when an outer effect (e.g. ZoomEffect) invokes
+        // this with an offscreen renderTarget, we must record into its render
+        // pass rather than the swapchain one.
+        VkCommandBuffer cmd = vkRenderer->activeCommandBuffer(renderTarget);
         if (cmd == VK_NULL_HANDLE) {
             return;
         }

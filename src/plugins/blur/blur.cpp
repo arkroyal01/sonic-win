@@ -1385,7 +1385,11 @@ void BlurEffect::blurVulkan(const RenderTarget &renderTarget, const RenderViewpo
     }
     auto *renderer = static_cast<ItemRendererVulkan *>(scene->renderer());
 
-    VkCommandBuffer cmd = renderer->currentCommandBuffer();
+    // FIXME: blur samples currentFramebuffer() — under a recursive paint flow
+    // (e.g. ZoomEffect's fullscreen offscreen capture) we'd want the caller's
+    // framebuffer instead. Routing the command buffer correctly is half of the
+    // fix; the framebuffer source needs to follow renderTarget too.
+    VkCommandBuffer cmd = renderer->activeCommandBuffer(renderTarget);
     VulkanFramebuffer *fb = renderer->currentFramebuffer();
     if (!cmd || !fb) {
         return;

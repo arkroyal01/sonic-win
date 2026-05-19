@@ -297,7 +297,9 @@ void MagnifierEffect::paintVulkan(const RenderTarget &renderTarget, const Render
         return;
     }
 
-    VkCommandBuffer cmd = vkRenderer->currentCommandBuffer();
+    // FIXME: this also samples currentFramebuffer() — under a recursive paint
+    // flow we'd want the caller's framebuffer instead.
+    VkCommandBuffer cmd = vkRenderer->activeCommandBuffer(renderTarget);
     VulkanFramebuffer *fb = vkRenderer->currentFramebuffer();
     if (cmd == VK_NULL_HANDLE || !fb) {
         return;

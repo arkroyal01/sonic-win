@@ -548,8 +548,14 @@ void ZoomEffect::paintScreenVulkan(const RenderTarget &renderTarget, const Rende
         // the same buffer region. The semaphore wait at FRAGMENT_SHADER_BIT
         // serializes execution between cmd2 and the main submit, so reusing
         // the same offset is safe.
+        // The scope flags this nested flow so debug builds catch effects that
+        // grab the swapchain command buffer instead of routing via the offscreen
+        // renderTarget — see ItemRendererVulkan::currentCommandBuffer().
         const size_t savedVertexOffset = renderer->vertexBufferOffset();
-        effects->paintScreen(offscreenRenderTarget, offscreenViewport, mask, region, screen);
+        {
+            ItemRendererVulkan::RecursivePaintScope guard;
+            effects->paintScreen(offscreenRenderTarget, offscreenViewport, mask, region, screen);
+        }
         renderer->setVertexBufferOffset(savedVertexOffset);
 
         offscreen->renderPass->end(cmd2);

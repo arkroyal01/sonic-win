@@ -588,7 +588,7 @@ void ContrastEffect::drawWindow(const RenderTarget &renderTarget, const RenderVi
         if (!effectiveShape.isEmpty()) {
 #if HAVE_VULKAN
             if (effects->isVulkanCompositing()) {
-                doContrastVulkan(viewport, w, effectiveShape, w->opacity() * data.opacity());
+                doContrastVulkan(renderTarget, viewport, w, effectiveShape, w->opacity() * data.opacity());
             } else
 #endif
             {
@@ -872,7 +872,7 @@ bool ContrastEffect::initVulkanResources()
     return true;
 }
 
-void ContrastEffect::doContrastVulkan(const RenderViewport &viewport, EffectWindow *w, const QRegion &shape, float opacity)
+void ContrastEffect::doContrastVulkan(const RenderTarget &renderTarget, const RenderViewport &viewport, EffectWindow *w, const QRegion &shape, float opacity)
 {
     if (!m_windowData.contains(w))
         return;
@@ -881,7 +881,9 @@ void ContrastEffect::doContrastVulkan(const RenderViewport &viewport, EffectWind
     if (!scene)
         return;
     auto *renderer = static_cast<ItemRendererVulkan *>(scene->renderer());
-    VkCommandBuffer cmd = renderer->currentCommandBuffer();
+    // FIXME: also samples currentFramebuffer() — under a recursive paint flow
+    // we'd want the caller's framebuffer instead.
+    VkCommandBuffer cmd = renderer->activeCommandBuffer(renderTarget);
     VulkanFramebuffer *fb = renderer->currentFramebuffer();
     if (!cmd || !fb)
         return;

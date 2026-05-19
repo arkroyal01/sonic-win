@@ -549,7 +549,7 @@ void StartupFeedbackEffect::paintVulkan(const RenderTarget &renderTarget, const 
     if (!vkRenderer) {
         return;
     }
-    VkCommandBuffer cmd = vkRenderer->currentCommandBuffer();
+    VkCommandBuffer cmd = vkRenderer->activeCommandBuffer(renderTarget);
     if (cmd == VK_NULL_HANDLE) {
         return;
     }

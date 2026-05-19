@@ -61,7 +61,7 @@ private:
     typedef QList<QPointF> Mark;
     void drawMark(QPainter *painter, const Mark &mark);
     static Mark createArrow(QPointF arrow_head, QPointF arrow_tail);
-    void paintVulkan(const RenderViewport &viewport);
+    void paintVulkan(const RenderTarget &renderTarget, const RenderViewport &viewport);
     QList<Mark> marks;
     Mark drawing;
     QPointF arrow_tail;

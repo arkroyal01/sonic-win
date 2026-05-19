@@ -120,7 +120,7 @@ void MouseMarkEffect::paintScreen(const RenderTarget &renderTarget, const Render
     }
 #if HAVE_VULKAN
     if (effects->isVulkanCompositing()) {
-        paintVulkan(viewport);
+        paintVulkan(renderTarget, viewport);
         return;
     }
 #endif
@@ -305,7 +305,7 @@ static void tessellatePolyline(QList<VulkanVertex2D> &verts, const QList<QPointF
     }
 }
 
-void MouseMarkEffect::paintVulkan(const RenderViewport &viewport)
+void MouseMarkEffect::paintVulkan(const RenderTarget &renderTarget, const RenderViewport &viewport)
 {
     VulkanContext *ctx = VulkanContext::currentContext();
     if (!ctx) {
@@ -315,7 +315,7 @@ void MouseMarkEffect::paintVulkan(const RenderViewport &viewport)
     if (!vkRenderer) {
         return;
     }
-    VkCommandBuffer cmd = vkRenderer->currentCommandBuffer();
+    VkCommandBuffer cmd = vkRenderer->activeCommandBuffer(renderTarget);
     if (cmd == VK_NULL_HANDLE) {
         return;
     }

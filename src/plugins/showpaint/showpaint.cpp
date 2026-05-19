@@ -60,7 +60,7 @@ void ShowPaintEffect::paintScreen(const RenderTarget &renderTarget, const Render
     else if (effects->isVulkanCompositing()) {
         auto *vkRenderer = dynamic_cast<ItemRendererVulkan *>(effects->scene()->renderer());
         if (vkRenderer) {
-            paintVulkan(viewport, vkRenderer);
+            paintVulkan(renderTarget, viewport, vkRenderer);
         }
     }
 #endif
@@ -113,13 +113,13 @@ void ShowPaintEffect::paintQPainter()
 }
 
 #if HAVE_VULKAN
-void ShowPaintEffect::paintVulkan(const RenderViewport &viewport, ItemRendererVulkan *vkRenderer)
+void ShowPaintEffect::paintVulkan(const RenderTarget &renderTarget, const RenderViewport &viewport, ItemRendererVulkan *vkRenderer)
 {
     VulkanContext *ctx = VulkanContext::currentContext();
     if (!ctx) {
         return;
     }
-    VkCommandBuffer cmd = vkRenderer->currentCommandBuffer();
+    VkCommandBuffer cmd = vkRenderer->activeCommandBuffer(renderTarget);
     if (cmd == VK_NULL_HANDLE) {
         return;
     }

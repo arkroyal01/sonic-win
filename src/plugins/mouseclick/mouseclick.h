@@ -129,7 +129,7 @@ private Q_SLOTS:
 
 private:
     std::unique_ptr<EffectFrame> createEffectFrame(const QPoint &pos, const QString &text);
-    inline void drawCircle(const RenderViewport &viewport, const QColor &color, float cx, float cy, float r);
+    inline void drawCircle(const RenderTarget &renderTarget, const RenderViewport &viewport, const QColor &color, float cx, float cy, float r);
 
     inline bool isReleased(Qt::MouseButtons button, Qt::MouseButtons buttons, Qt::MouseButtons oldButtons);
     inline bool isPressed(Qt::MouseButtons button, Qt::MouseButtons buttons, Qt::MouseButtons oldButtons);
@@ -141,7 +141,7 @@ private:
 
     void drawCircleGl(const RenderViewport &viewport, const QColor &color, float cx, float cy, float r);
     void drawCircleQPainter(const QColor &color, float cx, float cy, float r);
-    void drawCircleVulkan(const RenderViewport &viewport, const QColor &color, float cx, float cy, float r);
+    void drawCircleVulkan(const RenderTarget &renderTarget, const RenderViewport &viewport, const QColor &color, float cx, float cy, float r);
     void paintScreenSetupGl(const RenderTarget &renderTarget, const QMatrix4x4 &projectionMatrix);
     void paintScreenFinishGl();
 

@@ -124,7 +124,7 @@ void MouseClickEffect::paintScreen(const RenderTarget &renderTarget, const Rende
             if (size > 0 && alpha > 0) {
                 QColor color = m_colors[click->m_button];
                 color.setAlphaF(alpha);
-                drawCircle(viewport, color, click->m_pos.x(), click->m_pos.y(), size);
+                drawCircle(renderTarget, viewport, color, click->m_pos.x(), click->m_pos.y(), size);
             }
         }
 
@@ -137,7 +137,7 @@ void MouseClickEffect::paintScreen(const RenderTarget &renderTarget, const Rende
     for (const auto &tool : std::as_const(m_tabletTools)) {
         const int step = m_ringMaxSize * (1. - tool.m_pressure);
         for (qreal size = m_ringMaxSize; size > 0; size -= step) {
-            drawCircle(viewport, tool.m_color, tool.m_globalPosition.x(), tool.m_globalPosition.y(), size);
+            drawCircle(renderTarget, viewport, tool.m_color, tool.m_globalPosition.x(), tool.m_globalPosition.y(), size);
         }
     }
     if (effects->isOpenGLCompositing()) {
@@ -264,14 +264,14 @@ bool MouseClickEffect::isActive() const
     return m_enabled && (m_clicks.size() != 0 || !m_tabletTools.isEmpty());
 }
 
-void MouseClickEffect::drawCircle(const RenderViewport &viewport, const QColor &color, float cx, float cy, float r)
+void MouseClickEffect::drawCircle(const RenderTarget &renderTarget, const RenderViewport &viewport, const QColor &color, float cx, float cy, float r)
 {
     if (effects->isOpenGLCompositing()) {
         drawCircleGl(viewport, color, cx, cy, r);
     }
 #if HAVE_VULKAN
     else if (effects->isVulkanCompositing()) {
-        drawCircleVulkan(viewport, color, cx, cy, r);
+        drawCircleVulkan(renderTarget, viewport, color, cx, cy, r);
     }
 #endif
 }
@@ -359,7 +359,7 @@ TabletToolEvent &MouseClickEffect::getOrCreateTabletPoint(InputDeviceTabletTool 
 }
 
 #if HAVE_VULKAN
-void MouseClickEffect::drawCircleVulkan(const RenderViewport &viewport, const QColor &color, float cx, float cy, float r)
+void MouseClickEffect::drawCircleVulkan(const RenderTarget &renderTarget, const RenderViewport &viewport, const QColor &color, float cx, float cy, float r)
 {
     VulkanContext *ctx = VulkanContext::currentContext();
     if (!ctx) {
@@ -369,7 +369,7 @@ void MouseClickEffect::drawCircleVulkan(const RenderViewport &viewport, const QC
     if (!vkRenderer) {
         return;
     }
-    VkCommandBuffer cmd = vkRenderer->currentCommandBuffer();
+    VkCommandBuffer cmd = vkRenderer->activeCommandBuffer(renderTarget);
     if (cmd == VK_NULL_HANDLE) {
         return;
     }

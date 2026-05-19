@@ -331,7 +331,13 @@ void ScreenShotEffect::takeScreenShot(ScreenShotWindowData *screenshot)
                         const size_t savedOffset = vkRenderer ? vkRenderer->vertexBufferOffset() : 0;
 
                         WindowPaintData d;
-                        effects->drawWindow(offscreenRT, viewport, window, mask, infiniteRegion(), d);
+                        // RecursivePaintScope flags this nested flow so debug
+                        // builds catch effects that record on the swapchain
+                        // command buffer instead of the offscreenRT one.
+                        {
+                            ItemRendererVulkan::RecursivePaintScope guard;
+                            effects->drawWindow(offscreenRT, viewport, window, mask, infiniteRegion(), d);
+                        }
 
                         if (vkRenderer) {
                             vkRenderer->setVertexBufferOffset(savedOffset);

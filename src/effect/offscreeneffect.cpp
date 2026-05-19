@@ -461,11 +461,6 @@ void VulkanOffscreenData::paint(const RenderTarget &renderTarget, const RenderVi
     }
 
     auto *renderer = static_cast<ItemRendererVulkan *>(scene->renderer());
-    VkCommandBuffer cmd = renderer->currentCommandBuffer();
-    if (cmd == VK_NULL_HANDLE) {
-        qCWarning(KWIN_VULKAN) << "VulkanOffscreenData::paint: No active command buffer";
-        return;
-    }
 
     if (!m_vulkanFbo || !m_vulkanContext) {
         qCWarning(KWIN_VULKAN) << "VulkanOffscreenData::paint: No framebuffer or context";
@@ -482,6 +477,15 @@ void VulkanOffscreenData::paint(const RenderTarget &renderTarget, const RenderVi
     // Get the Vulkan render target from the passed render target
     auto *vulkanRenderTarget = renderTarget.vulkanTarget();
     if (!vulkanRenderTarget) {
+        return;
+    }
+
+    // Use activeCommandBuffer so recursive paint flows (e.g. ZoomEffect's
+    // fullscreen offscreen capture) record into the caller's render pass and
+    // not the swapchain one — otherwise the recursive target ends up empty.
+    VkCommandBuffer cmd = renderer->activeCommandBuffer(renderTarget);
+    if (cmd == VK_NULL_HANDLE) {
+        qCWarning(KWIN_VULKAN) << "VulkanOffscreenData::paint: No active command buffer";
         return;
     }
 

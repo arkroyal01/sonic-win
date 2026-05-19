@@ -29,7 +29,7 @@ public:
 private:
     void paintGL(const RenderTarget &renderTarget, const QMatrix4x4 &projection, qreal scale);
     void paintQPainter();
-    void paintVulkan(const RenderViewport &viewport, ItemRendererVulkan *renderer);
+    void paintVulkan(const RenderTarget &renderTarget, const RenderViewport &viewport, ItemRendererVulkan *renderer);
 
     QRegion m_painted; // what's painted in one pass
     int m_colorIndex = 0;

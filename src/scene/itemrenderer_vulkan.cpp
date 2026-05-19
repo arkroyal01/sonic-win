@@ -47,6 +47,48 @@
 namespace KWin
 {
 
+namespace
+{
+// Tracks recursive paint-screen / paint-window flows on this thread. Incremented
+// by ItemRendererVulkan::RecursivePaintScope. Effects that recurse into the paint
+// chain with their own offscreen RenderTarget must enclose the recursion in such
+// a scope so currentCommandBuffer() can flag misuse — see the header doc.
+thread_local int t_recursivePaintDepth = 0;
+}
+
+ItemRendererVulkan::RecursivePaintScope::RecursivePaintScope()
+{
+    ++t_recursivePaintDepth;
+}
+
+ItemRendererVulkan::RecursivePaintScope::~RecursivePaintScope()
+{
+    Q_ASSERT(t_recursivePaintDepth > 0);
+    --t_recursivePaintDepth;
+}
+
+VkCommandBuffer ItemRendererVulkan::currentCommandBuffer() const
+{
+    // Catch effects that grab the swapchain command buffer while a parent
+    // effect has handed us an offscreen RenderTarget. Use activeCommandBuffer()
+    // when participating in paintScreen / drawWindow so the draw lands in the
+    // caller's render pass instead of the swapchain one. See the bug fixed
+    // for ZoomEffect+InvertEffect (silent: only the cursor survived because
+    // the inverted window quads went to the wrong cmd buffer).
+    Q_ASSERT_X(t_recursivePaintDepth == 0,
+               "ItemRendererVulkan::currentCommandBuffer",
+               "called inside a recursive paint flow; use activeCommandBuffer(renderTarget) instead");
+    return m_currentCommandBuffer;
+}
+
+VkCommandBuffer ItemRendererVulkan::activeCommandBuffer(const RenderTarget &renderTarget) const
+{
+    if (const auto *vt = renderTarget.vulkanTarget(); vt && vt->commandBuffer() != VK_NULL_HANDLE) {
+        return vt->commandBuffer();
+    }
+    return m_currentCommandBuffer;
+}
+
 ItemRendererVulkan::ItemRendererVulkan(VulkanBackend *backend)
     : m_backend(backend)
     , m_context(backend->vulkanContext())
@@ -1070,13 +1112,9 @@ void ItemRendererVulkan::renderNodes(const RenderContext &context, VkCommandBuff
 
 void ItemRendererVulkan::renderItem(const RenderTarget &renderTarget, const RenderViewport &viewport, Item *item, int mask, const QRegion &region, const WindowPaintData &data)
 {
-    // Get the command buffer to use - prefer the one from the renderTarget if available
-    VkCommandBuffer cmd = m_currentCommandBuffer;
-    const auto vulkanRenderTarget = renderTarget.vulkanTarget();
-    if (vulkanRenderTarget && vulkanRenderTarget->commandBuffer() != VK_NULL_HANDLE) {
-        cmd = vulkanRenderTarget->commandBuffer();
-    }
-
+    // Route to the renderTarget's command buffer when set (recursive offscreen
+    // flow), otherwise the swapchain one — see activeCommandBuffer() doc.
+    VkCommandBuffer cmd = activeCommandBuffer(renderTarget);
     if (cmd == VK_NULL_HANDLE) {
         qCWarning(KWIN_VULKAN) << "No active command buffer for rendering";
         return;
