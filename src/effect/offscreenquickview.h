@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include "config-kwin.h"
 #include "kwin_export.h"
 
 #include <QObject>
@@ -30,6 +31,9 @@ class QQuickWindow;
 namespace KWin
 {
 class GLTexture;
+#if HAVE_VULKAN
+class VulkanTexture;
+#endif
 
 class OffscreenQuickView;
 
@@ -118,6 +122,19 @@ public:
      * Returns the current output of the scene graph
      */
     QImage bufferAsImage() const;
+
+#if HAVE_VULKAN
+    /**
+     * Return the underlying VulkanTexture that Qt Quick renders into when the
+     * compositor uses the Vulkan backend. Returns nullptr otherwise (e.g. under
+     * an OpenGL compositor, before the first frame, or if Vulkan init failed).
+     *
+     * The image is left in VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL after each
+     * frame; consumers are responsible for issuing any pipeline barrier they need
+     * to express their read-after-write dependency on Qt's submission.
+     */
+    VulkanTexture *vulkanTexture() const;
+#endif
 
     /**
      * Inject any mouse event into the QQuickWindow.

@@ -14,6 +14,10 @@
 #include <memory>
 #include <vulkan/vulkan.h>
 
+QT_BEGIN_NAMESPACE
+class QVulkanInstance;
+QT_END_NAMESPACE
+
 namespace KWin
 {
 class Output;
@@ -133,6 +137,15 @@ public:
         return m_vkGetFenceFdKHR;
     }
 
+    /**
+     * @brief Return a QVulkanInstance wrapping the backend's VkInstance.
+     *
+     * Lazily constructed on first call so apps that never instantiate Qt Quick offscreen
+     * views do not pay for it. Ownership stays with the backend; the wrapper does not
+     * destroy the underlying VkInstance. Returns nullptr if creation fails.
+     */
+    QVulkanInstance *qVulkanInstance();
+
 protected:
     /**
      * @brief Sets the backend initialization to failed.
@@ -183,6 +196,9 @@ private:
     // External fence fd support
     bool m_supportsExternalFenceFd = false;
     PFN_vkGetFenceFdKHR m_vkGetFenceFdKHR = nullptr;
+
+    // QVulkanInstance wrapping m_instance; created lazily for native Qt Quick.
+    std::unique_ptr<QVulkanInstance> m_qVulkanInstance;
 };
 
 } // namespace KWin

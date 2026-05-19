@@ -1529,18 +1529,15 @@ void EffectsHandler::renderOffscreenQuickView(const RenderTarget &renderTarget, 
     }
 #if HAVE_VULKAN
     else if (compositingType() == VulkanCompositing) {
-        const QImage img = w->bufferAsImage();
-        if (img.isNull()) {
+        VulkanTexture *texture = w->vulkanTexture();
+        if (!texture || !texture->isValid()) {
+            // No Qt-native Vulkan image yet (e.g. before the first update(), or Vulkan
+            // init failed and the view fell back to the disabled path).
             return;
         }
 
         VulkanContext *ctx = VulkanContext::currentContext();
         if (!ctx) {
-            return;
-        }
-
-        auto texture = VulkanTexture::upload(ctx, img);
-        if (!texture || !texture->isValid()) {
             return;
         }
 
@@ -1552,6 +1549,28 @@ void EffectsHandler::renderOffscreenQuickView(const RenderTarget &renderTarget, 
         if (cmd == VK_NULL_HANDLE) {
             return;
         }
+
+        // Qt Quick has already submitted its render-pass to the shared graphics queue
+        // earlier on this thread, leaving the image in SHADER_READ_ONLY_OPTIMAL with
+        // COLOR_ATTACHMENT_WRITE pending. Queue submission ordering gives us execution
+        // dependency; we still need an explicit memory dependency before sampling.
+        VkImageMemoryBarrier qtReadBarrier{};
+        qtReadBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        qtReadBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        qtReadBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        qtReadBarrier.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        qtReadBarrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        qtReadBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        qtReadBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        qtReadBarrier.image = texture->image();
+        qtReadBarrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(cmd,
+                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             0,
+                             0, nullptr,
+                             0, nullptr,
+                             1, &qtReadBarrier);
 
         const QRectF rect = scaledRect(w->geometry(), viewport.scale());
         const QSize vpSize = viewport.renderRect().size().toSize();
@@ -1602,8 +1621,15 @@ void EffectsHandler::renderOffscreenQuickView(const RenderTarget &renderTarget, 
             return;
         }
 
-        // Fill all 4 texture slots with the overlay texture (shader uses slot 0 for MapTexture)
-        const VkDescriptorImageInfo imgInfo{texture->sampler(), texture->imageView(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        // Fill all 4 texture slots with the overlay texture (shader uses slot 0 for MapTexture).
+        // The OffscreenQuickView texture is mutable-format: the underlying image is UNORM
+        // (Qt wrote its sRGB-encoded values into it raw) and the alias view is SRGB, so
+        // sampling through it triggers HW sRGB→linear before the shader sees the value.
+        VkImageView sampleView = texture->aliasImageView();
+        if (sampleView == VK_NULL_HANDLE) {
+            sampleView = texture->imageView();
+        }
+        const VkDescriptorImageInfo imgInfo{texture->sampler(), sampleView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
         const std::array<VkDescriptorImageInfo, 4> imageInfos{imgInfo, imgInfo, imgInfo, imgInfo};
 
         VkDescriptorBufferInfo bufInfo{};

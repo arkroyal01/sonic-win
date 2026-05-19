@@ -90,6 +90,24 @@ public:
     static std::unique_ptr<VulkanTexture> createRenderTarget(VulkanContext *context, const QSize &size, VkFormat format);
 
     /**
+     * @brief Create a render target whose storage uses @p primaryFormat but is also
+     * reachable through a second image view in @p aliasFormat (format-compatible).
+     *
+     * Used by Qt Quick offscreen views: Qt writes sRGB-encoded color values into a UNORM
+     * image (so neither Qt's QRhi nor the hardware re-encodes them), while we sample
+     * through the SRGB alias view so the hardware decodes sRGB→linear before our shader
+     * sees them. Without this, the final swapchain sRGB encode double-encodes.
+     *
+     * Image flags include VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT with a format list
+     * containing both formats. imageView()/sampler() expose the primary view; the alias
+     * view is reachable via aliasImageView().
+     */
+    static std::unique_ptr<VulkanTexture> createMutableRenderTarget(VulkanContext *context,
+                                                                    const QSize &size,
+                                                                    VkFormat primaryFormat,
+                                                                    VkFormat aliasFormat);
+
+    /**
      * @brief Create a depth/stencil texture.
      */
     static std::unique_ptr<VulkanTexture> createDepthStencil(VulkanContext *context, const QSize &size);
@@ -122,6 +140,15 @@ public:
     VkImageView imageView() const
     {
         return m_imageView;
+    }
+
+    /**
+     * @brief Get the alias image view created by createMutableRenderTarget(), or
+     * VK_NULL_HANDLE for textures created via other factories.
+     */
+    VkImageView aliasImageView() const
+    {
+        return m_aliasImageView;
     }
 
     /**
@@ -277,7 +304,11 @@ private:
     VulkanTexture(VulkanContext *context);
 
     bool createImage(const QSize &size, VkFormat format, VkImageUsageFlags usage, VkImageTiling tiling);
+    bool createImageMutable(const QSize &size, VkFormat primaryFormat, VkFormat aliasFormat,
+                            VkImageUsageFlags usage, VkImageTiling tiling);
     bool createImageView(VkImageAspectFlags aspectFlags = VK_IMAGE_ASPECT_COLOR_BIT);
+    bool createAliasImageView(VkFormat aliasFormat,
+                              VkImageAspectFlags aspectFlags = VK_IMAGE_ASPECT_COLOR_BIT);
     bool createSampler();
     void updateSampler();
     void cleanup();
@@ -285,6 +316,7 @@ private:
     VulkanContext *m_context;
     VkImage m_image = VK_NULL_HANDLE;
     VkImageView m_imageView = VK_NULL_HANDLE;
+    VkImageView m_aliasImageView = VK_NULL_HANDLE; // Optional second view (format-compatible alias)
     VkSampler m_sampler = VK_NULL_HANDLE;
     VmaAllocation m_allocation = nullptr;
     VkDeviceMemory m_deviceMemory = VK_NULL_HANDLE; // For non-VMA memory (e.g., DMA-BUF imports)

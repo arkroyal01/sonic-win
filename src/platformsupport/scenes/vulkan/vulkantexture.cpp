@@ -34,6 +34,7 @@ VulkanTexture::VulkanTexture(VulkanTexture &&other) noexcept
     : m_context(other.m_context)
     , m_image(other.m_image)
     , m_imageView(other.m_imageView)
+    , m_aliasImageView(other.m_aliasImageView)
     , m_sampler(other.m_sampler)
     , m_allocation(other.m_allocation)
     , m_deviceMemory(other.m_deviceMemory)
@@ -47,6 +48,7 @@ VulkanTexture::VulkanTexture(VulkanTexture &&other) noexcept
 {
     other.m_image = VK_NULL_HANDLE;
     other.m_imageView = VK_NULL_HANDLE;
+    other.m_aliasImageView = VK_NULL_HANDLE;
     other.m_sampler = VK_NULL_HANDLE;
     other.m_allocation = nullptr;
     other.m_deviceMemory = VK_NULL_HANDLE;
@@ -60,6 +62,7 @@ VulkanTexture &VulkanTexture::operator=(VulkanTexture &&other) noexcept
         m_context = other.m_context;
         m_image = other.m_image;
         m_imageView = other.m_imageView;
+        m_aliasImageView = other.m_aliasImageView;
         m_sampler = other.m_sampler;
         m_allocation = other.m_allocation;
         m_deviceMemory = other.m_deviceMemory;
@@ -73,6 +76,7 @@ VulkanTexture &VulkanTexture::operator=(VulkanTexture &&other) noexcept
 
         other.m_image = VK_NULL_HANDLE;
         other.m_imageView = VK_NULL_HANDLE;
+        other.m_aliasImageView = VK_NULL_HANDLE;
         other.m_sampler = VK_NULL_HANDLE;
         other.m_allocation = nullptr;
         other.m_deviceMemory = VK_NULL_HANDLE;
@@ -97,6 +101,11 @@ void VulkanTexture::cleanup()
         // Use deferred destruction for image views that may still be in use
         m_context->queueImageViewForDestruction(m_imageView);
         m_imageView = VK_NULL_HANDLE;
+    }
+
+    if (m_aliasImageView != VK_NULL_HANDLE) {
+        m_context->queueImageViewForDestruction(m_aliasImageView);
+        m_aliasImageView = VK_NULL_HANDLE;
     }
 
     if (m_ownsImage && m_image != VK_NULL_HANDLE) {
@@ -151,6 +160,53 @@ bool VulkanTexture::createImage(const QSize &size, VkFormat format, VkImageUsage
     return true;
 }
 
+bool VulkanTexture::createImageMutable(const QSize &size, VkFormat primaryFormat, VkFormat aliasFormat,
+                                       VkImageUsageFlags usage, VkImageTiling tiling)
+{
+    // VkImageFormatListCreateInfo lets the driver know the set of view formats
+    // the image may be reinterpreted as. Without this list, some implementations
+    // refuse to create a view with a different (even format-compatible) format
+    // when MUTABLE_FORMAT_BIT is set. Core in Vulkan 1.2.
+    const VkFormat formatList[2] = {primaryFormat, aliasFormat};
+    VkImageFormatListCreateInfo formatListInfo{};
+    formatListInfo.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO;
+    formatListInfo.viewFormatCount = 2;
+    formatListInfo.pViewFormats = formatList;
+
+    VkImageCreateInfo imageInfo{};
+    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imageInfo.pNext = &formatListInfo;
+    imageInfo.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+    imageInfo.imageType = VK_IMAGE_TYPE_2D;
+    imageInfo.extent.width = static_cast<uint32_t>(size.width());
+    imageInfo.extent.height = static_cast<uint32_t>(size.height());
+    imageInfo.extent.depth = 1;
+    imageInfo.mipLevels = 1;
+    imageInfo.arrayLayers = 1;
+    imageInfo.format = primaryFormat;
+    imageInfo.tiling = tiling;
+    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    imageInfo.usage = usage;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VmaAllocationCreateInfo allocInfo{};
+    allocInfo.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+
+    VkResult result = vmaCreateImage(VulkanAllocator::allocator(), &imageInfo, &allocInfo,
+                                     &m_image, &m_allocation, nullptr);
+    if (result != VK_SUCCESS) {
+        qCWarning(KWIN_VULKAN) << "Failed to create mutable Vulkan image:" << result;
+        return false;
+    }
+
+    m_format = primaryFormat;
+    m_size = size;
+    m_currentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    m_ownsImage = true;
+    return true;
+}
+
 bool VulkanTexture::createImageView(VkImageAspectFlags aspectFlags)
 {
     VkImageViewCreateInfo viewInfo{};
@@ -178,6 +234,34 @@ bool VulkanTexture::createImageView(VkImageAspectFlags aspectFlags)
         return false;
     }
 
+    return true;
+}
+
+bool VulkanTexture::createAliasImageView(VkFormat aliasFormat, VkImageAspectFlags aspectFlags)
+{
+    VkImageViewCreateInfo viewInfo{};
+    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    viewInfo.image = m_image;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = aliasFormat;
+    viewInfo.subresourceRange.aspectMask = aspectFlags;
+    viewInfo.subresourceRange.baseMipLevel = 0;
+    viewInfo.subresourceRange.levelCount = 1;
+    viewInfo.subresourceRange.baseArrayLayer = 0;
+    viewInfo.subresourceRange.layerCount = 1;
+
+    if (aliasFormat == VK_FORMAT_B8G8R8A8_UNORM || aliasFormat == VK_FORMAT_B8G8R8A8_SRGB) {
+        viewInfo.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+        viewInfo.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+        viewInfo.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+        viewInfo.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+    }
+
+    VkResult result = vkCreateImageView(m_context->backend()->device(), &viewInfo, nullptr, &m_aliasImageView);
+    if (result != VK_SUCCESS) {
+        qCWarning(KWIN_VULKAN) << "Failed to create alias Vulkan image view:" << result;
+        return false;
+    }
     return true;
 }
 
@@ -402,6 +486,35 @@ std::unique_ptr<VulkanTexture> VulkanTexture::createRenderTarget(VulkanContext *
     }
 
     if (!texture->createImageView()) {
+        return nullptr;
+    }
+
+    if (!texture->createSampler()) {
+        return nullptr;
+    }
+
+    return texture;
+}
+
+std::unique_ptr<VulkanTexture> VulkanTexture::createMutableRenderTarget(VulkanContext *context,
+                                                                        const QSize &size,
+                                                                        VkFormat primaryFormat,
+                                                                        VkFormat aliasFormat)
+{
+    auto texture = std::unique_ptr<VulkanTexture>(new VulkanTexture(context));
+
+    if (!texture->createImageMutable(size, primaryFormat, aliasFormat,
+                                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
+                                         | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                     VK_IMAGE_TILING_OPTIMAL)) {
+        return nullptr;
+    }
+
+    if (!texture->createImageView()) {
+        return nullptr;
+    }
+
+    if (!texture->createAliasImageView(aliasFormat)) {
         return nullptr;
     }
 

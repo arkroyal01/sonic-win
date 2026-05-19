@@ -32,6 +32,14 @@
 #include <QTimer>
 #include <private/qeventpoint_p.h> // for QMutableEventPoint
 
+#if HAVE_VULKAN
+#include "platformsupport/scenes/vulkan/vulkanbackend.h"
+#include "platformsupport/scenes/vulkan/vulkancontext.h"
+#include "platformsupport/scenes/vulkan/vulkantexture.h"
+#include <QVulkanInstance>
+#include <vulkan/vulkan.h>
+#endif
+
 namespace KWin
 {
 
@@ -53,6 +61,17 @@ public:
     bool m_visible = true;
     bool m_hasAlphaChannel = true;
     bool m_automaticRepaint = true;
+
+#if HAVE_VULKAN
+    // Set when Qt Quick has been initialized with kwin's Vulkan device. In this mode
+    // Qt Quick renders directly into m_vkColorTexture and the renderer samples it
+    // without a CPU roundtrip.
+    VulkanBackend *m_vulkanBackend = nullptr;
+    std::unique_ptr<VulkanTexture> m_vkColorTexture;
+    // Layout the image is in when handed back to Qt for the next frame. Qt's RHI
+    // accepts UNDEFINED for the very first frame, then SHADER_READ_ONLY_OPTIMAL.
+    VkImageLayout m_vkLastLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+#endif
 
     std::optional<qreal> m_explicitDpr;
 
@@ -82,14 +101,31 @@ public:
 OffscreenQuickView::OffscreenQuickView(ExportMode exportMode, bool alpha)
     : d(new OffscreenQuickView::Private)
 {
-    // When the compositor uses Vulkan there is no global OpenGL share context,
-    // so Qt Quick would pick Vulkan as its scene graph backend.  Force OpenGL
-    // here (before the QQuickWindow is created) so that initialize() later
-    // creates an OpenGL QRhi compatible with our FBO-based render path.
-    if (!QOpenGLContext::globalShareContext()
+#if HAVE_VULKAN
+    const bool useVulkan = effects && effects->compositingType() == VulkanCompositing;
+#else
+    const bool useVulkan = false;
+#endif
+
+    // When the compositor uses OpenGL we force Qt Quick's scene graph onto the OpenGL
+    // backend (it would otherwise pick Vulkan if no global GL share context exists and
+    // crash inside QRhi with a null device). Under a Vulkan compositor we instead hand
+    // Qt Quick our VkDevice directly — see the Vulkan branch below.
+    if (!useVulkan
+        && !QOpenGLContext::globalShareContext()
         && QQuickWindow::sceneGraphBackend() != QLatin1String("opengl")) {
         QQuickWindow::setSceneGraphBackend(QStringLiteral("opengl"));
     }
+#if HAVE_VULKAN
+    // Qt's RHI scene-graph backend defaults to OpenGL on Linux and only honors
+    // setGraphicsDevice() if the requested graphics API matches. setGraphicsApi()
+    // is process-global and must be called before any QQuickWindow is created;
+    // doing it here means the very first OffscreenQuickView pins the API for the
+    // process. That matches kwin's single-backend lifetime.
+    if (useVulkan) {
+        QQuickWindow::setGraphicsApi(QSGRendererInterface::Vulkan);
+    }
+#endif
 
     d->m_renderControl = std::make_unique<QQuickRenderControl>();
 
@@ -103,13 +139,48 @@ OffscreenQuickView::OffscreenQuickView(ExportMode exportMode, bool alpha)
         d->m_useBlit = true;
     }
 
-    // Always try to create an OpenGL context for Qt Quick rendering.
-    // On X11, GLX is available independently of the compositor's backend,
-    // so a standalone GL context works even when kwin uses Vulkan.
-    // Checking graphicsApi() == OpenGL is not reliable here: under a Vulkan
-    // compositor Qt Quick reports Vulkan as its API, causing the old code to
-    // skip GL setup and call sync() with a null QRhi → SIGSEGV.
+#if HAVE_VULKAN
+    // Native Vulkan path: hand Qt Quick kwin's VkInstance/VkDevice so the scene graph
+    // renders directly into a VkImage we own. No FBO, no QImage roundtrip.
+    bool vulkanReady = false;
+    if (useVulkan) {
+        VulkanContext *ctx = VulkanContext::currentContext();
+        VulkanBackend *backend = ctx ? ctx->backend() : nullptr;
+        QVulkanInstance *qInst = backend ? backend->qVulkanInstance() : nullptr;
+        if (backend && qInst && backend->device() != VK_NULL_HANDLE) {
+            d->m_view->setVulkanInstance(qInst);
+            d->m_view->setGraphicsDevice(QQuickGraphicsDevice::fromDeviceObjects(
+                backend->physicalDevice(),
+                backend->device(),
+                int(backend->graphicsQueueFamily()),
+                /*queueIndex=*/0));
+            const bool initialized = d->m_renderControl->initialize();
+            const auto api = d->m_view->rendererInterface()->graphicsApi();
+            if (initialized && api == QSGRendererInterface::Vulkan) {
+                d->m_vulkanBackend = backend;
+                d->m_useBlit = false;
+                vulkanReady = true;
+            } else {
+                qCWarning(LIBKWINEFFECTS) << "Qt Quick failed to initialize with Vulkan (initialized="
+                                          << initialized << "api=" << api
+                                          << "), Qt Quick effects will be disabled";
+                d->m_useBlit = true;
+            }
+        } else {
+            qCWarning(LIBKWINEFFECTS) << "VulkanBackend/QVulkanInstance unavailable; Qt Quick effects disabled";
+            d->m_useBlit = true;
+        }
+    }
+    if (!vulkanReady) {
+#else
     {
+#endif
+        // Always try to create an OpenGL context for Qt Quick rendering.
+        // On X11, GLX is available independently of the compositor's backend,
+        // so a standalone GL context works even when kwin uses Vulkan.
+        // Checking graphicsApi() == OpenGL is not reliable here: under a Vulkan
+        // compositor Qt Quick reports Vulkan as its API, causing the old code to
+        // skip GL setup and call sync() with a null QRhi → SIGSEGV.
         QSurfaceFormat format;
         format.setOption(QSurfaceFormat::ResetNotification);
         format.setDepthBufferSize(16);
@@ -253,10 +324,15 @@ void OffscreenQuickView::update()
     }
 
     bool usingGl = d->m_glcontext != nullptr;
+#if HAVE_VULKAN
+    bool usingVulkan = d->m_vulkanBackend != nullptr;
+#else
+    constexpr bool usingVulkan = false;
+#endif
     OpenGlContext *previousContext = OpenGlContext::currentContext();
 
-    if (!usingGl) {
-        // No GL context. Only the software backend can render without one;
+    if (!usingGl && !usingVulkan) {
+        // No hardware context. Only the software backend can render without one;
         // any hardware backend (Vulkan, RHI) requires initialize() to have
         // been called, which we skip when there is no GL context. Guard here
         // so that sync() never reaches QSGBatchRenderer with a null QRhi.
@@ -298,13 +374,54 @@ void OffscreenQuickView::update()
         d->m_view->setRenderTarget(renderTarget);
     }
 
+#if HAVE_VULKAN
+    if (usingVulkan) {
+        qreal dpr = d->m_view->screen() ? d->m_view->screen()->devicePixelRatio() : 1.0;
+        if (d->m_explicitDpr.has_value()) {
+            dpr = d->m_explicitDpr.value();
+        }
+
+        const QSize nativeSize = d->m_view->size() * dpr;
+        if (!d->m_vkColorTexture || d->m_vkColorTexture->size() != nativeSize) {
+            VulkanContext *ctx = VulkanContext::currentContext();
+            if (!ctx) {
+                return;
+            }
+            // Mutable-format storage: Qt writes its sRGB-encoded color values into a
+            // UNORM image (so neither Qt's QRhi nor the hardware re-encodes them);
+            // our renderer samples through the SRGB alias view so the hardware does
+            // sRGB→linear on read, and the swapchain SRGB attachment encodes once
+            // on write. The X11 surface texture uses the same trick (sample via SRGB
+            // view) for the same reason.
+            d->m_vkColorTexture = VulkanTexture::createMutableRenderTarget(
+                ctx, nativeSize,
+                VK_FORMAT_R8G8B8A8_UNORM,
+                VK_FORMAT_R8G8B8A8_SRGB);
+            if (!d->m_vkColorTexture || !d->m_vkColorTexture->isValid()) {
+                d->m_vkColorTexture.reset();
+                return;
+            }
+            // Newly allocated image: Qt expects UNDEFINED for the first frame.
+            d->m_vkLastLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        }
+
+        QQuickRenderTarget renderTarget = QQuickRenderTarget::fromVulkanImage(
+            d->m_vkColorTexture->image(),
+            d->m_vkLastLayout,
+            VK_FORMAT_R8G8B8A8_UNORM,
+            d->m_vkColorTexture->size());
+        renderTarget.setDevicePixelRatio(dpr);
+        d->m_view->setRenderTarget(renderTarget);
+    }
+#endif
+
     d->m_renderControl->polishItems();
-    if (usingGl) {
+    if (usingGl || usingVulkan) {
         d->m_renderControl->beginFrame();
     }
     d->m_renderControl->sync();
     d->m_renderControl->render();
-    if (usingGl) {
+    if (usingGl || usingVulkan) {
         d->m_renderControl->endFrame();
     }
 
@@ -312,11 +429,25 @@ void OffscreenQuickView::update()
         QQuickOpenGLUtils::resetOpenGLState();
     }
 
+#if HAVE_VULKAN
+    if (usingVulkan) {
+        // Qt's RHI emits a barrier to SHADER_READ_ONLY_OPTIMAL at end-of-frame when
+        // the render target is also a sampled texture (which createRenderTarget()
+        // configured above). Track that so the next frame and downstream samplers
+        // both know the current layout.
+        d->m_vkLastLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        d->m_vkColorTexture->setCurrentLayout(d->m_vkLastLayout);
+    }
+#endif
+
     if (d->m_useBlit) {
         if (usingGl) {
             d->m_image = d->m_fbo->toImage();
             d->m_image.setDevicePixelRatio(d->m_view->effectiveDevicePixelRatio());
         } else {
+            // grabWindow() works for any RHI backend Qt drives, including Vulkan,
+            // by triggering an internal readback. Costs a GPU→CPU sync; only paid
+            // when a caller explicitly asked for the image export path.
             d->m_image = d->m_view->grabWindow();
         }
     }
@@ -537,6 +668,13 @@ QImage OffscreenQuickView::bufferAsImage() const
 {
     return d->m_image;
 }
+
+#if HAVE_VULKAN
+VulkanTexture *OffscreenQuickView::vulkanTexture() const
+{
+    return d->m_vkColorTexture.get();
+}
+#endif
 
 QSize OffscreenQuickView::size() const
 {

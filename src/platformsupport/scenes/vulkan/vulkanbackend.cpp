@@ -14,6 +14,7 @@
 #include "vulkantexture.h"
 
 #include <QDebug>
+#include <QVulkanInstance>
 #include <cstring>
 #include <vector>
 
@@ -365,8 +366,34 @@ bool VulkanBackend::createDevice(const QList<const char *> &requiredDeviceExtens
     return true;
 }
 
+QVulkanInstance *VulkanBackend::qVulkanInstance()
+{
+    if (m_qVulkanInstance) {
+        return m_qVulkanInstance.get();
+    }
+    if (m_instance == VK_NULL_HANDLE) {
+        return nullptr;
+    }
+    auto wrapper = std::make_unique<QVulkanInstance>();
+    wrapper->setVkInstance(m_instance);
+    // Match the API version requested in createInstance(); Qt uses this to gate which
+    // device-level features its QRhi can rely on.
+    wrapper->setApiVersion(QVersionNumber(1, 2));
+    if (!wrapper->create()) {
+        qCWarning(KWIN_VULKAN) << "QVulkanInstance::create() failed (errorCode="
+                               << wrapper->errorCode() << ")";
+        return nullptr;
+    }
+    m_qVulkanInstance = std::move(wrapper);
+    return m_qVulkanInstance.get();
+}
+
 void VulkanBackend::cleanup()
 {
+    // Drop the Qt wrapper before the VkInstance it references. setVkInstance() means
+    // the wrapper does not own the handle, so this only tears down Qt-side state.
+    m_qVulkanInstance.reset();
+
     if (m_device != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(m_device);
         vkDestroyDevice(m_device, nullptr);
