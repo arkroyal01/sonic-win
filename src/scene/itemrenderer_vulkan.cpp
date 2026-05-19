@@ -186,6 +186,68 @@ void ItemRendererVulkan::beginFrame(const RenderTarget &renderTarget, const Rend
     vkCmdSetScissor(m_currentCommandBuffer, 0, 1, &scissor);
 }
 
+void ItemRendererVulkan::registerPostPassCopy(VkImage srcImage, VkImageLayout srcLayoutAtPassEnd,
+                                              VkFormat srcFormat, const VkOffset3D &offset,
+                                              const VkExtent3D &extent, PostPassCopyCallback callback)
+{
+    if (srcImage == VK_NULL_HANDLE || extent.width == 0 || extent.height == 0) {
+        if (callback) {
+            callback(QImage());
+        }
+        return;
+    }
+    PostPassCopyRequest req;
+    req.srcImage = srcImage;
+    req.srcLayoutAtPassEnd = srcLayoutAtPassEnd;
+    req.srcFormat = srcFormat;
+    req.offset = offset;
+    req.extent = extent;
+    req.callback = std::move(callback);
+    m_pendingPostPassCopies.push_back(std::move(req));
+}
+
+static QImage::Format vulkanFormatToQImageFormat(VkFormat fmt)
+{
+    switch (fmt) {
+    case VK_FORMAT_B8G8R8A8_UNORM:
+    case VK_FORMAT_B8G8R8A8_SRGB:
+        return QImage::Format_ARGB32_Premultiplied;
+    case VK_FORMAT_R8G8B8A8_UNORM:
+    case VK_FORMAT_R8G8B8A8_SRGB:
+        return QImage::Format_RGBA8888_Premultiplied;
+    default:
+        return QImage::Format_Invalid;
+    }
+}
+
+// Caller must guarantee the GPU has finished executing the post-pass copies
+// (typically via vkWaitForFences on the submission's fence) before invoking this.
+static void drainPostPassCopies(auto &requests)
+{
+    for (auto &req : requests) {
+        if (!req.callback) {
+            continue;
+        }
+        QImage img;
+        if (req.staging) {
+            const QImage::Format qfmt = vulkanFormatToQImageFormat(req.srcFormat);
+            if (qfmt == QImage::Format_Invalid) {
+                qCWarning(KWIN_CORE) << "post-pass copy: unsupported format" << req.srcFormat;
+            } else {
+                const void *mapped = req.staging->map();
+                if (mapped) {
+                    QImage tmp(int(req.extent.width), int(req.extent.height), qfmt);
+                    std::memcpy(tmp.bits(), mapped, VkDeviceSize(req.extent.width) * req.extent.height * 4);
+                    req.staging->unmap();
+                    img = tmp;
+                }
+            }
+        }
+        req.callback(img);
+    }
+    requests.clear();
+}
+
 void ItemRendererVulkan::endFrame()
 {
     if (m_currentCommandBuffer == VK_NULL_HANDLE) {
@@ -196,6 +258,59 @@ void ItemRendererVulkan::endFrame()
     // End render pass if we were rendering to a framebuffer
     if (m_currentFramebuffer) {
         m_currentFramebuffer->endRenderPass(m_currentCommandBuffer);
+    }
+
+    // Record post-pass copies into the main command buffer. Allocates staging buffers,
+    // transitions each source image into TRANSFER_SRC_OPTIMAL, copies, transitions back.
+    // The actual readback happens after the queue submit completes (drainPostPassCopies).
+    if (!m_pendingPostPassCopies.empty()) {
+        for (auto &req : m_pendingPostPassCopies) {
+            const VkDeviceSize size = VkDeviceSize(req.extent.width) * req.extent.height * 4;
+            req.staging = VulkanBuffer::createStagingBuffer(m_context, size);
+            if (!req.staging) {
+                qCWarning(KWIN_CORE) << "post-pass copy: staging buffer alloc failed";
+                continue;
+            }
+
+            VkImageMemoryBarrier toTransfer{};
+            toTransfer.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            toTransfer.oldLayout = req.srcLayoutAtPassEnd;
+            toTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            toTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            toTransfer.image = req.srcImage;
+            toTransfer.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            toTransfer.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            vkCmdPipelineBarrier(m_currentCommandBuffer,
+                                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 0, 0, nullptr, 0, nullptr, 1, &toTransfer);
+
+            VkBufferImageCopy copy{};
+            copy.bufferOffset = 0;
+            copy.bufferRowLength = 0;
+            copy.bufferImageHeight = 0;
+            copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            copy.imageOffset = req.offset;
+            copy.imageExtent = req.extent;
+            vkCmdCopyImageToBuffer(m_currentCommandBuffer, req.srcImage,
+                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                   req.staging->buffer(), 1, &copy);
+
+            VkImageMemoryBarrier toRestore = toTransfer;
+            toRestore.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            toRestore.newLayout = req.srcLayoutAtPassEnd;
+            toRestore.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            // Swapchain images expect to be ready for present; offscreen targets
+            // for shader read. Either way COLOR_ATTACHMENT_OUTPUT is a safe stage
+            // since we're about to hand off to present or to the next frame.
+            toRestore.dstAccessMask = 0;
+            vkCmdPipelineBarrier(m_currentCommandBuffer,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                 0, 0, nullptr, 0, nullptr, 1, &toRestore);
+        }
     }
 
     // End command buffer recording
@@ -260,6 +375,13 @@ void ItemRendererVulkan::endFrame()
         // - Present waits on renderFinishedSemaphore (signaled by this submit)
         // - The inFlightFence will be waited on at the START of the NEXT frame
 
+        // …except when post-pass copies are pending: block once so the staging
+        // buffers are safe to read on the CPU before firing their callbacks.
+        if (!m_pendingPostPassCopies.empty()) {
+            vkWaitForFences(m_backend->device(), 1, &fence, VK_TRUE, UINT64_MAX);
+            drainPostPassCopies(m_pendingPostPassCopies);
+        }
+
         // Handle release points for external sync (e.g., DMA-BUF clients)
         if (!m_releasePoints.empty() && m_context->supportsExternalFenceFd()) {
             // Export fence to sync fd for release points
@@ -321,6 +443,9 @@ void ItemRendererVulkan::endFrame()
                     m_releasePoints.clear();
                     // Wait for the fence so the command buffer is safe to free immediately.
                     vkWaitForFences(m_backend->device(), 1, &exportableFence, VK_TRUE, UINT64_MAX);
+                    if (!m_pendingPostPassCopies.empty()) {
+                        drainPostPassCopies(m_pendingPostPassCopies);
+                    }
                     vkDestroyFence(m_backend->device(), exportableFence, nullptr);
                     m_context->freeCommandBuffer(m_currentCommandBuffer);
                     m_currentCommandBuffer = VK_NULL_HANDLE;
@@ -353,6 +478,12 @@ void ItemRendererVulkan::endFrame()
         // leaking via m_prevCommandBuffer (the fallback path has no guarantee that
         // doBeginFrame will wait for this specific fence next frame).
         vkWaitForFences(m_backend->device(), 1, &fence, VK_TRUE, UINT64_MAX);
+
+        // GPU is idle for this submission; safe to read back any post-pass copies.
+        if (!m_pendingPostPassCopies.empty()) {
+            drainPostPassCopies(m_pendingPostPassCopies);
+        }
+
         m_context->freeCommandBuffer(m_currentCommandBuffer);
         m_currentCommandBuffer = VK_NULL_HANDLE;
 

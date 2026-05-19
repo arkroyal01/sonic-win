@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include "config-kwin.h"
 #include "effect/effect.h"
 
 #include <QFuture>
@@ -93,6 +94,13 @@ private:
 
     void grabPointerImage(QImage &snapshot, int xOffset, int yOffset) const;
     QImage blitScreenshot(const RenderTarget &renderTarget, const RenderViewport &viewport, const QRect &geometry, qreal devicePixelRatio = 1.0) const;
+
+#if HAVE_VULKAN
+    bool scheduleVulkanScreenshot(const RenderTarget &renderTarget, const RenderViewport &viewport,
+                                  const QRect &captureRect, qreal devicePixelRatio,
+                                  ScreenShotFlags flags, const QPoint &cursorOriginInGlobal,
+                                  QPromise<QImage> promise);
+#endif
 
     std::vector<ScreenShotWindowData> m_windowScreenShots;
     std::vector<ScreenShotAreaData> m_areaScreenShots;

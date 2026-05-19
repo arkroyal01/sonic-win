@@ -19,8 +19,10 @@
 #include "scene/surfaceitem.h"
 #include "scene/windowitem.h"
 
+#include <QImage>
 #include <QMatrix4x4>
 #include <QStack>
+#include <functional>
 #include <unordered_set>
 #include <vulkan/vulkan.h>
 
@@ -157,6 +159,26 @@ public:
         m_externalWaitStages.push_back(stage);
     }
 
+    /**
+     * Capture a region of an image after the current frame's render pass ends.
+     *
+     * The renderer records vkCmdCopyImageToBuffer into the main command buffer
+     * (between endRenderPass and queue submit), waits for the submit to complete,
+     * then maps the staging buffer and invokes @p callback with the resulting QImage.
+     *
+     * Intended for effects that need a snapshot of the rendered output (the screenshot
+     * effect, eventually screen recording / color picker / etc.). Reading from the
+     * color attachment is illegal mid-render-pass, so requests are deferred to here.
+     *
+     * @p srcLayoutAtPassEnd is what layout the image is in immediately after the
+     * render pass's final-layout transition (typically PRESENT_SRC_KHR for swapchain
+     * images). The renderer transitions to TRANSFER_SRC_OPTIMAL, copies, then back.
+     */
+    using PostPassCopyCallback = std::function<void(const QImage &)>;
+    void registerPostPassCopy(VkImage srcImage, VkImageLayout srcLayoutAtPassEnd,
+                              VkFormat srcFormat, const VkOffset3D &offset,
+                              const VkExtent3D &extent, PostPassCopyCallback callback);
+
 private:
     QVector4D modulate(float opacity, float brightness) const;
     void createRenderNode(Item *item, RenderContext *context);
@@ -194,6 +216,19 @@ private:
     // External wait semaphores attached by effects this frame (cleared in endFrame).
     std::vector<VkSemaphore> m_externalWaitSemaphores;
     std::vector<VkPipelineStageFlags> m_externalWaitStages;
+
+    // Post-render-pass image captures requested this frame (drained in endFrame).
+    struct PostPassCopyRequest
+    {
+        VkImage srcImage = VK_NULL_HANDLE;
+        VkImageLayout srcLayoutAtPassEnd = VK_IMAGE_LAYOUT_UNDEFINED;
+        VkFormat srcFormat = VK_FORMAT_UNDEFINED;
+        VkOffset3D offset{};
+        VkExtent3D extent{};
+        std::unique_ptr<VulkanBuffer> staging;
+        PostPassCopyCallback callback;
+    };
+    std::vector<PostPassCopyRequest> m_pendingPostPassCopies;
 };
 
 } // namespace KWin

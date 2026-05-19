@@ -362,8 +362,84 @@ void ScreenShotEffect::takeScreenShot(ScreenShotWindowData *screenshot)
     }
 }
 
+#if HAVE_VULKAN
+// Schedule a post-render-pass capture of @p captureRect (in logical coords) and
+// finish @p promise asynchronously once the staging readback completes. Returns
+// false on setup failure (caller may fall through to an empty result).
+//
+// We can't sample the rendered framebuffer from inside paintScreen because
+// Vulkan disallows reading from a color attachment while its render pass is
+// active. ItemRendererVulkan::registerPostPassCopy queues the copy to be
+// recorded right after vkCmdEndRenderPass, then drains the result after the
+// submission fence signals.
+bool ScreenShotEffect::scheduleVulkanScreenshot(const RenderTarget &renderTarget, const RenderViewport &viewport,
+                                                const QRect &captureRect, qreal devicePixelRatio,
+                                                ScreenShotFlags flags, const QPoint &cursorOriginInGlobal,
+                                                QPromise<QImage> promise)
+{
+    const auto *vkRT = renderTarget.vulkanTarget();
+    if (!vkRT || !vkRT->framebuffer() || !vkRT->framebuffer()->renderPass()) {
+        promise.finish();
+        return false;
+    }
+    VulkanFramebuffer *fb = vkRT->framebuffer();
+    VkImage srcImage = fb->colorImage();
+    if (srcImage == VK_NULL_HANDLE && fb->colorTexture()) {
+        srcImage = fb->colorTexture()->image();
+    }
+    if (srcImage == VK_NULL_HANDLE) {
+        promise.finish();
+        return false;
+    }
+
+    auto *vkScene = dynamic_cast<WorkspaceSceneVulkan *>(Compositor::self()->scene());
+    auto *vkRenderer = vkScene ? static_cast<ItemRendererVulkan *>(vkScene->renderer()) : nullptr;
+    if (!vkRenderer) {
+        promise.finish();
+        return false;
+    }
+
+    const QRect fbRect = viewport.mapToRenderTarget(captureRect).intersected(QRect(QPoint(0, 0), fb->size()));
+    if (fbRect.isEmpty()) {
+        promise.finish();
+        return false;
+    }
+
+    const VkFormat fmt = vkRenderer->backend()->colorFormat();
+    const VkImageLayout finalLayout = fb->renderPass()->config().finalLayout;
+
+    // std::function requires copy-constructible callables; QPromise is move-only,
+    // so wrap it in a shared_ptr to make the lambda copyable.
+    auto sharedPromise = std::make_shared<QPromise<QImage>>(std::move(promise));
+    vkRenderer->registerPostPassCopy(srcImage, finalLayout, fmt,
+                                     VkOffset3D{fbRect.x(), fbRect.y(), 0},
+                                     VkExtent3D{uint32_t(fbRect.width()), uint32_t(fbRect.height()), 1},
+                                     [sharedPromise, flags, cursorOriginInGlobal, devicePixelRatio, this](const QImage &img) {
+        if (img.isNull()) {
+            sharedPromise->finish();
+            return;
+        }
+        QImage out = img.copy();
+        out.setDevicePixelRatio(devicePixelRatio);
+        if (flags & ScreenShotIncludeCursor) {
+            grabPointerImage(out, cursorOriginInGlobal.x(), cursorOriginInGlobal.y());
+        }
+        sharedPromise->addResult(out);
+        sharedPromise->finish();
+    });
+    return true;
+}
+#endif
+
 bool ScreenShotEffect::takeScreenShot(const RenderTarget &renderTarget, const RenderViewport &viewport, ScreenShotAreaData *screenshot)
 {
+#if HAVE_VULKAN
+    if (effects->isVulkanCompositing()) {
+        return scheduleVulkanScreenshot(renderTarget, viewport, screenshot->area, 1.0,
+                                        screenshot->flags, screenshot->area.topLeft(),
+                                        std::move(screenshot->promise));
+    }
+#endif
     // On X11, all screens are painted simultaneously and there is no native HiDPI support.
     QImage snapshot = blitScreenshot(renderTarget, viewport, screenshot->area);
     if (screenshot->flags & ScreenShotIncludeCursor) {
@@ -381,6 +457,15 @@ bool ScreenShotEffect::takeScreenShot(const RenderTarget &renderTarget, const Re
     if (screenshot->flags & ScreenShotNativeResolution) {
         devicePixelRatio = screenshot->screen->scale();
     }
+
+#if HAVE_VULKAN
+    if (effects->isVulkanCompositing()) {
+        return scheduleVulkanScreenshot(renderTarget, viewport, screenshot->screen->geometry(),
+                                        devicePixelRatio, screenshot->flags,
+                                        screenshot->screen->geometry().topLeft(),
+                                        std::move(screenshot->promise));
+    }
+#endif
 
     QImage snapshot = blitScreenshot(renderTarget, viewport, screenshot->screen->geometry(), devicePixelRatio);
     if (screenshot->flags & ScreenShotIncludeCursor) {
