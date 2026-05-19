@@ -105,6 +105,7 @@ static QString getVulkanResultString(VkResult result)
     }
 }
 
+#ifndef NDEBUG
 static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
     VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity,
     VkDebugUtilsMessageTypeFlagsEXT messageType,
@@ -144,6 +145,7 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
     }
     return VK_FALSE;
 }
+#endif
 
 VulkanBackend::VulkanBackend()
     : RenderBackend()
