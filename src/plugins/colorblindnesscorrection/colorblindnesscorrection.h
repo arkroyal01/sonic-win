@@ -15,6 +15,10 @@
 #include <QImage>
 #include <QPoint>
 
+#if HAVE_VULKAN
+#include <vulkan/vulkan.h>
+#endif
+
 namespace KWin
 {
 
@@ -63,6 +67,14 @@ private:
     void rebuildCursorImage();
 #if HAVE_VULKAN
     void paintVulkanCursor(const RenderTarget &, const RenderViewport &);
+    // Registers/unregisters the fullscreen color-correction post-pass with the
+    // Vulkan renderer. Whole-screen always, so it can wrap overview and other
+    // QuickSceneEffect overlays which terminate the effect chain.
+    void updateVulkanPostPass();
+    // Fullscreen post-pass callback: applies the colorblindness correction (or
+    // greyscale) to the captured scene and draws the corrected cursor on top.
+    void colorBlindnessVulkanPostPass(VkCommandBuffer cmd, VulkanTexture *sceneCapture,
+                                      const RenderTarget &, const RenderViewport &);
 #endif
 
     Mode m_mode = Protanopia;
@@ -81,6 +93,8 @@ private:
     VulkanPipeline *m_vkCursorPipeline = nullptr;
     float m_defectMatrix[12] = {};
     std::unique_ptr<VulkanTexture> m_vkCursorTexture;
+    // Fullscreen color-correction post-pass registration id (0 = not registered).
+    int m_vkPostPassId = 0;
 #endif
 };
 

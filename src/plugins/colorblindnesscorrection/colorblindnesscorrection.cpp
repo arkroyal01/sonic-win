@@ -65,6 +65,11 @@ ColorBlindnessCorrectionEffect::ColorBlindnessCorrectionEffect()
 
     loadData();
 
+#if HAVE_VULKAN
+    // Whole-screen correction via the fullscreen post-pass under Vulkan.
+    updateVulkanPostPass();
+#endif
+
     effects->hideCursor();
     connect(Cursors::self()->mouse(), &Cursor::cursorChanged, this, [this]() {
         m_cursorDirty = true;
@@ -81,6 +86,18 @@ ColorBlindnessCorrectionEffect::ColorBlindnessCorrectionEffect()
 ColorBlindnessCorrectionEffect::~ColorBlindnessCorrectionEffect()
 {
     effects->showCursor();
+#if HAVE_VULKAN
+    if (m_vkPostPassId != 0) {
+        // Guard scene()/renderer() — destruction order during compositor teardown
+        // is not guaranteed.
+        if (auto *scene = effects->scene()) {
+            if (auto *vkRenderer = dynamic_cast<ItemRendererVulkan *>(scene->renderer())) {
+                vkRenderer->unregisterFullscreenPostPass(m_vkPostPassId);
+            }
+        }
+        m_vkPostPassId = 0;
+    }
+#endif
 }
 
 bool ColorBlindnessCorrectionEffect::supported()
@@ -191,6 +208,17 @@ void ColorBlindnessCorrectionEffect::correctColor(KWin::EffectWindow *w)
     if (m_windows.contains(w)) {
         return;
     }
+
+#if HAVE_VULKAN
+    // Under Vulkan the correction runs as a fullscreen post-pass (see
+    // updateVulkanPostPass), so it can wrap overview and other QuickSceneEffect
+    // overlays. No per-window redirect needed; m_windows is still tracked so
+    // isActive() stays correct.
+    if (effects->isVulkanCompositing()) {
+        m_windows.insert(w);
+        return;
+    }
+#endif
 
     redirect(w);
 
@@ -467,6 +495,161 @@ void ColorBlindnessCorrectionEffect::paintVulkanCursor(const RenderTarget &rende
     vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &vbOffset);
     vkCmdDraw(cmd, 6, 1, 0, 0);
 }
+
+void ColorBlindnessCorrectionEffect::updateVulkanPostPass()
+{
+    if (!effects->isVulkanCompositing()) {
+        return;
+    }
+    auto *scene = effects->scene();
+    auto *vkRenderer = scene ? dynamic_cast<ItemRendererVulkan *>(scene->renderer()) : nullptr;
+    if (!vkRenderer) {
+        return;
+    }
+    // Color correction is always whole-screen — register once and leave it.
+    // The callback reads m_mode / m_defectMatrix / m_intensity live, so a
+    // reconfigure() needs no re-registration.
+    if (m_vkPostPassId == 0) {
+        m_vkPostPassId = vkRenderer->registerFullscreenPostPass(
+            [this](VkCommandBuffer cmd, VulkanTexture *sceneCapture,
+                   const RenderTarget &renderTarget, const RenderViewport &viewport) {
+            colorBlindnessVulkanPostPass(cmd, sceneCapture, renderTarget, viewport);
+        });
+    }
+}
+
+void ColorBlindnessCorrectionEffect::colorBlindnessVulkanPostPass(VkCommandBuffer cmd, VulkanTexture *sceneCapture,
+                                                                  const RenderTarget &renderTarget,
+                                                                  const RenderViewport &viewport)
+{
+    auto *ctx = VulkanContext::currentContext();
+    if (!ctx || !sceneCapture || cmd == VK_NULL_HANDLE) {
+        return;
+    }
+
+    // Greyscale desaturates via AdjustSaturation; the defect modes use
+    // ColorBlindnessCorrect. Unlike the per-window path we do NOT add
+    // TransformColorspace: the scene capture is already in the final display
+    // color space, so a source(sRGB)->dest transform here would round-trip
+    // through the transfer functions and brighten the output. Pipelines built
+    // against the presentation render pass are render-pass-compatible with the
+    // post-FX pass.
+    const bool greyscale = (m_mode == Greyscale);
+    VulkanPipeline *pipeline = greyscale
+        ? ctx->pipelineManager()->pipeline(VulkanShaderTrait::MapTexture | VulkanShaderTrait::Modulate
+                                           | VulkanShaderTrait::AdjustSaturation)
+        : ctx->pipelineManager()->pipeline(VulkanShaderTrait::MapTexture | VulkanShaderTrait::Modulate
+                                           | VulkanShaderTrait::ColorBlindnessCorrect);
+    if (!pipeline || !pipeline->isValid()) {
+        return;
+    }
+
+    // Fullscreen quad in device pixels (matches the scene's negative-height
+    // viewport and 1:1 scene-capture blit — see zoom.cpp / ItemRendererVulkan).
+    const QSize fbSize = renderTarget.size();
+    if (fbSize.isEmpty()) {
+        return;
+    }
+    const float w = float(fbSize.width());
+    const float h = float(fbSize.height());
+    const VulkanVertex2D verts[6] = {
+        {{0.0f, 0.0f}, {0.0f, 0.0f}},
+        {{w, 0.0f}, {1.0f, 0.0f}},
+        {{0.0f, h}, {0.0f, 1.0f}},
+        {{w, 0.0f}, {1.0f, 0.0f}},
+        {{w, h}, {1.0f, 1.0f}},
+        {{0.0f, h}, {0.0f, 1.0f}},
+    };
+    auto vertBuf = VulkanBuffer::createStreamingBuffer(ctx, sizeof(verts));
+    if (!vertBuf) {
+        return;
+    }
+    vertBuf->upload(verts, sizeof(verts));
+
+    VulkanPushConstants pc{};
+    memcpy(pc.mvp, viewport.projectionMatrix().constData(), sizeof(pc.mvp));
+    pc.textureMatrix[0] = pc.textureMatrix[5] = pc.textureMatrix[10] = pc.textureMatrix[15] = 1.0f;
+
+    VulkanUniforms uniforms{};
+    uniforms.opacity = 1.0f;
+    uniforms.brightness = 1.0f;
+    uniforms.saturation = greyscale ? 0.0f : 1.0f;
+    if (greyscale) {
+        // adjustSaturation() computes the greyscale luma as dot(rgb, primaryBrightness).
+        // The capture is sampled in linear space, so use the destination
+        // colorimetry's linear-RGB->Y weights (toXYZ row 1).
+        const auto toXYZ = renderTarget.colorDescription().containerColorimetry().toXYZ();
+        uniforms.primaryBrightness[0] = toXYZ(1, 0);
+        uniforms.primaryBrightness[1] = toXYZ(1, 1);
+        uniforms.primaryBrightness[2] = toXYZ(1, 2);
+    } else {
+        // m_defectMatrix is already packed std140 column-major (see loadData).
+        memcpy(uniforms.cbDefectMatrix, m_defectMatrix, sizeof(uniforms.cbDefectMatrix));
+        uniforms.cbIntensity = m_intensity;
+    }
+
+    auto uboBuf = VulkanBuffer::createUniformBuffer(ctx, sizeof(VulkanUniforms));
+    if (!uboBuf) {
+        return;
+    }
+    uboBuf->upload(&uniforms, sizeof(uniforms));
+
+    VkDescriptorSet ds = ctx->allocateDescriptorSet(pipeline->descriptorSetLayout());
+    if (ds == VK_NULL_HANDLE) {
+        return;
+    }
+
+    const VkDescriptorImageInfo imgInfo{sceneCapture->sampler(), sceneCapture->imageView(),
+                                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    const std::array<VkDescriptorImageInfo, 4> imageInfos{imgInfo, imgInfo, imgInfo, imgInfo};
+    VkDescriptorBufferInfo bufInfo{uboBuf->buffer(), 0, sizeof(VulkanUniforms)};
+
+    std::array<VkWriteDescriptorSet, 2> writes{};
+    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[0].dstSet = ds;
+    writes[0].dstBinding = 0;
+    writes[0].descriptorCount = 4;
+    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[0].pImageInfo = imageInfos.data();
+    writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[1].dstSet = ds;
+    writes[1].dstBinding = 1;
+    writes[1].descriptorCount = 1;
+    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    writes[1].pBufferInfo = &bufInfo;
+    vkUpdateDescriptorSets(ctx->backend()->device(), 2, writes.data(), 0, nullptr);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->pipeline());
+    vkCmdPushConstants(cmd, pipeline->layout(),
+                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                       0, sizeof(VulkanPushConstants), &pc);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            pipeline->layout(), 0, 1, &ds, 0, nullptr);
+    const VkBuffer vb = vertBuf->buffer();
+    const VkDeviceSize vbOffset = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &vbOffset);
+    vkCmdDraw(cmd, 6, 1, 0, 0);
+
+    // Draw the corrected software cursor on top — but only for the real swapchain
+    // frame. Offscreen captures (the screenshot effect's per-window render) carry
+    // a command-buffer override on their RenderTarget and handle the cursor
+    // separately, so the cursor must not be baked into their content.
+    const auto *vt = renderTarget.vulkanTarget();
+    const bool mainFrame = !vt || vt->commandBuffer() == VK_NULL_HANDLE;
+    // When fullscreen zoom is active it draws its own (magnified) cursor into the
+    // scene, which this post-pass then corrects along with everything else.
+    // Drawing our cursor here too would double it up.
+    Effect *zoom = effects->findEffect(QStringLiteral("zoom"));
+    const bool zoomActive = zoom && zoom->isActive();
+    if (mainFrame && !zoomActive) {
+        if (m_cursorDirty) {
+            rebuildCursorImage();
+        }
+        if (!m_cursorImage.isNull()) {
+            paintVulkanCursor(renderTarget, viewport);
+        }
+    }
+}
 #endif
 
 void ColorBlindnessCorrectionEffect::paintScreen(const RenderTarget &renderTarget, const RenderViewport &viewport, int mask, const QRegion &region, Output *screen)
@@ -482,7 +665,9 @@ void ColorBlindnessCorrectionEffect::paintScreen(const RenderTarget &renderTarge
 
 #if HAVE_VULKAN
     if (effects->isVulkanCompositing()) {
-        paintVulkanCursor(renderTarget, viewport);
+        // Under Vulkan the fullscreen post-pass draws the corrected cursor itself
+        // (so it also shows over overview). Nothing to do here — avoid drawing
+        // the cursor twice.
         return;
     }
 #endif
