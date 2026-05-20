@@ -347,6 +347,13 @@ void ScreenShotEffect::takeScreenShot(ScreenShotWindowData *screenshot)
                         if (VulkanTexture *tex = fbo->colorTexture()) {
                             tex->setCurrentLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
                         }
+                        // Apply whole-screen post-FX (invert / colorblindness) to the
+                        // captured window. These run as a fullscreen post-pass under
+                        // Vulkan and so are not part of drawWindow(); without this the
+                        // window screenshot would lack the effects visible on screen.
+                        if (vkRenderer) {
+                            vkRenderer->runFullscreenPostPassesOffscreen(cmd, fbo.get(), offscreenRT);
+                        }
                         ctx->endSingleTimeCommands(cmd); // blocks until GPU idle
 
                         if (VulkanTexture *tex = fbo->colorTexture()) {
