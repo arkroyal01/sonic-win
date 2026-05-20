@@ -16,6 +16,10 @@
 #include <QImage>
 #include <QPoint>
 
+#if HAVE_VULKAN
+#include <vulkan/vulkan.h>
+#endif
+
 namespace KWin
 {
 
@@ -61,6 +65,15 @@ private:
     void rebuildCursorImage();
 #if HAVE_VULKAN
     void paintVulkanCursor(const RenderTarget &, const RenderViewport &);
+    // Registers/unregisters the fullscreen invert post-pass with the Vulkan
+    // renderer to match the current state (Vulkan compositing + valid + whole-screen
+    // mode). Per-window invert keeps the OffscreenEffect redirect path instead.
+    void updateVulkanPostPass();
+    // Fullscreen post-pass callback: inverts the captured scene into the swapchain
+    // and draws the inverted software cursor on top. Runs after the effect chain,
+    // so it wraps overview and other QuickSceneEffect overlays.
+    void invertVulkanPostPass(VkCommandBuffer cmd, VulkanTexture *sceneCapture,
+                              const RenderTarget &, const RenderViewport &);
 #endif
 
     bool m_inited;
@@ -78,6 +91,8 @@ private:
     VulkanPipeline *m_vkPipeline = nullptr;
     VulkanPipeline *m_vkCursorPipeline = nullptr;
     std::unique_ptr<VulkanTexture> m_vkCursorTexture;
+    // Fullscreen invert post-pass registration id (0 = not registered).
+    int m_vkPostPassId = 0;
 #endif
 };
 

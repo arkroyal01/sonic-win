@@ -100,6 +100,12 @@ InvertEffect::InvertEffect()
         invert(window);
     }
 
+#if HAVE_VULKAN
+    // Whole-screen invert defaults to on (m_allWindows). Register the fullscreen
+    // post-pass so it applies even before the first window event.
+    updateVulkanPostPass();
+#endif
+
     // Hide hardware cursor and draw a software-inverted copy in paintScreen().
     effects->hideCursor();
     connect(Cursors::self()->mouse(), &Cursor::cursorChanged, this, [this]() {
@@ -125,6 +131,18 @@ InvertEffect::~InvertEffect()
     if (m_allWindows) {
         effects->showCursor();
     }
+#if HAVE_VULKAN
+    if (m_vkPostPassId != 0) {
+        // Guard scene()/renderer() — destruction order during compositor teardown
+        // is not guaranteed.
+        if (auto *scene = effects->scene()) {
+            if (auto *vkRenderer = dynamic_cast<ItemRendererVulkan *>(scene->renderer())) {
+                vkRenderer->unregisterFullscreenPostPass(m_vkPostPassId);
+            }
+        }
+        m_vkPostPassId = 0;
+    }
+#endif
 }
 
 bool InvertEffect::supported()
@@ -142,6 +160,15 @@ void InvertEffect::invert(EffectWindow *window)
     if (m_valid && !m_inited) {
         m_valid = loadData();
     }
+
+#if HAVE_VULKAN
+    // Whole-screen invert under Vulkan is handled by a fullscreen post-pass
+    // (see updateVulkanPostPass), so it can wrap overview and other
+    // QuickSceneEffect overlays. No per-window redirect in that mode.
+    if (effects->isVulkanCompositing() && m_allWindows) {
+        return;
+    }
+#endif
 
     redirect(window);
 
@@ -219,6 +246,12 @@ void InvertEffect::toggleScreenInversion()
             uninvert(window);
         }
     }
+
+#if HAVE_VULKAN
+    // m_allWindows flipped: register the fullscreen post-pass for whole-screen
+    // mode, or unregister it when switching to per-window mode.
+    updateVulkanPostPass();
+#endif
 
     effects->addRepaintFull();
 }
@@ -395,6 +428,144 @@ void InvertEffect::paintVulkanCursor(const RenderTarget &renderTarget, const Ren
     vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &vbOffset);
     vkCmdDraw(cmd, 6, 1, 0, 0);
 }
+
+void InvertEffect::updateVulkanPostPass()
+{
+    if (!effects->isVulkanCompositing()) {
+        return;
+    }
+    auto *scene = effects->scene();
+    auto *vkRenderer = scene ? dynamic_cast<ItemRendererVulkan *>(scene->renderer()) : nullptr;
+    if (!vkRenderer) {
+        return;
+    }
+
+    // The fullscreen post-pass handles whole-screen invert only. Per-window invert
+    // (m_allWindows == false) keeps the OffscreenEffect redirect path.
+    const bool want = m_valid && m_allWindows;
+    if (want && m_vkPostPassId == 0) {
+        m_vkPostPassId = vkRenderer->registerFullscreenPostPass(
+            [this](VkCommandBuffer cmd, VulkanTexture *sceneCapture,
+                   const RenderTarget &renderTarget, const RenderViewport &viewport) {
+            invertVulkanPostPass(cmd, sceneCapture, renderTarget, viewport);
+        });
+    } else if (!want && m_vkPostPassId != 0) {
+        vkRenderer->unregisterFullscreenPostPass(m_vkPostPassId);
+        m_vkPostPassId = 0;
+    }
+}
+
+void InvertEffect::invertVulkanPostPass(VkCommandBuffer cmd, VulkanTexture *sceneCapture,
+                                        const RenderTarget &renderTarget, const RenderViewport &viewport)
+{
+    auto *ctx = VulkanContext::currentContext();
+    if (!ctx || !sceneCapture || cmd == VK_NULL_HANDLE) {
+        return;
+    }
+
+    // Same trait set as the per-window path. Pipelines built against the
+    // presentation render pass are render-pass-compatible with the post-FX pass
+    // (matching attachment format / sample count / subpass count), so the
+    // pipeline-manager cache can be reused as-is.
+    VulkanPipeline *pipeline = ctx->pipelineManager()->pipeline(
+        VulkanShaderTrait::MapTexture | VulkanShaderTrait::Modulate | VulkanShaderTrait::Invert);
+    if (!pipeline || !pipeline->isValid()) {
+        return;
+    }
+
+    // Fullscreen quad in device pixels — viewport.projectionMatrix() maps device
+    // px, and the scene capture was blitted 1:1 from the swapchain so texel (0,0)
+    // is the top-left pixel.
+    const QSize fbSize = renderTarget.size();
+    if (fbSize.isEmpty()) {
+        return;
+    }
+    const float w = float(fbSize.width());
+    const float h = float(fbSize.height());
+    const VulkanVertex2D verts[6] = {
+        {{0.0f, 0.0f}, {0.0f, 0.0f}},
+        {{w, 0.0f}, {1.0f, 0.0f}},
+        {{0.0f, h}, {0.0f, 1.0f}},
+        {{w, 0.0f}, {1.0f, 0.0f}},
+        {{w, h}, {1.0f, 1.0f}},
+        {{0.0f, h}, {0.0f, 1.0f}},
+    };
+    auto vertBuf = VulkanBuffer::createStreamingBuffer(ctx, sizeof(verts));
+    if (!vertBuf) {
+        return;
+    }
+    vertBuf->upload(verts, sizeof(verts));
+
+    VulkanPushConstants pc{};
+    memcpy(pc.mvp, viewport.projectionMatrix().constData(), sizeof(pc.mvp));
+    pc.textureMatrix[0] = pc.textureMatrix[5] = pc.textureMatrix[10] = pc.textureMatrix[15] = 1.0f;
+
+    VulkanUniforms uniforms{};
+    uniforms.opacity = 1.0f;
+    uniforms.brightness = 1.0f;
+    uniforms.saturation = 1.0f;
+    auto uboBuf = VulkanBuffer::createUniformBuffer(ctx, sizeof(VulkanUniforms));
+    if (!uboBuf) {
+        return;
+    }
+    uboBuf->upload(&uniforms, sizeof(uniforms));
+
+    VkDescriptorSet ds = ctx->allocateDescriptorSet(pipeline->descriptorSetLayout());
+    if (ds == VK_NULL_HANDLE) {
+        return;
+    }
+
+    const VkDescriptorImageInfo imgInfo{sceneCapture->sampler(), sceneCapture->imageView(),
+                                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    const std::array<VkDescriptorImageInfo, 4> imageInfos{imgInfo, imgInfo, imgInfo, imgInfo};
+    VkDescriptorBufferInfo bufInfo{uboBuf->buffer(), 0, sizeof(VulkanUniforms)};
+
+    std::array<VkWriteDescriptorSet, 2> writes{};
+    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[0].dstSet = ds;
+    writes[0].dstBinding = 0;
+    writes[0].descriptorCount = 4;
+    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[0].pImageInfo = imageInfos.data();
+    writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[1].dstSet = ds;
+    writes[1].dstBinding = 1;
+    writes[1].descriptorCount = 1;
+    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    writes[1].pBufferInfo = &bufInfo;
+    vkUpdateDescriptorSets(ctx->backend()->device(), 2, writes.data(), 0, nullptr);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->pipeline());
+    vkCmdPushConstants(cmd, pipeline->layout(),
+                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                       0, sizeof(VulkanPushConstants), &pc);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            pipeline->layout(), 0, 1, &ds, 0, nullptr);
+    const VkBuffer vb = vertBuf->buffer();
+    const VkDeviceSize vbOffset = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &vbOffset);
+    vkCmdDraw(cmd, 6, 1, 0, 0);
+
+    // Draw the inverted software cursor on top — but only for the real swapchain
+    // frame. Offscreen captures (the screenshot effect's per-window render) carry
+    // a command-buffer override on their RenderTarget and handle the cursor
+    // separately, so the cursor must not be baked into their content.
+    const auto *vt = renderTarget.vulkanTarget();
+    const bool mainFrame = !vt || vt->commandBuffer() == VK_NULL_HANDLE;
+    // When fullscreen zoom is active it draws its own (magnified) cursor into the
+    // scene, which this post-pass then inverts along with everything else. Drawing
+    // our cursor here too would double it up.
+    Effect *zoom = effects->findEffect(QStringLiteral("zoom"));
+    const bool zoomActive = zoom && zoom->isActive();
+    if (mainFrame && !zoomActive) {
+        if (m_cursorDirty) {
+            rebuildCursorImage();
+        }
+        if (!m_cursorImage.isNull()) {
+            paintVulkanCursor(renderTarget, viewport);
+        }
+    }
+}
 #endif
 
 void InvertEffect::paintScreen(const RenderTarget &renderTarget, const RenderViewport &viewport, int mask, const QRegion &region, Output *screen)
@@ -414,7 +585,9 @@ void InvertEffect::paintScreen(const RenderTarget &renderTarget, const RenderVie
 
 #if HAVE_VULKAN
     if (effects->isVulkanCompositing()) {
-        paintVulkanCursor(renderTarget, viewport);
+        // Whole-screen invert under Vulkan runs as a fullscreen post-pass which
+        // draws the inverted cursor itself (so it also shows over overview).
+        // Nothing to do here — avoid drawing the cursor twice.
         return;
     }
 #endif
