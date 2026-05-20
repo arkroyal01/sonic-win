@@ -38,6 +38,7 @@
 #include "utils/common.h"
 #include "window.h"
 #include "workspace.h"
+#include <algorithm>
 #include <array>
 #include <vector>
 
@@ -246,6 +247,267 @@ void ItemRendererVulkan::registerPostPassCopy(VkImage srcImage, VkImageLayout sr
     req.extent = extent;
     req.callback = std::move(callback);
     m_pendingPostPassCopies.push_back(std::move(req));
+}
+
+int ItemRendererVulkan::registerFullscreenPostPass(FullscreenPostPassCallback callback)
+{
+    if (!callback) {
+        return 0;
+    }
+    const int id = m_nextPostPassId++;
+    m_fullscreenPostPasses.push_back({id, std::move(callback)});
+    return id;
+}
+
+void ItemRendererVulkan::unregisterFullscreenPostPass(int id)
+{
+    auto it = std::find_if(m_fullscreenPostPasses.begin(), m_fullscreenPostPasses.end(),
+                           [id](const FullscreenPostPassRegistration &r) {
+        return r.id == id;
+    });
+    if (it != m_fullscreenPostPasses.end()) {
+        m_fullscreenPostPasses.erase(it);
+    }
+}
+
+void ItemRendererVulkan::runFullscreenPostPasses(const RenderTarget &renderTarget, const RenderViewport &viewport)
+{
+    if (m_fullscreenPostPasses.empty() || m_currentCommandBuffer == VK_NULL_HANDLE || !m_currentFramebuffer) {
+        return;
+    }
+    // Only operates on the main swapchain target. Recursive/offscreen flows (zoom,
+    // screenshot, ...) skip this — their content doesn't need invert-style post-FX,
+    // and they own their own command buffer / framebuffer.
+    auto *vkTarget = renderTarget.vulkanTarget();
+    if (!vkTarget || vkTarget->commandBuffer() != VK_NULL_HANDLE) {
+        return;
+    }
+
+    VkImage swapchainImage = m_currentFramebuffer->colorImage();
+    const VkFormat swapchainFormat = m_currentFramebuffer->renderPass()->config().colorFormat;
+    const QSize fbSize = m_currentFramebuffer->size();
+    if (swapchainImage == VK_NULL_HANDLE || swapchainFormat == VK_FORMAT_UNDEFINED || fbSize.isEmpty()) {
+        return;
+    }
+
+    // Lazy: (re)allocate scene-capture texture when the swapchain size/format changes.
+    if (!m_sceneCaptureTexture
+        || m_sceneCaptureTexture->size() != fbSize
+        || m_sceneCaptureTexture->format() != swapchainFormat) {
+        m_sceneCaptureTexture = VulkanTexture::allocate(m_context, fbSize, swapchainFormat);
+        if (!m_sceneCaptureTexture) {
+            qCWarning(KWIN_CORE) << "runFullscreenPostPasses: failed to allocate scene capture texture";
+            return;
+        }
+        m_sceneCaptureTexture->setFilter(VK_FILTER_NEAREST);
+        m_sceneCaptureTexture->setWrapMode(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+    }
+    // Lazy: (re)create post-FX render pass when the swapchain format changes.
+    if (!m_postFxRenderPass || m_postFxRenderPassFormat != swapchainFormat) {
+        m_postFxRenderPass = VulkanRenderPass::createForSwapchainPostFx(m_context, swapchainFormat);
+        m_postFxRenderPassFormat = swapchainFormat;
+        if (!m_postFxRenderPass) {
+            qCWarning(KWIN_CORE) << "runFullscreenPostPasses: failed to create post-FX render pass";
+            return;
+        }
+    }
+
+    // End the main scene pass; swapchain is now in PRESENT_SRC_KHR (its finalLayout).
+    m_currentFramebuffer->endRenderPass(m_currentCommandBuffer);
+
+    const VkRect2D renderArea{{0, 0}, {uint32_t(fbSize.width()), uint32_t(fbSize.height())}};
+
+    for (auto &reg : m_fullscreenPostPasses) {
+        // 1) swapchain: PRESENT_SRC_KHR (or COLOR_ATTACHMENT, after a previous post-pass) -> TRANSFER_SRC
+        {
+            VkImageMemoryBarrier b{};
+            b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            b.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+            b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.image = swapchainImage;
+            b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            b.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            vkCmdPipelineBarrier(m_currentCommandBuffer,
+                                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 0, 0, nullptr, 0, nullptr, 1, &b);
+        }
+
+        // 2) capture texture: current (UNDEFINED first time, SHADER_READ_ONLY thereafter) -> TRANSFER_DST
+        const VkImageLayout captureOld = m_sceneCaptureTexture->currentLayout();
+        m_sceneCaptureTexture->transitionLayout(m_currentCommandBuffer,
+                                                captureOld,
+                                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                                captureOld == VK_IMAGE_LAYOUT_UNDEFINED
+                                                    ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+                                                    : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                                VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+        // 3) blit swapchain -> capture (1:1, no scaling)
+        {
+            VkImageBlit blit{};
+            blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            blit.srcOffsets[0] = {0, 0, 0};
+            blit.srcOffsets[1] = {fbSize.width(), fbSize.height(), 1};
+            blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            blit.dstOffsets[0] = {0, 0, 0};
+            blit.dstOffsets[1] = {fbSize.width(), fbSize.height(), 1};
+            vkCmdBlitImage(m_currentCommandBuffer,
+                           swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           m_sceneCaptureTexture->image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           1, &blit, VK_FILTER_NEAREST);
+        }
+
+        // 4) capture: TRANSFER_DST -> SHADER_READ_ONLY (the post-pass samples it)
+        m_sceneCaptureTexture->transitionLayout(m_currentCommandBuffer,
+                                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+
+        // 5) swapchain: TRANSFER_SRC -> COLOR_ATTACHMENT_OPTIMAL. The post-FX render
+        //    pass has initialLayout=UNDEFINED + loadOp=DONT_CARE so the layout is
+        //    semantically not preserved; the explicit barrier provides the required
+        //    transfer→color-attachment-output synchronization.
+        {
+            VkImageMemoryBarrier b{};
+            b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            b.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.image = swapchainImage;
+            b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            b.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            vkCmdPipelineBarrier(m_currentCommandBuffer,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                 0, 0, nullptr, 0, nullptr, 1, &b);
+        }
+
+        // 6) begin post-FX pass on the same swapchain framebuffer. loadOp=DONT_CARE
+        //    so the callback MUST cover every pixel via a fullscreen quad.
+        VkClearValue clear{};
+        m_postFxRenderPass->begin(m_currentCommandBuffer,
+                                  m_currentFramebuffer->framebuffer(),
+                                  renderArea, &clear, 1);
+
+        // Y-flipped (negative-height) viewport, matching beginFrame(). The scene
+        // — and therefore the captured texture — was rendered with this
+        // convention, and post-pass callbacks build geometry with
+        // viewport.projectionMatrix(). A positive-height viewport here would
+        // flip the post-processed output upside down.
+        VkViewport vkViewport{};
+        vkViewport.x = 0.0f;
+        vkViewport.y = float(fbSize.height());
+        vkViewport.width = float(fbSize.width());
+        vkViewport.height = -float(fbSize.height());
+        vkViewport.minDepth = 0.0f;
+        vkViewport.maxDepth = 1.0f;
+        vkCmdSetViewport(m_currentCommandBuffer, 0, 1, &vkViewport);
+        vkCmdSetScissor(m_currentCommandBuffer, 0, 1, &renderArea);
+
+        // 7) callback: pipeline bind + descriptor + fullscreen draw.
+        reg.callback(m_currentCommandBuffer, m_sceneCaptureTexture.get(), renderTarget, viewport);
+
+        // 8) end pass: swapchain auto-transitions back to PRESENT_SRC_KHR.
+        m_postFxRenderPass->end(m_currentCommandBuffer);
+    }
+
+    // The main scene render pass is already ended; tell endFrame() not to end it again.
+    m_currentFramebuffer = nullptr;
+}
+
+void ItemRendererVulkan::runFullscreenPostPassesOffscreen(VkCommandBuffer cmd, VulkanFramebuffer *targetFb,
+                                                          const RenderTarget &renderTarget)
+{
+    if (m_fullscreenPostPasses.empty() || cmd == VK_NULL_HANDLE || !targetFb) {
+        return;
+    }
+    VulkanTexture *colorTex = targetFb->colorTexture();
+    VulkanRenderPass *renderPass = targetFb->renderPass();
+    if (!colorTex || !renderPass) {
+        return;
+    }
+    const QSize fbSize = targetFb->size();
+    const VkFormat fmt = colorTex->format();
+    if (fbSize.isEmpty() || fmt == VK_FORMAT_UNDEFINED) {
+        return;
+    }
+
+    // Capture texture: a fresh allocation — offscreen captures (window screenshots)
+    // are rare and one-shot. VulkanTexture destruction is deferred, so the local
+    // staying alive only until this function returns is safe: the caller blocks on
+    // the GPU (endSingleTimeCommands) before the deferred-destruction queue drains.
+    auto capture = VulkanTexture::allocate(m_context, fbSize, fmt);
+    if (!capture) {
+        qCWarning(KWIN_CORE) << "runFullscreenPostPassesOffscreen: capture allocation failed";
+        return;
+    }
+    capture->setFilter(VK_FILTER_NEAREST);
+    capture->setWrapMode(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+
+    // The caller's render pass has ended; its color image is in SHADER_READ_ONLY.
+    colorTex->transitionLayout(cmd, colorTex->currentLayout(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    capture->transitionLayout(cmd, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                              VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+    VkImageBlit blit{};
+    blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.srcOffsets[0] = {0, 0, 0};
+    blit.srcOffsets[1] = {fbSize.width(), fbSize.height(), 1};
+    blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.dstOffsets[0] = {0, 0, 0};
+    blit.dstOffsets[1] = {fbSize.width(), fbSize.height(), 1};
+    vkCmdBlitImage(cmd, colorTex->image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   capture->image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                   1, &blit, VK_FILTER_NEAREST);
+
+    capture->transitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                              VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    // Synchronize the transfer read against the upcoming color-attachment writes.
+    colorTex->transitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+
+    // The caller's viewport is anchored at the captured window's on-screen
+    // position, so its projection maps FB-local pixel (0,0) somewhere off the
+    // framebuffer. Build a viewport whose projection maps framebuffer-local
+    // device pixels (0,0)..(fbSize) instead, matching how the post-FX callbacks
+    // build their fullscreen quad. Without this the quad lands off-framebuffer
+    // and the screenshot comes out fully transparent.
+    const RenderViewport localViewport(QRectF(0, 0, fbSize.width(), fbSize.height()), 1.0, renderTarget);
+
+    // Reuse the framebuffer's own render pass. Its loadOp is CLEAR; the post-FX
+    // callbacks cover every pixel with a fullscreen quad so the clear is harmless.
+    // Its finalLayout is SHADER_READ_ONLY, which is what the caller reads back.
+    const VkRect2D renderArea{{0, 0}, {uint32_t(fbSize.width()), uint32_t(fbSize.height())}};
+    VkClearValue clear{};
+    renderPass->begin(cmd, targetFb->framebuffer(), renderArea, &clear, 1);
+
+    // Y-flipped viewport, matching beginFrame() and the screenshot effect's own
+    // offscreen render — see runFullscreenPostPasses().
+    VkViewport vkViewport{};
+    vkViewport.x = 0.0f;
+    vkViewport.y = float(fbSize.height());
+    vkViewport.width = float(fbSize.width());
+    vkViewport.height = -float(fbSize.height());
+    vkViewport.minDepth = 0.0f;
+    vkViewport.maxDepth = 1.0f;
+    vkCmdSetViewport(cmd, 0, 1, &vkViewport);
+    vkCmdSetScissor(cmd, 0, 1, &renderArea);
+
+    for (auto &reg : m_fullscreenPostPasses) {
+        reg.callback(cmd, capture.get(), renderTarget, localViewport);
+    }
+
+    renderPass->end(cmd);
+    // createForOffscreen's finalLayout is SHADER_READ_ONLY_OPTIMAL.
+    colorTex->setCurrentLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 }
 
 static QImage::Format vulkanFormatToQImageFormat(VkFormat fmt)

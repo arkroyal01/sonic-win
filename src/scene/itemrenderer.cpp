@@ -32,4 +32,8 @@ void ItemRenderer::endFrame()
 {
 }
 
+void ItemRenderer::runFullscreenPostPasses(const RenderTarget &renderTarget, const RenderViewport &viewport)
+{
+}
+
 } // namespace KWin

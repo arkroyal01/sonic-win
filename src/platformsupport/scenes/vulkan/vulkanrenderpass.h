@@ -60,6 +60,17 @@ public:
                                                                 bool withDepth = false);
 
     /**
+     * @brief Create a render pass for fullscreen post-FX on a swapchain image.
+     *
+     * Used after the main scene render pass has ended. Discards prior swapchain
+     * contents (loadOp=DONT_CARE) since the post-FX shader is expected to write
+     * every pixel via a fullscreen quad; finalLayout=PRESENT_SRC_KHR so the
+     * image is presentation-ready when the pass ends. Compatible with the
+     * existing per-swapchain-image VkFramebuffers created for presentation.
+     */
+    static std::unique_ptr<VulkanRenderPass> createForSwapchainPostFx(VulkanContext *context, VkFormat colorFormat);
+
+    /**
      * @brief Create a render pass with custom configuration.
      */
     static std::unique_ptr<VulkanRenderPass> create(VulkanContext *context, const Config &config);

@@ -402,6 +402,12 @@ void WorkspaceScene::paint(const RenderTarget &renderTarget, const QRegion &regi
         }
     }
 
+    // Run any fullscreen post-passes (e.g. invert under Vulkan) before the frame
+    // is submitted. These wrap the whole screen including QuickSceneEffect-derived
+    // overlays which terminate the effect chain. No-op for backends that don't
+    // implement post-passes.
+    m_renderer->runFullscreenPostPasses(renderTarget, viewport);
+
     Q_EMIT frameRendered();
     m_renderer->endFrame();
 }

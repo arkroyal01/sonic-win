@@ -34,6 +34,7 @@ class VulkanContext;
 class VulkanBuffer;
 class VulkanTexture;
 class VulkanFramebuffer;
+class VulkanRenderPass;
 class VulkanSwapchain;
 class VulkanRenderTarget;
 class RenderTarget;
@@ -219,6 +220,59 @@ public:
                               VkFormat srcFormat, const VkOffset3D &offset,
                               const VkExtent3D &extent, PostPassCopyCallback callback);
 
+    /**
+     * Fullscreen post-pass: runs after the scene's effect chain has finished and the
+     * main render pass has been ended. The renderer takes the just-rendered swapchain
+     * content, blits it into a sampled "scene capture" texture, and invokes each
+     * registered callback inside a fresh render pass on the same swapchain framebuffer.
+     * The callback is expected to draw a fullscreen quad (or other geometry) that
+     * samples @p sceneCapture and writes the post-processed result to the swapchain.
+     *
+     * Registrations are stable across frames — register once when the effect becomes
+     * active and unregister when it deactivates. Use this for effects that must wrap
+     * the entire screen including QuickSceneEffect-derived overlays (overview, etc.),
+     * which terminate the effect chain and would otherwise hide downstream effects.
+     */
+    using FullscreenPostPassCallback = std::function<void(
+        VkCommandBuffer cmd,
+        VulkanTexture *sceneCapture,
+        const RenderTarget &renderTarget,
+        const RenderViewport &viewport)>;
+    int registerFullscreenPostPass(FullscreenPostPassCallback callback);
+    void unregisterFullscreenPostPass(int id);
+    bool hasFullscreenPostPasses() const
+    {
+        return !m_fullscreenPostPasses.empty();
+    }
+
+    /**
+     * Drains all registered fullscreen post-passes against the current frame's
+     * swapchain target. Must be called after the effect chain's paintScreen() has
+     * returned but before endFrame(). Safe no-op if no callbacks are registered or
+     * the current target is not a Vulkan swapchain framebuffer.
+     *
+     * After this returns, the main scene render pass has been ended and the renderer
+     * is "between passes" — endFrame() detects this via m_currentFramebuffer == nullptr
+     * and skips its own endRenderPass call.
+     */
+    void runFullscreenPostPasses(const RenderTarget &renderTarget, const RenderViewport &viewport) override;
+
+    /**
+     * Applies the registered fullscreen post-passes to an offscreen framebuffer
+     * that was rendered outside the main frame (e.g. the screenshot effect's
+     * per-window capture, which uses a recursive drawWindow() and so never goes
+     * through runFullscreenPostPasses()).
+     *
+     * @p cmd is the caller's (single-time) command buffer; @p targetFb must
+     * already contain the rendered content with its color image in
+     * SHADER_READ_ONLY_OPTIMAL (i.e. the caller's render pass has ended). The
+     * method blits the content into a capture texture, re-renders the post-FX
+     * over @p targetFb reusing its own render pass, and leaves the color image
+     * back in SHADER_READ_ONLY_OPTIMAL. Safe no-op if no post-passes registered.
+     */
+    void runFullscreenPostPassesOffscreen(VkCommandBuffer cmd, VulkanFramebuffer *targetFb,
+                                          const RenderTarget &renderTarget);
+
 private:
     QVector4D modulate(float opacity, float brightness) const;
     void createRenderNode(Item *item, RenderContext *context);
@@ -256,6 +310,21 @@ private:
     // External wait semaphores attached by effects this frame (cleared in endFrame).
     std::vector<VkSemaphore> m_externalWaitSemaphores;
     std::vector<VkPipelineStageFlags> m_externalWaitStages;
+
+    // Fullscreen post-pass registrations: each is invoked after the main scene pass.
+    // Drained by runFullscreenPostPasses(); registrations are NOT cleared per-frame.
+    struct FullscreenPostPassRegistration
+    {
+        int id;
+        FullscreenPostPassCallback callback;
+    };
+    std::vector<FullscreenPostPassRegistration> m_fullscreenPostPasses;
+    int m_nextPostPassId = 1;
+    // Lazy resources for runFullscreenPostPasses. Reallocated when the swapchain
+    // format/size changes.
+    std::unique_ptr<VulkanTexture> m_sceneCaptureTexture;
+    std::unique_ptr<VulkanRenderPass> m_postFxRenderPass;
+    VkFormat m_postFxRenderPassFormat = VK_FORMAT_UNDEFINED;
 
     // Post-render-pass image captures requested this frame (drained in endFrame).
     struct PostPassCopyRequest

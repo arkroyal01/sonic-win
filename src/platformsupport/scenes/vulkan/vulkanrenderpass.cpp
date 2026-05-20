@@ -83,6 +83,22 @@ std::unique_ptr<VulkanRenderPass> VulkanRenderPass::createForOffscreen(VulkanCon
     return create(context, config);
 }
 
+std::unique_ptr<VulkanRenderPass> VulkanRenderPass::createForSwapchainPostFx(VulkanContext *context, VkFormat colorFormat)
+{
+    Config config;
+    config.colorFormat = colorFormat;
+    // Post-FX always writes every pixel via a fullscreen quad, so the prior
+    // contents are irrelevant. The previously-rendered scene is read via a
+    // sampled "scene capture" texture set up by the caller.
+    config.colorLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    config.colorStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
+    config.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    config.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    config.hasDepth = false;
+
+    return create(context, config);
+}
+
 std::unique_ptr<VulkanRenderPass> VulkanRenderPass::create(VulkanContext *context, const Config &config)
 {
     auto renderPass = std::unique_ptr<VulkanRenderPass>(new VulkanRenderPass(context, config));
