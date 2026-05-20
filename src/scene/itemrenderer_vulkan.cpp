@@ -1213,16 +1213,26 @@ void ItemRendererVulkan::renderNodes(const RenderContext &context, VkCommandBuff
             continue;
         }
 
+        // Fold window-global brightness/saturation modulation into the per-node
+        // traits so the correct pipeline (specialization constants) is selected.
+        VulkanShaderTraits effectiveTraits = node.traits;
+        if (context.brightness != 1.0) {
+            effectiveTraits |= VulkanShaderTrait::Modulate;
+        }
+        if (context.saturation != 1.0) {
+            effectiveTraits |= VulkanShaderTrait::AdjustSaturation;
+        }
+
         // Get or create pipeline for this node's traits
-        VulkanPipeline *pipeline = pipelineManager->pipeline(node.traits);
+        VulkanPipeline *pipeline = pipelineManager->pipeline(effectiveTraits);
         if (!pipeline) {
-            qCWarning(KWIN_CORE) << "Failed to get pipeline for traits:" << static_cast<int>(node.traits);
+            qCWarning(KWIN_CORE) << "Failed to get pipeline for traits:" << static_cast<int>(effectiveTraits);
             continue;
         }
 
         // Validate pipeline before using it
         if (!pipeline->isValid()) {
-            qCWarning(KWIN_CORE) << "Pipeline is invalid for traits:" << static_cast<int>(node.traits);
+            qCWarning(KWIN_CORE) << "Pipeline is invalid for traits:" << static_cast<int>(effectiveTraits);
             continue;
         }
 
@@ -1232,7 +1242,7 @@ void ItemRendererVulkan::renderNodes(const RenderContext &context, VkCommandBuff
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->pipeline());
                 currentPipeline = pipeline;
             } else {
-                qCWarning(KWIN_CORE) << "Skipping null pipeline binding for traits:" << static_cast<int>(node.traits);
+                qCWarning(KWIN_CORE) << "Skipping null pipeline binding for traits:" << static_cast<int>(effectiveTraits);
                 continue;
             }
         }
@@ -1269,8 +1279,11 @@ void ItemRendererVulkan::renderNodes(const RenderContext &context, VkCommandBuff
         const QVector4D modulation = modulate(node.opacity, 1.0f);
         memcpy(uniforms.uniformColor, &modulation, sizeof(uniforms.uniformColor));
         uniforms.opacity = node.opacity;
-        uniforms.brightness = 1.0f;
-        uniforms.saturation = 1.0f;
+        uniforms.brightness = context.brightness;
+        uniforms.saturation = context.saturation;
+        uniforms.primaryBrightness[0] = context.primaryBrightness.x();
+        uniforms.primaryBrightness[1] = context.primaryBrightness.y();
+        uniforms.primaryBrightness[2] = context.primaryBrightness.z();
         memcpy(uniforms.geometryBox, &node.box, sizeof(uniforms.geometryBox));
         memcpy(uniforms.borderRadius, &node.borderRadius, sizeof(uniforms.borderRadius));
         uniforms.borderThickness = node.borderThickness;
@@ -1387,6 +1400,12 @@ void ItemRendererVulkan::renderItem(const RenderTarget &renderTarget, const Rend
 
     // Build render context using the viewport's projection matrix
     RenderContext context(viewport.projectionMatrix(), data.toMatrix(viewport.scale()), region, hardwareClipping, viewport.scale(), &viewport);
+
+    // Window-global brightness/saturation modulation (e.g. diminactive).
+    context.brightness = data.brightness();
+    context.saturation = data.saturation();
+    const auto toXYZ = renderTarget.colorDescription().containerColorimetry().toXYZ();
+    context.primaryBrightness = QVector3D(toXYZ(1, 0), toXYZ(1, 1), toXYZ(1, 2));
 
     // Initialize stacks (matching OpenGL approach)
     // Push identity - rootTransform is applied in createRenderNode when stack size is 1

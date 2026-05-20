@@ -80,6 +80,11 @@ public:
         const qreal renderTargetScale;
         const RenderViewport *viewport;
 
+        // Window-global modulation from WindowPaintData (e.g. diminactive).
+        qreal brightness = 1.0;
+        qreal saturation = 1.0;
+        QVector3D primaryBrightness;
+
         RenderContext(const QMatrix4x4 &proj, const QMatrix4x4 &root, const QRegion &c, bool hc, qreal scale, const RenderViewport *vp)
             : projectionMatrix(proj)
             , rootTransform(root)
