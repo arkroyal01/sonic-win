@@ -127,14 +127,20 @@ void ImageItemVulkan::preprocess()
             return;
         }
 
-        if (!m_texture || m_texture->size() != m_image.size()) {
-            m_texture = VulkanTexture::upload(context, m_image);
+        // The item renderer blends textures with premultiplied alpha, but a
+        // QImage handed to setImage() (e.g. loaded from a file) carries
+        // straight alpha. Premultiply it so transparent regions stay
+        // transparent instead of adding their color.
+        const QImage premultiplied = m_image.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+
+        if (!m_texture || m_texture->size() != premultiplied.size()) {
+            m_texture = VulkanTexture::upload(context, premultiplied);
             if (m_texture) {
                 m_texture->setFilter(VK_FILTER_LINEAR);
                 m_texture->setWrapMode(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
             }
         } else {
-            m_texture->update(m_image, m_image.rect());
+            m_texture->update(premultiplied, premultiplied.rect());
         }
     }
 #endif
