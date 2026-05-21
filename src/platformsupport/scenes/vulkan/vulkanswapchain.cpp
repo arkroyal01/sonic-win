@@ -222,14 +222,13 @@ VkSurfaceFormatKHR VulkanSwapchain::chooseSwapSurfaceFormat(const std::vector<Vk
 
 VkPresentModeKHR VulkanSwapchain::chooseSwapPresentMode(const std::vector<VkPresentModeKHR> &availablePresentModes)
 {
-    // Prefer mailbox (triple buffering) for smooth vsync
-    for (const auto &mode : availablePresentModes) {
-        if (mode == VK_PRESENT_MODE_MAILBOX_KHR) {
-            return mode;
-        }
-    }
-
-    // FIFO is always available (vsync)
+    Q_UNUSED(availablePresentModes)
+    // FIFO (always supported): every queued present is displayed, in order, with
+    // no dropped frames. The compositor's RenderLoop already paces rendering to
+    // the refresh rate, so MAILBOX's render-ahead buys nothing here — and MAILBOX
+    // can discard a queued frame, which would corrupt VK_KHR_incremental_present
+    // (its changed-region hints are relative to the previous present). FIFO also
+    // avoids the wasted GPU work / wakeups MAILBOX invites on battery.
     return VK_PRESENT_MODE_FIFO_KHR;
 }
 
