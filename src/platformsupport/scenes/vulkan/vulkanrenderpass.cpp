@@ -99,6 +99,22 @@ std::unique_ptr<VulkanRenderPass> VulkanRenderPass::createForSwapchainPostFx(Vul
     return create(context, config);
 }
 
+std::unique_ptr<VulkanRenderPass> VulkanRenderPass::createForSwapchainLoad(VulkanContext *context, VkFormat colorFormat)
+{
+    Config config;
+    config.colorFormat = colorFormat;
+    // Preserve the previously-presented contents so a partial-repaint frame only
+    // has to redraw the damaged sub-region. A swapchain image is in
+    // PRESENT_SRC_KHR when re-acquired, hence that initial layout.
+    config.colorLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    config.colorStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
+    config.initialLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    config.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    config.hasDepth = false;
+
+    return create(context, config);
+}
+
 std::unique_ptr<VulkanRenderPass> VulkanRenderPass::create(VulkanContext *context, const Config &config)
 {
     auto renderPass = std::unique_ptr<VulkanRenderPass>(new VulkanRenderPass(context, config));
@@ -169,6 +185,13 @@ bool VulkanRenderPass::create()
     dependency.srcAccessMask = 0;
     dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
+    if (m_config.colorLoadOp == VK_ATTACHMENT_LOAD_OP_LOAD) {
+        // loadOp=LOAD reads the attachment at the start of the pass; make that
+        // read wait for, and see, the prior frame's color writes.
+        dependency.srcAccessMask |= VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        dependency.dstAccessMask |= VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
+    }
 
     if (m_config.hasDepth) {
         dependency.srcStageMask |= VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;

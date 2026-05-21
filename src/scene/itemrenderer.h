@@ -9,6 +9,7 @@
 #include <kwin_export.h>
 
 #include <QMatrix4x4>
+#include <QRegion>
 #include <memory>
 
 class QPainter;
@@ -31,7 +32,13 @@ public:
 
     virtual QPainter *painter() const;
 
-    virtual void beginFrame(const RenderTarget &renderTarget, const RenderViewport &viewport);
+    /**
+     * Starts a frame. @p damage is the region the scene is about to repaint, in
+     * scene coordinates, or infiniteRegion() for a full repaint. Backends that
+     * support partial repaints (Vulkan) use it to scissor the frame and to
+     * preserve undamaged pixels; backends that clip per-draw (OpenGL) ignore it.
+     */
+    virtual void beginFrame(const RenderTarget &renderTarget, const RenderViewport &viewport, const QRegion &damage);
     virtual void endFrame();
 
     virtual void renderBackground(const RenderTarget &renderTarget, const RenderViewport &viewport, const QRegion &region) = 0;

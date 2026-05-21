@@ -106,17 +106,22 @@ std::optional<OutputLayerBeginFrameInfo> VulkanLayer::doBeginFrame()
     // Create a RenderTarget with the VulkanRenderTarget
     RenderTarget renderTarget(vulkanRenderTarget.release());
 
+    // Buffer-age repaint region: how stale this swapchain image's contents are
+    // determines how much must be redrawn. infiniteRegion() => full repaint.
     return OutputLayerBeginFrameInfo{
         .renderTarget = std::move(renderTarget),
-        .repaint = infiniteRegion(),
+        .repaint = x11Backend->bufferDamage(imageIndex),
     };
 }
 
 bool VulkanLayer::doEndFrame(const QRegion &renderedRegion, const QRegion &damagedRegion, OutputFrame *frame)
 {
     Q_UNUSED(renderedRegion);
-    Q_UNUSED(damagedRegion);
     Q_UNUSED(frame);
+
+    // Feed this frame's damage into the backend's manual buffer-age tracking so
+    // subsequent frames can compute a correct partial-repaint region.
+    static_cast<X11StandaloneVulkanBackend *>(m_backend)->recordFrameDamage(damagedRegion);
 
     // Rendering has been submitted by the ItemRendererVulkan
     // The actual presentation happens in X11StandaloneVulkanBackend::present()
@@ -138,6 +143,13 @@ X11StandaloneVulkanBackend::X11StandaloneVulkanBackend(X11StandaloneBackend *bac
 {
     m_overlayWindow = std::make_unique<OverlayWindowX11>(backend);
     m_layer = std::make_unique<VulkanLayer>(this);
+
+    // Damage-driven partial repaint is opt-in for now (KWIN_VULKAN_PARTIAL_REPAINT=1)
+    // so it can be A/B-tested against the full-repaint path.
+    m_partialRepaint = qEnvironmentVariableIntValue("KWIN_VULKAN_PARTIAL_REPAINT") != 0;
+    if (m_partialRepaint) {
+        qCInfo(KWIN_X11STANDALONE) << "Vulkan: damage-driven partial repaint enabled";
+    }
 
     // Note: We can't connect to workspace() here as it might not be available yet
     // This connection should be made after workspace is initialized
@@ -297,6 +309,9 @@ bool X11StandaloneVulkanBackend::initSwapchain()
     // Connect the swapchain's render pass to the pipeline manager
     m_context->pipelineManager()->setRenderPass(m_swapchain->renderPass()->renderPass());
 
+    // Fresh swapchain images carry no usable previous contents.
+    resetDamageTracking();
+
     return true;
 }
 
@@ -363,6 +378,9 @@ bool X11StandaloneVulkanBackend::present(Output *output, const std::shared_ptr<O
                 const QSize size = workspace()->geometry().size();
                 if (!m_swapchain->recreate(size)) {
                     qCWarning(KWIN_X11STANDALONE) << "Failed to recreate swapchain";
+                } else {
+                    // Recreated images start blank — drop stale age tracking.
+                    resetDamageTracking();
                 }
             }
             // Even if present failed, we still mark the frame as presented to avoid blocking
@@ -427,6 +445,45 @@ void X11StandaloneVulkanBackend::screenGeometryChanged()
 
     overlayWindow()->resize(size);
     Xcb::sync();
+}
+
+void X11StandaloneVulkanBackend::resetDamageTracking()
+{
+    m_damageJournal.clear();
+    m_frameCounter = 1;
+    m_imageLastRenderFrame.assign(m_swapchain ? m_swapchain->imageCount() : 0, 0);
+}
+
+QRegion X11StandaloneVulkanBackend::bufferDamage(uint32_t imageIndex) const
+{
+    if (!m_partialRepaint || imageIndex >= m_imageLastRenderFrame.size()) {
+        return infiniteRegion();
+    }
+    const uint64_t last = m_imageLastRenderFrame[imageIndex];
+    if (last == 0 || last >= m_frameCounter) {
+        // This image has not been rendered into yet (or the counter was just
+        // reset): its contents are unusable, so repaint everything.
+        return infiniteRegion();
+    }
+    // Age = frames elapsed since this image last held a rendered result. Its
+    // contents are that stale, so repaint everything damaged since then.
+    const int age = static_cast<int>(m_frameCounter - last);
+    return m_damageJournal.accumulate(age, infiniteRegion());
+}
+
+void X11StandaloneVulkanBackend::recordFrameDamage(const QRegion &damage)
+{
+    if (!m_partialRepaint) {
+        return;
+    }
+    m_damageJournal.add(damage);
+    if (m_swapchain) {
+        const uint32_t imageIndex = m_swapchain->currentImageIndex();
+        if (imageIndex < m_imageLastRenderFrame.size()) {
+            m_imageLastRenderFrame[imageIndex] = m_frameCounter;
+        }
+    }
+    ++m_frameCounter;
 }
 
 xcb_connection_t *X11StandaloneVulkanBackend::connection() const

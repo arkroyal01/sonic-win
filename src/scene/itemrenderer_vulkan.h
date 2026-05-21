@@ -103,7 +103,7 @@ public:
 
     std::unique_ptr<ImageItem> createImageItem(Item *parent = nullptr) override;
 
-    void beginFrame(const RenderTarget &renderTarget, const RenderViewport &viewport) override;
+    void beginFrame(const RenderTarget &renderTarget, const RenderViewport &viewport, const QRegion &damage) override;
     void endFrame() override;
 
     void renderBackground(const RenderTarget &renderTarget, const RenderViewport &viewport, const QRegion &region) override;
@@ -316,6 +316,21 @@ private:
     uint32_t m_currentFrameIndex = 0;
     // Per-draw uniform slot cursor, reset to 0 at the start of every frame.
     uint32_t m_uniformDrawIndex = 0;
+
+    // --- Partial repaint state (per frame) ---
+    // True when this frame only repaints a damage sub-region of a swapchain
+    // image, preserving the rest via a LOAD render pass. False => full repaint.
+    bool m_partialFrame = false;
+    // Device-pixel render area / scissor for this frame: the full framebuffer for
+    // a full repaint, the damage bounding box for a partial one. All draws are
+    // scissored to it so undamaged pixels keep their preserved contents.
+    VkRect2D m_frameRenderArea{};
+    // LOAD-variant swapchain render pass (loadOp=LOAD, initialLayout=PRESENT_SRC),
+    // used for partial-repaint frames. Lazily (re)created when the color format
+    // changes; compatible with the swapchain's presentation framebuffers.
+    std::unique_ptr<VulkanRenderPass> m_loadRenderPass;
+    VkFormat m_loadRenderPassFormat = VK_FORMAT_UNDEFINED;
+
     // Default 1x1 white texture for non-textured draws
     std::unique_ptr<VulkanTexture> m_defaultWhiteTexture;
 

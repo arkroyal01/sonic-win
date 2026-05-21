@@ -71,6 +71,17 @@ public:
     static std::unique_ptr<VulkanRenderPass> createForSwapchainPostFx(VulkanContext *context, VkFormat colorFormat);
 
     /**
+     * @brief Create a LOAD-variant render pass for partial repaints on a swapchain image.
+     *
+     * Used instead of the presentation render pass when a frame only repaints a
+     * damage sub-region: loadOp=LOAD preserves the previously-presented contents
+     * so undamaged pixels survive. initialLayout=PRESENT_SRC_KHR matches the
+     * layout a swapchain image is in when re-acquired. Compatible with the
+     * per-swapchain-image VkFramebuffers created for presentation.
+     */
+    static std::unique_ptr<VulkanRenderPass> createForSwapchainLoad(VulkanContext *context, VkFormat colorFormat);
+
+    /**
      * @brief Create a render pass with custom configuration.
      */
     static std::unique_ptr<VulkanRenderPass> create(VulkanContext *context, const Config &config);

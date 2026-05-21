@@ -146,7 +146,7 @@ std::unique_ptr<ImageItem> ItemRendererVulkan::createImageItem(Item *parent)
     return std::make_unique<ImageItemVulkan>(parent);
 }
 
-void ItemRendererVulkan::beginFrame(const RenderTarget &renderTarget, const RenderViewport &viewport)
+void ItemRendererVulkan::beginFrame(const RenderTarget &renderTarget, const RenderViewport &viewport, const QRegion &damage)
 {
     if (!m_context->makeCurrent()) {
         qCWarning(KWIN_CORE) << "Failed to make Vulkan context current";
@@ -226,17 +226,75 @@ void ItemRendererVulkan::beginFrame(const RenderTarget &renderTarget, const Rend
     m_currentProjection = viewport.projectionMatrix();
     const QSize size = viewport.renderRect().size().toSize();
 
+    // Decide between a full repaint and a damage-driven partial repaint.
+    //
+    // Partial repaint is only safe on a swapchain image (it carries sync info and
+    // is re-acquired in PRESENT_SRC_KHR with its previous contents intact). It is
+    // skipped when the damage is infinite/empty, when it already covers the whole
+    // framebuffer, or when fullscreen post-passes are active (those re-process the
+    // entire screen). The compositor only hands us a finite damage region when the
+    // backend's doBeginFrame() returned a finite buffer-age repaint, so this also
+    // implies the swapchain image was rendered before — i.e. genuinely preservable.
+    const QSize fbSize = m_currentFramebuffer ? m_currentFramebuffer->size() : size;
+    const VkRect2D fullArea{{0, 0}, {static_cast<uint32_t>(fbSize.width()), static_cast<uint32_t>(fbSize.height())}};
+    const bool swapchainTarget = vulkanRenderTarget && vulkanRenderTarget->hasSyncInfo();
+
+    m_partialFrame = false;
+    m_frameRenderArea = fullArea;
+    if (swapchainTarget && m_currentFramebuffer && !hasFullscreenPostPasses()
+        && damage != infiniteRegion()) {
+        const QRect fbRect(QPoint(0, 0), fbSize);
+        // Empty damage must still take the partial (LOAD) path — a full clearing
+        // pass would blank the screen. An empty render area then means "preserve
+        // everything, draw nothing".
+        const QRect devBounds = damage.isEmpty()
+            ? QRect()
+            : (viewport.mapToRenderTarget(damage).boundingRect() & fbRect);
+        if (devBounds != fbRect) {
+            m_partialFrame = true;
+            if (devBounds.isEmpty()) {
+                // Minimal valid render area; no draws are expected to land in it.
+                m_frameRenderArea = VkRect2D{{0, 0}, {1, 1}};
+            } else {
+                m_frameRenderArea = VkRect2D{
+                    {devBounds.x(), devBounds.y()},
+                    {static_cast<uint32_t>(devBounds.width()), static_cast<uint32_t>(devBounds.height())}};
+            }
+        }
+    }
+
     // Begin render pass if we have a framebuffer
     if (m_currentFramebuffer) {
-        // Set up clear values
-        std::array<VkClearValue, 2> clearValues{};
-        clearValues[0].color = {{0.0f, 0.0f, 0.0f, 0.0f}}; // Clear to transparent black
-        if (m_currentFramebuffer->renderPass()->config().hasDepth) {
-            clearValues[1].depthStencil = {1.0f, 0};
+        if (m_partialFrame) {
+            // Lazily (re)create the LOAD-variant render pass for this color format.
+            const VkFormat fmt = m_currentFramebuffer->renderPass()->config().colorFormat;
+            if (!m_loadRenderPass || m_loadRenderPassFormat != fmt) {
+                m_loadRenderPass = VulkanRenderPass::createForSwapchainLoad(m_context, fmt);
+                m_loadRenderPassFormat = fmt;
+            }
+            if (m_loadRenderPass) {
+                // No clear: loadOp=LOAD keeps the previously-presented contents;
+                // only m_frameRenderArea is touched, so undamaged pixels survive.
+                m_loadRenderPass->begin(m_currentCommandBuffer, m_currentFramebuffer->framebuffer(),
+                                        m_frameRenderArea, nullptr, 0);
+            } else {
+                // LOAD pass unavailable — fall back to a full clearing repaint.
+                qCWarning(KWIN_CORE) << "Partial repaint: LOAD render pass unavailable, falling back to full repaint";
+                m_partialFrame = false;
+                m_frameRenderArea = fullArea;
+            }
         }
+        if (!m_partialFrame) {
+            // Full repaint: the presentation render pass clears the framebuffer.
+            std::array<VkClearValue, 2> clearValues{};
+            clearValues[0].color = {{0.0f, 0.0f, 0.0f, 0.0f}}; // Clear to transparent black
+            if (m_currentFramebuffer->renderPass()->config().hasDepth) {
+                clearValues[1].depthStencil = {1.0f, 0};
+            }
 
-        m_currentFramebuffer->beginRenderPass(m_currentCommandBuffer, clearValues.data(),
-                                              m_currentFramebuffer->renderPass()->config().hasDepth ? 2 : 1);
+            m_currentFramebuffer->beginRenderPass(m_currentCommandBuffer, clearValues.data(),
+                                                  m_currentFramebuffer->renderPass()->config().hasDepth ? 2 : 1);
+        }
     }
 
     // Set viewport with Y-flip to match OpenGL coordinate conventions
@@ -251,11 +309,9 @@ void ItemRendererVulkan::beginFrame(const RenderTarget &renderTarget, const Rend
     vkViewport.maxDepth = 1.0f;
     vkCmdSetViewport(m_currentCommandBuffer, 0, 1, &vkViewport);
 
-    // Set scissor
-    VkRect2D scissor{};
-    scissor.offset = {0, 0};
-    scissor.extent = {static_cast<uint32_t>(size.width()), static_cast<uint32_t>(size.height())};
-    vkCmdSetScissor(m_currentCommandBuffer, 0, 1, &scissor);
+    // Scissor everything to the frame's render area: the full framebuffer for a
+    // full repaint, or the damage bounding box for a partial one.
+    vkCmdSetScissor(m_currentCommandBuffer, 0, 1, &m_frameRenderArea);
 }
 
 void ItemRendererVulkan::registerPostPassCopy(VkImage srcImage, VkImageLayout srcLayoutAtPassEnd,
@@ -1220,20 +1276,10 @@ void ItemRendererVulkan::renderNodes(const RenderContext &context, VkCommandBuff
         }
     }
 
-    // Set up scissor for hardware clipping if needed
-    // The scissor is set per-node based on the clipping region
-    VkRect2D nodeScissor{};
-    nodeScissor.offset = {0, 0};
-    QSize renderSize;
-    if (m_currentFramebuffer) {
-        renderSize = m_currentFramebuffer->size();
-    } else if (context.viewport) {
-        // Fallback to viewport size from render target
-        renderSize = context.viewport->renderRect().size().toSize();
-    } else {
-        renderSize = QSize(1920, 1080); // Default fallback
-    }
-    nodeScissor.extent = {static_cast<uint32_t>(renderSize.width()), static_cast<uint32_t>(renderSize.height())};
+    // Non-hardware-clipped draws inherit the scissor set in beginFrame
+    // (m_frameRenderArea — the full framebuffer, or the damage bounding box on a
+    // partial-repaint frame). The hardware-clipping branch below overrides it
+    // per node and restores it afterwards.
 
     // Render each node
     VulkanPipeline *currentPipeline = nullptr;
@@ -1390,10 +1436,12 @@ void ItemRendererVulkan::renderNodes(const RenderContext &context, VkCommandBuff
         if (node.vertexCount > 0) {
             // Update scissor for hardware clipping if needed
             if (context.hardwareClipping) {
-                // Convert clip region to device coordinates
-                QRegion scissorRegion = context.viewport->mapToRenderTarget(context.clip);
-                // For simplicity, use bounding rect of clip region
-                QRect scissorRect = scissorRegion.boundingRect();
+                // Convert clip region to device coordinates, using its bounding
+                // rect, and clamp to the frame's render area so a clipped draw
+                // can never write outside the damaged region on a partial frame.
+                const QRect frameArea(m_frameRenderArea.offset.x, m_frameRenderArea.offset.y,
+                                      m_frameRenderArea.extent.width, m_frameRenderArea.extent.height);
+                const QRect scissorRect = context.viewport->mapToRenderTarget(context.clip).boundingRect() & frameArea;
                 VkRect2D scissor{};
                 scissor.offset.x = scissorRect.x();
                 scissor.offset.y = scissorRect.y();
@@ -1406,13 +1454,9 @@ void ItemRendererVulkan::renderNodes(const RenderContext &context, VkCommandBuff
         }
     }
 
-    // Reset scissor to full framebuffer if we were using hardware clipping
-    if (context.hardwareClipping && m_currentFramebuffer) {
-        VkRect2D fullScissor{};
-        QSize fbSize = m_currentFramebuffer->size();
-        fullScissor.offset = {0, 0};
-        fullScissor.extent = {static_cast<uint32_t>(fbSize.width()), static_cast<uint32_t>(fbSize.height())};
-        vkCmdSetScissor(cmd, 0, 1, &fullScissor);
+    // Restore the frame-wide scissor if a hardware-clipped node overrode it.
+    if (context.hardwareClipping) {
+        vkCmdSetScissor(cmd, 0, 1, &m_frameRenderArea);
     }
 }
 

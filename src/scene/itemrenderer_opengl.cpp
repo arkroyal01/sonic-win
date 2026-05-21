@@ -39,8 +39,9 @@ std::unique_ptr<ImageItem> ItemRendererOpenGL::createImageItem(Item *parent)
     return std::make_unique<ImageItemOpenGL>(parent);
 }
 
-void ItemRendererOpenGL::beginFrame(const RenderTarget &renderTarget, const RenderViewport &viewport)
+void ItemRendererOpenGL::beginFrame(const RenderTarget &renderTarget, const RenderViewport &viewport, const QRegion &damage)
 {
+    // OpenGL clips per-draw via scissor regions, so the frame-wide damage is unused here.
     GLFramebuffer *fbo = renderTarget.framebuffer();
     GLFramebuffer::pushFramebuffer(fbo);
 

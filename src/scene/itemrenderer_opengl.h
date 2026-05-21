@@ -60,7 +60,7 @@ public:
 
     ItemRendererOpenGL(EglDisplay *eglDisplay);
 
-    void beginFrame(const RenderTarget &renderTarget, const RenderViewport &viewport) override;
+    void beginFrame(const RenderTarget &renderTarget, const RenderViewport &viewport, const QRegion &damage) override;
     void endFrame() override;
 
     void renderBackground(const RenderTarget &renderTarget, const RenderViewport &viewport, const QRegion &region) override;

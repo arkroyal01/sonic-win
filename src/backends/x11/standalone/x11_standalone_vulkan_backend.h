@@ -13,12 +13,15 @@
 #include "platformsupport/scenes/vulkan/vulkancontext.h"
 #include "platformsupport/scenes/vulkan/vulkansurfacetexture_x11.h"
 #include "platformsupport/scenes/vulkan/vulkanswapchain.h"
+#include "utils/damagejournal.h"
 #include "x11eventfilter.h"
 
 #include <vulkan/vulkan.h>
 #include <xcb/xcb.h>
 
+#include <cstdint>
 #include <memory>
+#include <vector>
 
 namespace KWin
 {
@@ -78,6 +81,31 @@ public:
         return m_swapchain.get();
     }
 
+    /**
+     * @brief Whether damage-driven partial repaint is enabled (KWIN_VULKAN_PARTIAL_REPAINT=1).
+     */
+    bool partialRepaintEnabled() const
+    {
+        return m_partialRepaint;
+    }
+
+    /**
+     * @brief Compute the region that must be repainted into swapchain image @p imageIndex.
+     *
+     * Vulkan has no buffer-age query, so age is tracked manually: the result is the
+     * union of the damage of every frame since this image was last rendered into.
+     * Returns infiniteRegion() (full repaint) when partial repaint is disabled or
+     * the image has not been rendered before.
+     */
+    QRegion bufferDamage(uint32_t imageIndex) const;
+
+    /**
+     * @brief Record this frame's damage and mark the current swapchain image fresh.
+     *
+     * Called from VulkanLayer::doEndFrame() with the per-frame damage region.
+     */
+    void recordFrameDamage(const QRegion &damage);
+
 private:
     bool initInstance();
     bool initPhysicalDevice();
@@ -87,6 +115,12 @@ private:
     bool initOverlayWindow();
 
     void screenGeometryChanged();
+
+    /**
+     * @brief Reset partial-repaint age tracking. Called whenever the swapchain is
+     * (re)created, since the new images carry no usable previous contents.
+     */
+    void resetDamageTracking();
 
     std::unique_ptr<OverlayWindow> m_overlayWindow;
     xcb_window_t m_window = XCB_WINDOW_NONE;
@@ -99,6 +133,17 @@ private:
     X11StandaloneBackend *m_backend;
     std::unique_ptr<VulkanLayer> m_layer;
     std::shared_ptr<OutputFrame> m_frame;
+
+    // --- Partial repaint / manual buffer-age tracking ---
+    // Enabled via KWIN_VULKAN_PARTIAL_REPAINT=1.
+    bool m_partialRepaint = false;
+    // Per-frame damage history, accumulated by age to form the repaint region.
+    DamageJournal m_damageJournal;
+    // For each swapchain image, the value of m_frameCounter when it was last
+    // rendered into; 0 means "never rendered" (its contents are unusable).
+    std::vector<uint64_t> m_imageLastRenderFrame;
+    // Monotonic presented-frame counter; starts at 1 so 0 reads as "never".
+    uint64_t m_frameCounter = 1;
 
     friend class X11StandaloneVulkanSurfaceTexture;
 };
