@@ -914,14 +914,45 @@ QVector4D ItemRendererVulkan::modulate(float opacity, float brightness) const
     return QVector4D(rgb, rgb, rgb, a);
 }
 
-// Helper to build geometry from quads using RenderGeometry (matching OpenGL's clipQuads approach)
-static RenderGeometry buildGeometryFromQuads(const WindowQuadList &quads, qreal deviceScale)
+// Clip an item's window quads to the damage region, matching ItemRendererOpenGL::clipQuads().
+//
+// On a partial-repaint frame context->clip is the damage region. Quads fully outside it are
+// dropped and partially-covered quads are split to their intersection, so the geometry a draw
+// produces never extends past the actual damage — a lower window cannot paint into the gap
+// between disjoint damage rects, where an undamaged higher window is showing. When the clip is
+// infinite (full repaint) or hardware clipping is active, quads are emitted whole and the GPU
+// scissor does the clipping instead.
+static RenderGeometry clipQuads(const Item *item, const ItemRendererVulkan::RenderContext *context)
 {
+    const WindowQuadList quads = item->quads();
+    // Item-to-world translation, so clip rects (world space) can be moved into item space.
+    const QPointF worldTranslation = context->transformStack.top().map(QPointF(0., 0.));
+    const qreal scale = context->renderTargetScale;
+
     RenderGeometry geometry;
     geometry.reserve(quads.count() * 6);
 
     for (const WindowQuad &quad : quads) {
-        geometry.appendWindowQuad(quad, deviceScale);
+        if (context->clip != infiniteRegion() && !context->hardwareClipping) {
+            // Scale to device coordinates, rounding as needed.
+            const QRectF deviceBounds = snapToPixelGridF(scaledRect(quad.bounds(), scale));
+
+            for (const QRect &clipRect : context->clip) {
+                const QRectF deviceClipRect = snapToPixelGridF(scaledRect(clipRect, scale)).translated(-worldTranslation);
+                const QRectF intersected = deviceClipRect.intersected(deviceBounds);
+                if (intersected.isValid()) {
+                    if (deviceBounds == intersected) {
+                        // case 1: quad completely inside this clip rect — keep it whole
+                        geometry.appendWindowQuad(quad, scale);
+                        break;
+                    }
+                    // case 2: partial intersection — emit only the covered sub-quad
+                    geometry.appendSubQuad(quad, intersected, scale);
+                }
+            }
+        } else {
+            geometry.appendWindowQuad(quad, scale);
+        }
     }
 
     return geometry;
@@ -981,8 +1012,8 @@ void ItemRendererVulkan::createRenderNode(Item *item, RenderContext *context)
     // Preprocess the item to ensure pixmap/texture is created
     item->preprocess();
 
-    // Build geometry from quads (using RenderGeometry like OpenGL)
-    RenderGeometry geometry = buildGeometryFromQuads(item->quads(), scale);
+    // Build geometry from quads, clipped to the damage region on partial-repaint frames.
+    RenderGeometry geometry = clipQuads(item, context);
 
     // Handle different item types (matching OpenGL's approach)
     if (auto shadowItem = qobject_cast<ShadowItem *>(item)) {
