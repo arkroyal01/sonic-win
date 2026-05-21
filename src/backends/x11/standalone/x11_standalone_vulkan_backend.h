@@ -19,6 +19,7 @@
 #include <vulkan/vulkan.h>
 #include <xcb/xcb.h>
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -31,6 +32,7 @@ class X11StandaloneVulkanSurfaceTexture;
 class Swapchain;
 class SurfacePixmapX11;
 class Output;
+class VsyncMonitor;
 
 class VulkanLayer : public OutputLayer
 {
@@ -122,6 +124,21 @@ private:
      */
     void resetDamageTracking();
 
+    /**
+     * @brief Create the vsync monitor used to report real presentation timing.
+     *
+     * Tries the hardware monitors (SGI_video_sync, OML_sync_control) first,
+     * falling back to a software (timer-based) monitor — the same cascade the
+     * GLX backend uses.
+     */
+    void initVsyncMonitor();
+
+    /**
+     * @brief Vsync monitor callback: reports the real present timestamp of the
+     * in-flight frame to its OutputFrame, driving RenderLoop's vblank prediction.
+     */
+    void vblank(std::chrono::nanoseconds timestamp);
+
     std::unique_ptr<OverlayWindow> m_overlayWindow;
     xcb_window_t m_window = XCB_WINDOW_NONE;
     xcb_colormap_t m_colormap = XCB_COLORMAP_NONE;
@@ -137,6 +154,11 @@ private:
     // Region changed this frame, stashed by doEndFrame() for the next present()'s
     // VK_KHR_incremental_present hint. Independent of partial repaint.
     QRegion m_presentDamage;
+
+    // Reports real vblank timestamps; present() arms it and vblank() forwards the
+    // timestamp to the in-flight OutputFrame. Hardware monitor where available,
+    // software (timer) fallback otherwise.
+    std::unique_ptr<VsyncMonitor> m_vsyncMonitor;
 
     // --- Partial repaint / manual buffer-age tracking ---
     // Enabled via KWIN_VULKAN_PARTIAL_REPAINT=1.

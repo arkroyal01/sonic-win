@@ -11,16 +11,21 @@
 #include "compositor.h"
 #include "core/outputbackend.h"
 #include "core/overlaywindow.h"
+#include "core/renderloop.h"
 #include "platformsupport/scenes/vulkan/vulkanpipelinemanager.h"
 #include "platformsupport/scenes/vulkan/vulkanrenderpass.h"
 #include "platformsupport/scenes/vulkan/vulkanrendertarget.h"
 #include "platformsupport/scenes/vulkan/vulkansurfacetexture_x11.h"
 #include "scene/surfaceitem_x11.h"
+#include "utils/softwarevsyncmonitor.h"
+#include "utils/vsyncmonitor.h"
 #include "utils/xcbutils.h"
 #include "workspace.h"
 #include "x11_standalone_backend.h"
 #include "x11_standalone_logging.h"
+#include "x11_standalone_omlsynccontrolvsyncmonitor.h"
 #include "x11_standalone_overlaywindow.h"
+#include "x11_standalone_sgivideosyncvsyncmonitor.h"
 
 #include <QOpenGLContext>
 #include <private/qtx11extras_p.h>
@@ -157,6 +162,9 @@ X11StandaloneVulkanBackend::X11StandaloneVulkanBackend(X11StandaloneBackend *bac
 
 X11StandaloneVulkanBackend::~X11StandaloneVulkanBackend()
 {
+    // Stop the vsync monitor first so no vblank() callback fires during teardown.
+    m_vsyncMonitor.reset();
+
     if (isFailed()) {
         m_overlayWindow->destroy();
     }
@@ -233,7 +241,46 @@ void X11StandaloneVulkanBackend::init()
     // Connect to workspace geometry changes for resize handling
     connect(workspace(), &Workspace::geometryChanged, this, &X11StandaloneVulkanBackend::screenGeometryChanged);
 
+    // Set up real presentation-timing feedback for the RenderLoop.
+    initVsyncMonitor();
+
     qCDebug(KWIN_X11STANDALONE) << "Successfully initialized Vulkan backend";
+}
+
+void X11StandaloneVulkanBackend::initVsyncMonitor()
+{
+    // Same monitor cascade as the GLX backend: prefer a hardware vblank source,
+    // fall back to a software (timer-based) one. Each monitor is self-contained
+    // (its own X11 connection / thread), so no GL or Vulkan context is needed.
+    m_vsyncMonitor = SGIVideoSyncVsyncMonitor::create();
+    if (!m_vsyncMonitor) {
+        m_vsyncMonitor = OMLSyncControlVsyncMonitor::create();
+    }
+    if (!m_vsyncMonitor) {
+        std::unique_ptr<SoftwareVsyncMonitor> monitor = SoftwareVsyncMonitor::create();
+        if (monitor) {
+            RenderLoop *renderLoop = m_backend->renderLoop();
+            monitor->setRefreshRate(renderLoop->refreshRate());
+            connect(renderLoop, &RenderLoop::refreshRateChanged, this, [this, m = monitor.get()]() {
+                m->setRefreshRate(m_backend->renderLoop()->refreshRate());
+            });
+            m_vsyncMonitor = std::move(monitor);
+        }
+    }
+
+    if (m_vsyncMonitor) {
+        connect(m_vsyncMonitor.get(), &VsyncMonitor::vblankOccurred, this, &X11StandaloneVulkanBackend::vblank);
+    } else {
+        qCWarning(KWIN_X11STANDALONE) << "Vulkan: no vsync monitor available; presentation timing will be approximate";
+    }
+}
+
+void X11StandaloneVulkanBackend::vblank(std::chrono::nanoseconds timestamp)
+{
+    if (m_frame) {
+        m_frame->presented(timestamp, PresentationMode::VSync);
+        m_frame.reset();
+    }
 }
 
 bool X11StandaloneVulkanBackend::initInstance()
@@ -365,32 +412,40 @@ bool X11StandaloneVulkanBackend::present(Output *output, const std::shared_ptr<O
     bool presentSuccess = m_swapchain->present(m_presentDamage);
     m_presentDamage = QRegion();
 
-    // Get the presentation timestamp
-    auto presentTime = std::chrono::steady_clock::now();
-    auto presentNanos = std::chrono::duration_cast<std::chrono::nanoseconds>(presentTime.time_since_epoch());
-
-    if (m_frame) {
-        if (presentSuccess) {
-            qCDebug(KWIN_X11STANDALONE) << "Present successful, marking frame as presented";
-            m_frame->presented(presentNanos, PresentationMode::VSync);
-        } else {
-            // Present failed, likely swapchain needs recreation
-            qCWarning(KWIN_X11STANDALONE) << "Present failed, checking if swapchain needs recreation";
-            if (m_swapchain->needsRecreation()) {
-                qCDebug(KWIN_X11STANDALONE) << "Swapchain needs recreation after present failure";
-                // Try to recreate
-                const QSize size = workspace()->geometry().size();
-                if (!m_swapchain->recreate(size)) {
-                    qCWarning(KWIN_X11STANDALONE) << "Failed to recreate swapchain";
-                } else {
-                    // Recreated images start blank — drop stale age tracking.
-                    resetDamageTracking();
-                }
-            }
-            // Even if present failed, we still mark the frame as presented to avoid blocking
-            m_frame->presented(presentNanos, PresentationMode::VSync);
+    if (presentSuccess) {
+        // The real present timestamp is reported asynchronously by the vsync
+        // monitor: arm it now, and vblank() forwards the timestamp to the
+        // OutputFrame. Without a monitor, fall back to an immediate (approximate)
+        // timestamp so the RenderLoop still gets feedback.
+        if (m_vsyncMonitor) {
+            m_vsyncMonitor->arm();
+        } else if (m_frame) {
+            m_frame->presented(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch()),
+                               PresentationMode::VSync);
+            m_frame.reset();
         }
-        m_frame.reset();
+    } else {
+        // Present failed, likely the swapchain needs recreation.
+        qCWarning(KWIN_X11STANDALONE) << "Present failed, checking if swapchain needs recreation";
+        if (m_swapchain->needsRecreation()) {
+            qCDebug(KWIN_X11STANDALONE) << "Swapchain needs recreation after present failure";
+            const QSize size = workspace()->geometry().size();
+            if (!m_swapchain->recreate(size)) {
+                qCWarning(KWIN_X11STANDALONE) << "Failed to recreate swapchain";
+            } else {
+                // Recreated images start blank — drop stale age tracking.
+                resetDamageTracking();
+            }
+        }
+        // No vblank will be reported for a failed present; mark the frame
+        // presented immediately so the RenderLoop is not left waiting.
+        if (m_frame) {
+            m_frame->presented(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch()),
+                               PresentationMode::VSync);
+            m_frame.reset();
+        }
     }
 
     // Advance to the next frame in the swapchain
