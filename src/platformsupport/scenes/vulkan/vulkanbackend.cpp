@@ -317,12 +317,16 @@ bool VulkanBackend::createDevice(const QList<const char *> &requiredDeviceExtens
 
     bool hasExternalFenceFd = false;
     bool hasExternalFenceCapabilities = false;
+    bool hasIncrementalPresent = false;
     for (const auto &ext : availableExtensions) {
         if (strcmp(ext.extensionName, VK_KHR_EXTERNAL_FENCE_FD_EXTENSION_NAME) == 0) {
             hasExternalFenceFd = true;
         }
         if (strcmp(ext.extensionName, VK_KHR_EXTERNAL_FENCE_CAPABILITIES_EXTENSION_NAME) == 0) {
             hasExternalFenceCapabilities = true;
+        }
+        if (strcmp(ext.extensionName, VK_KHR_INCREMENTAL_PRESENT_EXTENSION_NAME) == 0) {
+            hasIncrementalPresent = true;
         }
     }
 
@@ -332,6 +336,13 @@ bool VulkanBackend::createDevice(const QList<const char *> &requiredDeviceExtens
         extensions.push_back(VK_KHR_EXTERNAL_FENCE_CAPABILITIES_EXTENSION_NAME);
         m_supportsExternalFenceFd = true;
         qCDebug(KWIN_VULKAN) << "VK_KHR_external_fence_fd extension enabled";
+    }
+
+    // Enable incremental present if available — lets present() hint changed regions.
+    if (hasIncrementalPresent) {
+        extensions.push_back(VK_KHR_INCREMENTAL_PRESENT_EXTENSION_NAME);
+        m_supportsIncrementalPresent = true;
+        qCDebug(KWIN_VULKAN) << "VK_KHR_incremental_present extension enabled";
     }
 
     createInfo.enabledExtensionCount = static_cast<uint32_t>(extensions.size());

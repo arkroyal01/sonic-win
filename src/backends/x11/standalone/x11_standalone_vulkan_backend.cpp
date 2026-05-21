@@ -358,8 +358,12 @@ bool X11StandaloneVulkanBackend::present(Output *output, const std::shared_ptr<O
         return false;
     }
 
-    // Present the rendered frame to the swapchain
-    bool presentSuccess = m_swapchain->present();
+    // Present the rendered frame to the swapchain, hinting the changed region
+    // (VK_KHR_incremental_present). Cleared afterwards so a present that is not
+    // preceded by a doEndFrame() (e.g. a failed beginFrame) falls back to a
+    // regionless full present.
+    bool presentSuccess = m_swapchain->present(m_presentDamage);
+    m_presentDamage = QRegion();
 
     // Get the presentation timestamp
     auto presentTime = std::chrono::steady_clock::now();
@@ -473,6 +477,10 @@ QRegion X11StandaloneVulkanBackend::bufferDamage(uint32_t imageIndex) const
 
 void X11StandaloneVulkanBackend::recordFrameDamage(const QRegion &damage)
 {
+    // Stashed for the next present()'s VK_KHR_incremental_present hint,
+    // regardless of whether damage-driven partial repaint is enabled.
+    m_presentDamage = damage;
+
     if (!m_partialRepaint) {
         return;
     }

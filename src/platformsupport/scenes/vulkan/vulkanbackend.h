@@ -130,6 +130,17 @@ public:
     }
 
     /**
+     * @brief Check if VK_KHR_incremental_present is supported.
+     *
+     * When true, present() may attach a VkPresentRegionsKHR listing the rectangles
+     * that changed this frame, letting the presentation engine copy only those.
+     */
+    bool supportsIncrementalPresent() const
+    {
+        return m_supportsIncrementalPresent;
+    }
+
+    /**
      * @brief Get the vkGetFenceFdKHR function pointer (only valid if supportsExternalFenceFd() returns true)
      */
     PFN_vkGetFenceFdKHR vkGetFenceFdKHR() const
@@ -196,6 +207,9 @@ private:
     // External fence fd support
     bool m_supportsExternalFenceFd = false;
     PFN_vkGetFenceFdKHR m_vkGetFenceFdKHR = nullptr;
+
+    // VK_KHR_incremental_present support (changed-region hints in vkQueuePresentKHR)
+    bool m_supportsIncrementalPresent = false;
 
     // QVulkanInstance wrapping m_instance; created lazily for native Qt Quick.
     std::unique_ptr<QVulkanInstance> m_qVulkanInstance;

@@ -134,6 +134,10 @@ private:
     std::unique_ptr<VulkanLayer> m_layer;
     std::shared_ptr<OutputFrame> m_frame;
 
+    // Region changed this frame, stashed by doEndFrame() for the next present()'s
+    // VK_KHR_incremental_present hint. Independent of partial repaint.
+    QRegion m_presentDamage;
+
     // --- Partial repaint / manual buffer-age tracking ---
     // Enabled via KWIN_VULKAN_PARTIAL_REPAINT=1.
     bool m_partialRepaint = false;

@@ -10,6 +10,7 @@
 
 #include "kwin_export.h"
 
+#include <QRegion>
 #include <QSize>
 #include <memory>
 #include <vector>
@@ -141,9 +142,13 @@ public:
     /**
      * @brief Present the current image.
      *
+     * @param damage Region that changed since the previous present, in image
+     * pixels. When VK_KHR_incremental_present is supported and @p damage is
+     * non-empty it is passed as a VkPresentRegionsKHR hint; otherwise the whole
+     * image is presented.
      * @return True if presentation succeeded.
      */
-    bool present();
+    bool present(const QRegion &damage = QRegion());
 
     /**
      * @brief Recreate the swapchain (e.g., after resize).

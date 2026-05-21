@@ -451,7 +451,7 @@ uint32_t VulkanSwapchain::acquireNextImage(uint64_t timeout)
     return m_currentImageIndex;
 }
 
-bool VulkanSwapchain::present()
+bool VulkanSwapchain::present(const QRegion &damage)
 {
     VkSemaphore signalSemaphores[] = {m_renderFinishedSemaphores[m_currentFrame]};
 
@@ -462,6 +462,37 @@ bool VulkanSwapchain::present()
     presentInfo.swapchainCount = 1;
     presentInfo.pSwapchains = &m_swapchain;
     presentInfo.pImageIndices = &m_currentImageIndex;
+
+    // VK_KHR_incremental_present: tell the presentation engine which rectangles
+    // changed relative to the previously presented image, so it can copy only
+    // those. Skipped when the extension is unavailable or the damage is empty
+    // (a regionless present always presents the whole image — the safe default).
+    // rectLayers must outlive the vkQueuePresentKHR call below.
+    std::vector<VkRectLayerKHR> rectLayers;
+    VkPresentRegionKHR presentRegion{};
+    VkPresentRegionsKHR presentRegions{};
+    if (m_context->backend()->supportsIncrementalPresent() && !damage.isEmpty()) {
+        const QRect bounds(0, 0, static_cast<int>(m_extent.width), static_cast<int>(m_extent.height));
+        for (const QRect &r : damage) {
+            const QRect c = r.intersected(bounds);
+            if (c.isEmpty()) {
+                continue;
+            }
+            VkRectLayerKHR rl{};
+            rl.offset = {c.x(), c.y()};
+            rl.extent = {static_cast<uint32_t>(c.width()), static_cast<uint32_t>(c.height())};
+            rl.layer = 0;
+            rectLayers.push_back(rl);
+        }
+        if (!rectLayers.empty()) {
+            presentRegion.rectangleCount = static_cast<uint32_t>(rectLayers.size());
+            presentRegion.pRectangles = rectLayers.data();
+            presentRegions.sType = VK_STRUCTURE_TYPE_PRESENT_REGIONS_KHR;
+            presentRegions.swapchainCount = 1;
+            presentRegions.pRegions = &presentRegion;
+            presentInfo.pNext = &presentRegions;
+        }
+    }
 
     VkResult result = vkQueuePresentKHR(m_context->backend()->graphicsQueue(), &presentInfo);
 
