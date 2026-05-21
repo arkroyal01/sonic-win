@@ -83,11 +83,6 @@ public:
     VulkanPipelineManager *pipelineManager() const;
 
     /**
-     * @brief Get the streaming vertex buffer for per-frame geometry.
-     */
-    VulkanBuffer *streamingBuffer() const;
-
-    /**
      * @brief Queue a DMA-BUF image barrier to be issued at frame start.
      *
      * Instead of immediately submitting barriers (which causes vkQueueWaitIdle per texture),
@@ -269,7 +264,6 @@ private:
     bool m_isCleaningUp = false; // Set to true during cleanup to destroy immediately
 
     std::unique_ptr<VulkanPipelineManager> m_pipelineManager;
-    std::unique_ptr<VulkanBuffer> m_streamingBuffer;
 
     QStack<VulkanFramebuffer *> m_framebufferStack;
 

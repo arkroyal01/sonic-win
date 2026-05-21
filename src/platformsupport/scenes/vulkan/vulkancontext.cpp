@@ -94,9 +94,6 @@ VulkanContext::VulkanContext(VulkanBackend *backend)
     // Create pipeline manager
     m_pipelineManager = std::make_unique<VulkanPipelineManager>(this);
 
-    // Create streaming vertex buffer (4MB initial size, can grow)
-    m_streamingBuffer = VulkanBuffer::createStreamingBuffer(this, 4 * 1024 * 1024);
-
     // Check for DMA-BUF import support
     // This requires VK_EXT_external_memory_dma_buf extension
     VkPhysicalDeviceProperties2 props2{};
@@ -190,9 +187,8 @@ void VulkanContext::cleanup()
 
     vkDeviceWaitIdle(device);
 
-    // First, destroy streaming buffer and pipeline manager
-    // This will queue their resources for destruction
-    m_streamingBuffer.reset();
+    // First, destroy the pipeline manager
+    // This will queue its resources for destruction
     m_pipelineManager.reset();
 
     // Clean up all pending resources since GPU is now idle
@@ -286,11 +282,6 @@ VkDescriptorPool VulkanContext::descriptorPool() const
 VulkanPipelineManager *VulkanContext::pipelineManager() const
 {
     return m_pipelineManager.get();
-}
-
-VulkanBuffer *VulkanContext::streamingBuffer() const
-{
-    return m_streamingBuffer.get();
 }
 
 VkCommandBuffer VulkanContext::allocateCommandBuffer()

@@ -22,7 +22,9 @@
 #include <QImage>
 #include <QMatrix4x4>
 #include <QStack>
+#include <array>
 #include <functional>
+#include <memory>
 #include <unordered_set>
 #include <vulkan/vulkan.h>
 
@@ -291,9 +293,29 @@ private:
     VulkanFramebuffer *m_currentFramebuffer = nullptr;
     QMatrix4x4 m_currentProjection;
 
-    std::unique_ptr<VulkanBuffer> m_uniformBuffer;
     VkDescriptorSet m_currentDescriptorSet = VK_NULL_HANDLE;
 
+    // Transient per-frame GPU buffers. The streaming buffer holds this frame's
+    // vertex data; the uniform buffer holds per-draw shader uniforms. Both are
+    // host-visible and rewritten every frame, so each frame-in-flight needs its
+    // own copy — otherwise frame N would overwrite regions frame N-1's GPU work
+    // is still reading. kBufferSlots = MAX_FRAMES_IN_FLIGHT swapchain slots plus
+    // one dedicated slot for offscreen / non-swapchain targets (which carry no
+    // sync info and are serialized, but must not alias a swapchain frame's copy).
+    static constexpr uint32_t kFramesInFlight = 2;
+    static constexpr uint32_t kOffscreenSlot = kFramesInFlight;
+    static constexpr uint32_t kBufferSlots = kFramesInFlight + 1;
+
+    struct FrameResources
+    {
+        std::unique_ptr<VulkanBuffer> streamingBuffer;
+        std::unique_ptr<VulkanBuffer> uniformBuffer;
+    };
+    std::array<FrameResources, kBufferSlots> m_frameResources;
+    // Buffer slot the current beginFrame()/endFrame() pair writes into.
+    uint32_t m_currentFrameIndex = 0;
+    // Per-draw uniform slot cursor, reset to 0 at the start of every frame.
+    uint32_t m_uniformDrawIndex = 0;
     // Default 1x1 white texture for non-textured draws
     std::unique_ptr<VulkanTexture> m_defaultWhiteTexture;
 

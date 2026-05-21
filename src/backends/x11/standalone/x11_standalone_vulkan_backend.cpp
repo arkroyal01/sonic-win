@@ -100,6 +100,7 @@ std::optional<OutputLayerBeginFrameInfo> VulkanLayer::doBeginFrame()
     syncInfo.imageAvailableSemaphore = swapchain->imageAvailableSemaphore();
     syncInfo.renderFinishedSemaphore = swapchain->renderFinishedSemaphore();
     syncInfo.inFlightFence = swapchain->inFlightFence();
+    syncInfo.frameIndex = swapchain->currentFrame();
     vulkanRenderTarget->setSyncInfo(syncInfo);
 
     // Create a RenderTarget with the VulkanRenderTarget

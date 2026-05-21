@@ -23,6 +23,7 @@
 #include "platformsupport/scenes/vulkan/vulkanrendertarget.h"
 #include "platformsupport/scenes/vulkan/vulkansurfacetexture.h"
 #include "platformsupport/scenes/vulkan/vulkansurfacetexture_x11.h"
+#include "platformsupport/scenes/vulkan/vulkanswapchain.h"
 #include "platformsupport/scenes/vulkan/vulkantexture.h"
 #include "scene/decorationitem.h"
 #include "scene/imageitem.h"
@@ -94,10 +95,21 @@ ItemRendererVulkan::ItemRendererVulkan(VulkanBackend *backend)
     : m_backend(backend)
     , m_context(backend->vulkanContext())
 {
-    // Create uniform buffer for shader parameters
-    m_uniformBuffer = VulkanBuffer::createUniformBuffer(
-        m_context,
-        sizeof(VulkanUniforms) * 1024); // Support up to 1024 draws per frame
+    // The frame slot index handed to us via VulkanSyncInfo comes straight from
+    // the swapchain's currentFrame(), so our per-slot buffer count must cover
+    // every swapchain frame-in-flight.
+    static_assert(kFramesInFlight == VulkanSwapchain::MAX_FRAMES_IN_FLIGHT,
+                  "kFramesInFlight must match the swapchain's MAX_FRAMES_IN_FLIGHT");
+
+    // Create a streaming vertex buffer and a uniform buffer per frame slot, so a
+    // frame never writes over a buffer region a previous in-flight frame's GPU
+    // work is still reading. See FrameResources in the header.
+    for (FrameResources &fr : m_frameResources) {
+        fr.streamingBuffer = VulkanBuffer::createStreamingBuffer(m_context, 4 * 1024 * 1024);
+        fr.uniformBuffer = VulkanBuffer::createUniformBuffer(
+            m_context,
+            sizeof(VulkanUniforms) * 1024); // Support up to 1024 draws per frame
+    }
 
     // Create default 1x1 white texture for non-textured draws
     QImage whiteImage(1, 1, QImage::Format_ARGB32_Premultiplied);
@@ -121,7 +133,12 @@ ItemRendererVulkan::~ItemRendererVulkan()
     if (m_currentCommandBuffer != VK_NULL_HANDLE) {
         m_context->freeCommandBuffer(m_currentCommandBuffer);
     }
-    m_uniformBuffer.reset();
+    // Release the per-frame buffers while the context (and its VMA allocator /
+    // deferred-destruction queue) is still alive.
+    for (FrameResources &fr : m_frameResources) {
+        fr.streamingBuffer.reset();
+        fr.uniformBuffer.reset();
+    }
 }
 
 std::unique_ptr<ImageItem> ItemRendererVulkan::createImageItem(Item *parent)
@@ -187,10 +204,22 @@ void ItemRendererVulkan::beginFrame(const RenderTarget &renderTarget, const Rend
         // Extract sync info for GPU-GPU synchronization
         if (vulkanRenderTarget->hasSyncInfo()) {
             m_currentSyncInfo = vulkanRenderTarget->syncInfo();
+            // Swapchain frame: write into the buffer copy owned by this
+            // frame-in-flight slot. doBeginFrame() has already waited the
+            // matching fence, so the slot's previous user (this slot's frame
+            // from kFramesInFlight ago) is guaranteed done with its buffers.
+            m_currentFrameIndex = m_currentSyncInfo.frameIndex % kFramesInFlight;
         } else {
             m_currentSyncInfo = VulkanSyncInfo{}; // Reset to defaults
+            // Offscreen / non-swapchain target: use the dedicated slot so it
+            // never aliases a swapchain frame's in-flight buffers.
+            m_currentFrameIndex = kOffscreenSlot;
         }
     }
+
+    // Per-draw uniform cursor restarts each frame; the buffer it indexes is now
+    // private to this frame slot.
+    m_uniformDrawIndex = 0;
 
     // Use the viewport's projection matrix which includes render target transform
     // This is important for multi-monitor setups with different orientations
@@ -1141,7 +1170,8 @@ void ItemRendererVulkan::renderNodes(const RenderContext &context, VkCommandBuff
     }
 
     auto *pipelineManager = m_context->pipelineManager();
-    VulkanBuffer *streamingBuffer = m_context->streamingBuffer();
+    VulkanBuffer *streamingBuffer = m_frameResources[m_currentFrameIndex].streamingBuffer.get();
+    VulkanBuffer *uniformBuffer = m_frameResources[m_currentFrameIndex].uniformBuffer.get();
 
     // Calculate total vertex count for this batch
     size_t totalVertexCount = 0;
@@ -1291,10 +1321,11 @@ void ItemRendererVulkan::renderNodes(const RenderContext &context, VkCommandBuff
                                     node.borderColor.blueF(), node.borderColor.alphaF());
         memcpy(uniforms.borderColor, &borderColor, sizeof(uniforms.borderColor));
 
-        static int uniformIndex = 0;
-        VkDeviceSize uniformOffset = (uniformIndex % 1024) * sizeof(VulkanUniforms);
-        m_uniformBuffer->upload(&uniforms, sizeof(VulkanUniforms), uniformOffset);
-        uniformIndex++;
+        // Uniform slot cursor is per-frame (reset in beginFrame) and indexes this
+        // frame slot's own uniform buffer, so there is no cross-frame aliasing.
+        const VkDeviceSize uniformOffset = (m_uniformDrawIndex % 1024) * sizeof(VulkanUniforms);
+        uniformBuffer->upload(&uniforms, sizeof(VulkanUniforms), uniformOffset);
+        m_uniformDrawIndex++;
 
         // Update and bind descriptor sets for textures and UBO
 
@@ -1328,7 +1359,7 @@ void ItemRendererVulkan::renderNodes(const RenderContext &context, VkCommandBuff
 
         // Set up UBO
         VkDescriptorBufferInfo bufferInfo{};
-        bufferInfo.buffer = m_uniformBuffer->buffer();
+        bufferInfo.buffer = uniformBuffer->buffer();
         bufferInfo.offset = uniformOffset;
         bufferInfo.range = sizeof(VulkanUniforms);
 

@@ -34,6 +34,13 @@ struct VulkanSyncInfo
     VkSemaphore imageAvailableSemaphore = VK_NULL_HANDLE; ///< Wait before rendering
     VkSemaphore renderFinishedSemaphore = VK_NULL_HANDLE; ///< Signal after rendering
     VkFence inFlightFence = VK_NULL_HANDLE; ///< Signal when command buffer completes
+    /**
+     * Frame-in-flight slot for this frame (the swapchain's current frame index,
+     * in [0, VulkanSwapchain::MAX_FRAMES_IN_FLIGHT)). The item renderer uses it to
+     * pick a per-frame copy of its transient streaming/uniform buffers so a frame
+     * never overwrites buffer regions a previous in-flight frame is still reading.
+     */
+    uint32_t frameIndex = 0;
 };
 
 class KWIN_EXPORT VulkanRenderTarget
