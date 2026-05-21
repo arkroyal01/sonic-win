@@ -229,12 +229,16 @@ void ItemRendererVulkan::beginFrame(const RenderTarget &renderTarget, const Rend
     // Decide between a full repaint and a damage-driven partial repaint.
     //
     // Partial repaint is only safe on a swapchain image (it carries sync info and
-    // is re-acquired in PRESENT_SRC_KHR with its previous contents intact). It is
-    // skipped when the damage is infinite/empty, when it already covers the whole
-    // framebuffer, or when fullscreen post-passes are active (those re-process the
-    // entire screen). The compositor only hands us a finite damage region when the
-    // backend's doBeginFrame() returned a finite buffer-age repaint, so this also
-    // implies the swapchain image was rendered before — i.e. genuinely preservable.
+    // is re-acquired in PRESENT_SRC_KHR with its previous contents intact), and is
+    // skipped when fullscreen post-passes are active (those re-process the whole
+    // screen). The decision uses the actual damage *region*, not its bounding box:
+    // a frame is a full clearing repaint only when the damage genuinely covers
+    // every pixel. Disjoint damage whose bounding box happens to span the screen
+    // must still be a partial LOAD frame — a full clear would blank the gaps
+    // between the damage rects (the "background flickers to black" bug). A finite
+    // damage region also implies the swapchain image was rendered before
+    // (doBeginFrame() only returns a finite buffer-age repaint for an
+    // already-rendered image), so the LOAD path's preserved contents are valid.
     const QSize fbSize = m_currentFramebuffer ? m_currentFramebuffer->size() : size;
     const VkRect2D fullArea{{0, 0}, {static_cast<uint32_t>(fbSize.width()), static_cast<uint32_t>(fbSize.height())}};
     const bool swapchainTarget = vulkanRenderTarget && vulkanRenderTarget->hasSyncInfo();
@@ -243,15 +247,15 @@ void ItemRendererVulkan::beginFrame(const RenderTarget &renderTarget, const Rend
     m_frameRenderArea = fullArea;
     if (swapchainTarget && m_currentFramebuffer && !hasFullscreenPostPasses()
         && damage != infiniteRegion()) {
-        const QRect fbRect(QPoint(0, 0), fbSize);
-        // Empty damage must still take the partial (LOAD) path — a full clearing
-        // pass would blank the screen. An empty render area then means "preserve
-        // everything, draw nothing".
-        const QRect devBounds = damage.isEmpty()
-            ? QRect()
-            : (viewport.mapToRenderTarget(damage).boundingRect() & fbRect);
-        if (devBounds != fbRect) {
+        const QRegion fbRegion(QRect(QPoint(0, 0), fbSize));
+        // Damage mapped to device pixels and clamped to the framebuffer.
+        const QRegion devRegion = damage.isEmpty()
+            ? QRegion()
+            : (viewport.mapToRenderTarget(damage) & fbRegion);
+        if (devRegion != fbRegion) {
+            // Sub-screen damage (including disjoint or empty) — partial LOAD frame.
             m_partialFrame = true;
+            const QRect devBounds = devRegion.boundingRect();
             if (devBounds.isEmpty()) {
                 // Minimal valid render area; no draws are expected to land in it.
                 m_frameRenderArea = VkRect2D{{0, 0}, {1, 1}};
