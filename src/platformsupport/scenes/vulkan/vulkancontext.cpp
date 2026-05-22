@@ -232,6 +232,19 @@ void VulkanContext::cleanup()
         m_fence = VK_NULL_HANDLE;
     }
 
+    // Drain the single-time submission pool. vkDeviceWaitIdle above already
+    // guarantees nothing is in flight, so the fences are safe to destroy and
+    // the command buffers safe to free without further synchronization.
+    for (auto &slot : m_singleTimeSlots) {
+        if (slot.fence != VK_NULL_HANDLE) {
+            vkDestroyFence(device, slot.fence, nullptr);
+        }
+        if (slot.cmd != VK_NULL_HANDLE && m_commandPool != VK_NULL_HANDLE) {
+            vkFreeCommandBuffers(device, m_commandPool, 1, &slot.cmd);
+        }
+    }
+    m_singleTimeSlots.clear();
+
     if (m_descriptorPool != VK_NULL_HANDLE) {
         vkDestroyDescriptorPool(device, m_descriptorPool, nullptr);
         m_descriptorPool = VK_NULL_HANDLE;
@@ -309,35 +322,185 @@ void VulkanContext::freeCommandBuffer(VkCommandBuffer commandBuffer)
     }
 }
 
+int VulkanContext::findSingleTimeSlotById(uint64_t id) const
+{
+    if (id == 0) {
+        return -1;
+    }
+    for (size_t i = 0; i < m_singleTimeSlots.size(); ++i) {
+        if (m_singleTimeSlots[i].id == id) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+int VulkanContext::findSingleTimeSlotByCmd(VkCommandBuffer cmd) const
+{
+    if (cmd == VK_NULL_HANDLE) {
+        return -1;
+    }
+    for (size_t i = 0; i < m_singleTimeSlots.size(); ++i) {
+        if (m_singleTimeSlots[i].cmd == cmd && m_singleTimeSlots[i].id != 0) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+void VulkanContext::reclaimSignaledSingleTimeSlots()
+{
+    VkDevice device = m_backend->device();
+    for (auto &slot : m_singleTimeSlots) {
+        if (slot.id == 0 || slot.fence == VK_NULL_HANDLE) {
+            continue;
+        }
+        // VK_NOT_READY = still in flight; VK_SUCCESS = signaled and reusable.
+        // An error result (e.g. device lost) leaves the slot in place; the
+        // next device-wide cleanup path will tear everything down.
+        if (vkGetFenceStatus(device, slot.fence) == VK_SUCCESS) {
+            vkResetFences(device, 1, &slot.fence);
+            // Reset is cheap and the pool was created with
+            // VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT.
+            vkResetCommandBuffer(slot.cmd, 0);
+            slot.id = 0;
+        }
+    }
+}
+
+int VulkanContext::acquireFreeSingleTimeSlot()
+{
+    // Opportunistic reclaim so a finished slot from an earlier submission
+    // becomes reusable on the next begin() without waiting for the next
+    // frame-boundary cleanup pass.
+    reclaimSignaledSingleTimeSlots();
+
+    for (size_t i = 0; i < m_singleTimeSlots.size(); ++i) {
+        if (m_singleTimeSlots[i].id == 0) {
+            return static_cast<int>(i);
+        }
+    }
+
+    // No free slot — grow the pool. Steady state is 1–2 slots; growth here
+    // happens when an async submission is still in flight and a second one
+    // is requested.
+    SingleTimeSlot slot;
+    slot.cmd = allocateCommandBuffer();
+    if (slot.cmd == VK_NULL_HANDLE) {
+        return -1;
+    }
+
+    VkFenceCreateInfo fenceInfo{};
+    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    fenceInfo.flags = 0; // Unsignaled — fence is signaled by the first submit.
+    if (vkCreateFence(m_backend->device(), &fenceInfo, nullptr, &slot.fence) != VK_SUCCESS) {
+        freeCommandBuffer(slot.cmd);
+        return -1;
+    }
+
+    m_singleTimeSlots.push_back(slot);
+    return static_cast<int>(m_singleTimeSlots.size() - 1);
+}
+
 VkCommandBuffer VulkanContext::beginSingleTimeCommands()
 {
-    VkCommandBuffer commandBuffer = allocateCommandBuffer();
-    if (commandBuffer == VK_NULL_HANDLE) {
+    const int idx = acquireFreeSingleTimeSlot();
+    if (idx < 0) {
         return VK_NULL_HANDLE;
+    }
+    SingleTimeSlot &slot = m_singleTimeSlots[idx];
+
+    // Assign the id eagerly so the slot is reserved between begin() and the
+    // matching submit / end. The slot only becomes free again when the GPU
+    // signals its fence post-submit.
+    slot.id = m_nextSubmitId++;
+    if (m_nextSubmitId == 0) {
+        m_nextSubmitId = 1; // wrap past the sentinel; practically unreachable
     }
 
     VkCommandBufferBeginInfo beginInfo{};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 
-    vkBeginCommandBuffer(commandBuffer, &beginInfo);
-
-    return commandBuffer;
+    if (vkBeginCommandBuffer(slot.cmd, &beginInfo) != VK_SUCCESS) {
+        // Roll the slot back to free without consuming the fence.
+        slot.id = 0;
+        return VK_NULL_HANDLE;
+    }
+    return slot.cmd;
 }
 
-void VulkanContext::endSingleTimeCommands(VkCommandBuffer commandBuffer)
+VulkanSubmitHandle VulkanContext::submitSingleTimeCommandsAsync(VkCommandBuffer commandBuffer)
 {
-    vkEndCommandBuffer(commandBuffer);
+    const int idx = findSingleTimeSlotByCmd(commandBuffer);
+    if (idx < 0) {
+        qCWarning(KWIN_VULKAN) << "submitSingleTimeCommandsAsync: unknown command buffer";
+        return VulkanSubmitHandle{};
+    }
+    SingleTimeSlot &slot = m_singleTimeSlots[idx];
+
+    if (vkEndCommandBuffer(slot.cmd) != VK_SUCCESS) {
+        // The command buffer is now in an invalid state; mark the slot free
+        // so it gets reset on next acquire (the fence is still unsignaled,
+        // so opportunistic reclaim won't touch it — force a reset here).
+        vkResetCommandBuffer(slot.cmd, 0);
+        slot.id = 0;
+        return VulkanSubmitHandle{};
+    }
 
     VkSubmitInfo submitInfo{};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &commandBuffer;
+    submitInfo.pCommandBuffers = &slot.cmd;
 
-    vkQueueSubmit(m_backend->graphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
-    vkQueueWaitIdle(m_backend->graphicsQueue());
+    const VkResult result = vkQueueSubmit(m_backend->graphicsQueue(), 1, &submitInfo, slot.fence);
+    if (result != VK_SUCCESS) {
+        qCWarning(KWIN_VULKAN) << "submitSingleTimeCommandsAsync: vkQueueSubmit failed:" << result;
+        // Fence was never signaled — force-reset the slot.
+        vkResetCommandBuffer(slot.cmd, 0);
+        slot.id = 0;
+        return VulkanSubmitHandle{};
+    }
 
-    freeCommandBuffer(commandBuffer);
+    return VulkanSubmitHandle{slot.id};
+}
+
+void VulkanContext::waitForSubmit(VulkanSubmitHandle handle)
+{
+    const int idx = findSingleTimeSlotById(handle.id);
+    if (idx < 0) {
+        // Either the submit failed (no slot) or already completed and was
+        // reclaimed by a prior cleanup pass — either way, nothing to wait on.
+        return;
+    }
+    VkFence fence = m_singleTimeSlots[idx].fence;
+    if (fence == VK_NULL_HANDLE) {
+        return;
+    }
+    vkWaitForFences(m_backend->device(), 1, &fence, VK_TRUE, UINT64_MAX);
+    // Opportunistically reclaim now that we know it's signaled; saves a
+    // round-trip through cleanupPendingResources for synchronous callers.
+    reclaimSignaledSingleTimeSlots();
+}
+
+VkFence VulkanContext::fenceFor(VulkanSubmitHandle handle) const
+{
+    const int idx = findSingleTimeSlotById(handle.id);
+    if (idx < 0) {
+        return VK_NULL_HANDLE;
+    }
+    return m_singleTimeSlots[idx].fence;
+}
+
+void VulkanContext::endSingleTimeCommands(VkCommandBuffer commandBuffer)
+{
+    // Compatibility shim: submit, then wait scoped to just this submission's
+    // fence — no more queue-wide vkQueueWaitIdle. Unmigrated callers retain
+    // the synchronous contract but stop blocking unrelated GPU work.
+    const VulkanSubmitHandle handle = submitSingleTimeCommandsAsync(commandBuffer);
+    if (handle.isValid()) {
+        waitForSubmit(handle);
+    }
 }
 
 VkDescriptorSet VulkanContext::allocateDescriptorSet(VkDescriptorSetLayout layout)
@@ -445,6 +608,11 @@ void VulkanContext::queueSamplerForDestruction(VkSampler sampler)
 void VulkanContext::cleanupPendingResources()
 {
     VkDevice device = m_backend->device();
+
+    // Reclaim async single-time submission slots whose fence has signaled.
+    // Done first so command buffers belonging to drained submissions become
+    // available again before any new work is recorded this frame.
+    reclaimSignaledSingleTimeSlots();
 
     // Clean up pending samplers
     if (!m_pendingSamplerDestructions.isEmpty()) {

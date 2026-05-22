@@ -17,6 +17,7 @@
 #include <QStack>
 #include <QVector>
 #include <memory>
+#include <vector>
 #include <vulkan/vulkan.h>
 
 struct VmaAllocator_T;
@@ -33,6 +34,25 @@ class VulkanFramebuffer;
 class VulkanPipelineManager;
 class VulkanTexture;
 struct DmaBufAttributes;
+
+/**
+ * @brief Opaque handle for a non-blocking single-time submission.
+ *
+ * Returned by VulkanContext::submitSingleTimeCommandsAsync(). A handle stays
+ * usable across frames: waitForSubmit() blocks until the GPU finishes the
+ * referenced submission; fenceFor() exposes the underlying fence while the
+ * submission is still in flight. Once the fence signals and the slot is
+ * recycled, both calls become no-ops — this is the expected steady-state
+ * for fire-and-forget submissions chained via semaphore to a later draw.
+ */
+struct VulkanSubmitHandle
+{
+    uint64_t id = 0;
+    bool isValid() const
+    {
+        return id != 0;
+    }
+};
 
 /**
  * @brief Manages Vulkan rendering context including command pools, descriptor pools, and pipelines.
@@ -110,13 +130,53 @@ public:
 
     /**
      * @brief Begin a single-time command buffer for immediate submission.
+     *
+     * Command buffers and fences are pooled per context — repeated
+     * begin/submit pairs recycle prior slots once their fence signals, so the
+     * hot path no longer allocates a fresh VkCommandBuffer per call.
      */
     VkCommandBuffer beginSingleTimeCommands();
 
     /**
-     * @brief End and submit a single-time command buffer.
+     * @brief End, submit, and block until completion (compatibility shim).
+     *
+     * Equivalent to submitSingleTimeCommandsAsync() + waitForSubmit() and
+     * preserves the historical synchronous contract callers relied on. The
+     * wait is fence-scoped to just this submission rather than draining the
+     * whole graphics queue (vkQueueWaitIdle), so even unmigrated callers see
+     * a strict improvement when other work is in flight.
      */
     void endSingleTimeCommands(VkCommandBuffer commandBuffer);
+
+    /**
+     * @brief Submit a single-time command buffer without waiting.
+     *
+     * The caller is responsible for ordering GPU consumers of any resources
+     * the submission writes — typically via a semaphore attached to the next
+     * submit, or by parking a waitForSubmit() at the actual point of need.
+     * The pool reclaims the command buffer + fence at frame-boundary cleanup
+     * once the fence signals; until then the handle stays referenceable.
+     *
+     * @return A handle for waitForSubmit() / fenceFor(); .isValid() is false
+     *         if the submit itself failed.
+     */
+    VulkanSubmitHandle submitSingleTimeCommandsAsync(VkCommandBuffer commandBuffer);
+
+    /**
+     * @brief Block until the submission identified by @p handle completes.
+     *
+     * No-op if the submission has already completed and been reclaimed —
+     * which is the normal steady state for fire-and-forget submits.
+     */
+    void waitForSubmit(VulkanSubmitHandle handle);
+
+    /**
+     * @brief Returns the VkFence backing an in-flight submission, or
+     *        VK_NULL_HANDLE if already reclaimed. Useful for chaining via
+     *        VkSubmitInfo::pWaitSemaphores's host-side equivalents or
+     *        vkWaitForFences with a custom timeout.
+     */
+    VkFence fenceFor(VulkanSubmitHandle handle) const;
 
     /**
      * @brief Read a region of a texture into a QImage (blocking).
@@ -257,6 +317,20 @@ private:
     bool createDescriptorPool();
     void cleanup();
 
+    // Pool entry for the single-time submission API. A slot is "free" when
+    // id == 0; assigned a unique id at begin(); cleared back to 0 once the
+    // GPU signals its fence and reclaimSignaledSingleTimeSlots() picks it up.
+    struct SingleTimeSlot
+    {
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        VkFence fence = VK_NULL_HANDLE;
+        uint64_t id = 0;
+    };
+    int findSingleTimeSlotById(uint64_t id) const;
+    int findSingleTimeSlotByCmd(VkCommandBuffer cmd) const;
+    int acquireFreeSingleTimeSlot();
+    void reclaimSignaledSingleTimeSlots();
+
     VulkanBackend *m_backend;
     VkCommandPool m_commandPool = VK_NULL_HANDLE;
     VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
@@ -315,6 +389,12 @@ private:
         VkImageLayout newLayout;
     };
     QVector<PendingDmaBufBarrier> m_pendingDmaBufBarriers;
+
+    // Fence-gated command buffer pool used by the single-time submission API.
+    // Slots are reused once their fence signals; size grows on contention and
+    // settles at a small steady-state (typically 1–2 in flight).
+    std::vector<SingleTimeSlot> m_singleTimeSlots;
+    uint64_t m_nextSubmitId = 1;
 
     static VulkanContext *s_currentContext;
 };
