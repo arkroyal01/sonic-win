@@ -146,9 +146,12 @@ public:
      * pixels. When VK_KHR_incremental_present is supported and @p damage is
      * non-empty it is passed as a VkPresentRegionsKHR hint; otherwise the whole
      * image is presented.
+     * @param presentId Non-zero tags the present for VK_EXT_present_timing so its
+     * real on-screen time can later be retrieved via vkGetPastPresentationTimingEXT.
+     * Ignored if 0 or the extension is unsupported.
      * @return True if presentation succeeded.
      */
-    bool present(const QRegion &damage = QRegion());
+    bool present(const QRegion &damage = QRegion(), uint64_t presentId = 0);
 
     /**
      * @brief Recreate the swapchain (e.g., after resize).

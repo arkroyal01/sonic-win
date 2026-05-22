@@ -232,6 +232,13 @@ void X11StandaloneVulkanBackend::init()
         return;
     }
 
+    // Decide the presentation-feedback path: VK_EXT_present_timing when the device
+    // and surface both support it (and it is not disabled), else the VsyncMonitor.
+    // Must run before initSwapchain() — the swapchain needs the timing create flag.
+    detectPresentTimingSupport();
+    qCWarning(KWIN_X11STANDALONE) << "Vulkan presentation feedback:"
+                                  << (m_presentTimingActive ? "VK_EXT_present_timing" : "VsyncMonitor");
+
     // Finally create the swapchain
     if (!initSwapchain()) {
         setFailed(QStringLiteral("Failed to initialize Vulkan swapchain"));
@@ -241,8 +248,12 @@ void X11StandaloneVulkanBackend::init()
     // Connect to workspace geometry changes for resize handling
     connect(workspace(), &Workspace::geometryChanged, this, &X11StandaloneVulkanBackend::screenGeometryChanged);
 
-    // Set up real presentation-timing feedback for the RenderLoop.
-    initVsyncMonitor();
+    // Real presentation-timing feedback for the RenderLoop. The VsyncMonitor is
+    // only the fallback — when VK_EXT_present_timing is active, present()/
+    // drainPresentTiming() report timestamps instead.
+    if (!m_presentTimingActive) {
+        initVsyncMonitor();
+    }
 
     qCDebug(KWIN_X11STANDALONE) << "Successfully initialized Vulkan backend";
 }
@@ -283,12 +294,247 @@ void X11StandaloneVulkanBackend::vblank(std::chrono::nanoseconds timestamp)
     }
 }
 
+// Depth of the swapchain's VK_EXT_present_timing result queue. The compositor
+// drains it every frame, so only a couple of entries are ever pending; this is
+// generous headroom and also bounds the drain scratch arrays.
+static constexpr uint32_t kPresentTimingQueueSize = 16;
+
+// If the timing anchor is more than this many presents old, the extrapolation
+// is no longer trustworthy and estimatePresentTime() falls back to "now".
+static constexpr uint64_t kPresentTimingMaxExtrapolation = 8;
+
+static std::chrono::nanoseconds monotonicNow()
+{
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch());
+}
+
+void X11StandaloneVulkanBackend::detectPresentTimingSupport()
+{
+    setPresentTimingEnabled(false);
+    m_presentTimingActive = false;
+
+    // Device-level support (extensions + features) was established in
+    // createDevice(); honour the env override and require surface support too.
+    const bool disabled = qEnvironmentVariableIsSet("KWIN_VULKAN_PRESENT_TIMING")
+        && qEnvironmentVariableIntValue("KWIN_VULKAN_PRESENT_TIMING") == 0;
+    if (!supportsPresentTiming() || disabled || m_surface == VK_NULL_HANDLE) {
+        return;
+    }
+
+    // VK_EXT_present_timing also requires the surface to support present timing
+    // and VK_KHR_present_id2 — query VkPresentTimingSurfaceCapabilitiesEXT and
+    // VkSurfaceCapabilitiesPresentId2KHR via vkGetPhysicalDeviceSurfaceCapabilities2KHR.
+    VkSurfaceCapabilitiesPresentId2KHR id2Caps{};
+    id2Caps.sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_PRESENT_ID_2_KHR;
+    VkPresentTimingSurfaceCapabilitiesEXT timingCaps{};
+    timingCaps.sType = VK_STRUCTURE_TYPE_PRESENT_TIMING_SURFACE_CAPABILITIES_EXT;
+    timingCaps.pNext = &id2Caps;
+    VkSurfaceCapabilities2KHR caps2{};
+    caps2.sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR;
+    caps2.pNext = &timingCaps;
+
+    VkPhysicalDeviceSurfaceInfo2KHR surfaceInfo{};
+    surfaceInfo.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR;
+    surfaceInfo.surface = m_surface;
+
+    const VkResult r = vkGetPhysicalDeviceSurfaceCapabilities2KHR(physicalDevice(), &surfaceInfo, &caps2);
+    qCWarning(KWIN_X11STANDALONE).nospace()
+        << "VK_EXT_present_timing surface check: result=" << int(r)
+        << " presentTimingSupported=" << bool(timingCaps.presentTimingSupported)
+        << " presentId2Supported=" << bool(id2Caps.presentId2Supported)
+        << " supportedStages=0x" << QString::number(timingCaps.presentStageQueries, 16);
+
+    if (r != VK_SUCCESS || !timingCaps.presentTimingSupported || !id2Caps.presentId2Supported) {
+        return;
+    }
+
+    // Request timing for the latest pipeline stage the surface supports — the one
+    // closest to "actually on screen". QUEUE_OPERATIONS_END is always supported.
+    VkPresentStageFlagsEXT stages = timingCaps.presentStageQueries
+        & (VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_VISIBLE_BIT_EXT
+           | VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT
+           | VK_PRESENT_STAGE_QUEUE_OPERATIONS_END_BIT_EXT);
+    if (stages == 0) {
+        stages = VK_PRESENT_STAGE_QUEUE_OPERATIONS_END_BIT_EXT;
+    }
+    setPresentTimingStages(stages);
+    setPresentTimingEnabled(true);
+    m_presentTimingActive = true;
+}
+
+void X11StandaloneVulkanBackend::setupPresentTimingQueue()
+{
+    if (!m_presentTimingActive || !m_swapchain || !m_swapchain->isValid()) {
+        return;
+    }
+    if (auto fn = setSwapchainPresentTimingQueueSizeEXT()) {
+        const VkResult r = fn(device(), m_swapchain->swapchain(), kPresentTimingQueueSize);
+        if (r != VK_SUCCESS) {
+            qCWarning(KWIN_X11STANDALONE) << "vkSetSwapchainPresentTimingQueueSizeEXT failed:" << r;
+        }
+    }
+
+    // Pick the time domain for VkPresentTimingInfoEXT.timeDomainId — prefer
+    // CLOCK_MONOTONIC, the clock RenderLoop (and steady_clock) uses.
+    setPresentTimeDomainId(0);
+    if (auto domainsFn = getSwapchainTimeDomainPropertiesEXT()) {
+        VkSwapchainTimeDomainPropertiesEXT props{};
+        props.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_TIME_DOMAIN_PROPERTIES_EXT;
+        if (domainsFn(device(), m_swapchain->swapchain(), &props, nullptr) == VK_SUCCESS
+            && props.timeDomainCount > 0) {
+            std::vector<VkTimeDomainKHR> domains(props.timeDomainCount);
+            std::vector<uint64_t> ids(props.timeDomainCount);
+            props.pTimeDomains = domains.data();
+            props.pTimeDomainIds = ids.data();
+            if (domainsFn(device(), m_swapchain->swapchain(), &props, nullptr) == VK_SUCCESS) {
+                uint64_t chosen = ids.front();
+                for (uint32_t i = 0; i < props.timeDomainCount; ++i) {
+                    if (domains[i] == VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR) {
+                        chosen = ids[i];
+                        break;
+                    }
+                }
+                setPresentTimeDomainId(chosen);
+            }
+        }
+    }
+}
+
+void X11StandaloneVulkanBackend::drainPresentTiming()
+{
+    if (!m_presentTimingActive || !m_swapchain) {
+        return;
+    }
+    auto fn = getPastPresentationTimingEXT();
+    if (!fn) {
+        return;
+    }
+
+    // Pre-size the doubly-nested result arrays: at most kPresentTimingQueueSize
+    // timings, each with at most the four defined present stages.
+    constexpr uint32_t kMaxStages = 4;
+    VkPresentStageTimeEXT stageStorage[kPresentTimingQueueSize][kMaxStages];
+    VkPastPresentationTimingEXT timings[kPresentTimingQueueSize];
+    for (uint32_t i = 0; i < kPresentTimingQueueSize; ++i) {
+        timings[i] = {};
+        timings[i].sType = VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_EXT;
+        timings[i].presentStageCount = kMaxStages;
+        timings[i].pPresentStages = stageStorage[i];
+    }
+
+    VkPastPresentationTimingPropertiesEXT props{};
+    props.sType = VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_PROPERTIES_EXT;
+    props.presentationTimingCount = kPresentTimingQueueSize;
+    props.pPresentationTimings = timings;
+
+    VkPastPresentationTimingInfoEXT info{};
+    info.sType = VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_INFO_EXT;
+    info.swapchain = m_swapchain->swapchain();
+
+    const VkResult r = fn(device(), &info, &props);
+
+    // Diagnostic dump of the raw vkGetPastPresentationTimingEXT output, enabled
+    // with KWIN_VULKAN_PRESENT_TIMING_DEBUG=1. Budget-limited so it does not
+    // spam indefinitely.
+    static int s_debugBudget = qEnvironmentVariableIsSet("KWIN_VULKAN_PRESENT_TIMING_DEBUG") ? 150 : 0;
+    if (s_debugBudget > 0) {
+        --s_debugBudget;
+        qCWarning(KWIN_X11STANDALONE).nospace()
+            << "present-timing drain: result=" << int(r)
+            << " count=" << props.presentationTimingCount
+            << " anchorId=" << static_cast<qulonglong>(m_lastTimedPresentId);
+        for (uint32_t i = 0; i < props.presentationTimingCount; ++i) {
+            const VkPastPresentationTimingEXT &t = timings[i];
+            QString stages;
+            for (uint32_t s = 0; s < t.presentStageCount; ++s) {
+                stages += QStringLiteral(" {stage=0x%1,time=%2}")
+                              .arg(t.pPresentStages[s].stage, 0, 16)
+                              .arg(static_cast<qulonglong>(t.pPresentStages[s].time));
+            }
+            qCWarning(KWIN_X11STANDALONE).nospace()
+                << "  timing id=" << static_cast<qulonglong>(t.presentId)
+                << " timeDomain=" << int(t.timeDomain)
+                << " stageCount=" << t.presentStageCount
+                << " reportComplete=" << bool(t.reportComplete)
+                << " stages:" << stages;
+        }
+    }
+
+    if (r != VK_SUCCESS && r != VK_INCOMPLETE) {
+        return;
+    }
+
+    // Pick the newest completed present that carries an on-screen
+    // (FIRST_PIXEL_VISIBLE) timestamp in a monotonic time domain.
+    uint64_t newestId = 0;
+    std::chrono::nanoseconds newestTime{};
+    for (uint32_t i = 0; i < props.presentationTimingCount; ++i) {
+        const VkPastPresentationTimingEXT &t = timings[i];
+        if (t.presentId <= m_lastTimedPresentId || t.presentId <= newestId) {
+            continue;
+        }
+        if (t.timeDomain != VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR
+            && t.timeDomain != VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_KHR) {
+            // A time domain we cannot relate to steady_clock — skip it.
+            continue;
+        }
+        for (uint32_t s = 0; s < t.presentStageCount; ++s) {
+            if (t.pPresentStages[s].stage & VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_VISIBLE_BIT_EXT) {
+                newestId = t.presentId;
+                newestTime = std::chrono::nanoseconds(static_cast<int64_t>(t.pPresentStages[s].time));
+            }
+        }
+    }
+    if (newestId == 0) {
+        return;
+    }
+
+    // Advance the anchor and update the running per-frame interval from the gap
+    // to the previous anchor (exponentially smoothed to ride out jitter).
+    if (m_lastTimedPresentId != 0) {
+        const std::chrono::nanoseconds delta = newestTime - m_lastTimedPresentTime;
+        const uint64_t frames = newestId - m_lastTimedPresentId;
+        if (frames > 0 && delta.count() > 0) {
+            const std::chrono::nanoseconds perFrame = delta / static_cast<int64_t>(frames);
+            m_presentInterval = m_presentInterval.count() == 0
+                ? perFrame
+                : (m_presentInterval * 7 + perFrame) / 8;
+        }
+    }
+    m_lastTimedPresentId = newestId;
+    m_lastTimedPresentTime = newestTime;
+
+    if (!m_loggedPresentTiming && m_presentInterval.count() > 0) {
+        m_loggedPresentTiming = true;
+        qCWarning(KWIN_X11STANDALONE) << "VK_EXT_present_timing delivering; measured present interval"
+                                      << (m_presentInterval.count() / 1000) << "us";
+    }
+}
+
+std::chrono::nanoseconds X11StandaloneVulkanBackend::estimatePresentTime(uint64_t presentId) const
+{
+    // Extrapolate from the last measured present: lastTime + N refresh intervals.
+    // Until two timing samples have anchored the interval — or if the anchor has
+    // gone stale because timing results stopped arriving — fall back to "now".
+    if (m_lastTimedPresentId != 0 && m_presentInterval.count() > 0
+        && presentId >= m_lastTimedPresentId
+        && presentId - m_lastTimedPresentId <= kPresentTimingMaxExtrapolation) {
+        return m_lastTimedPresentTime
+            + std::chrono::nanoseconds(m_presentInterval.count()
+                                       * static_cast<int64_t>(presentId - m_lastTimedPresentId));
+    }
+    return monotonicNow();
+}
+
 bool X11StandaloneVulkanBackend::initInstance()
 {
     // Required extensions for X11 surface
     QList<const char *> requiredExtensions = {
         VK_KHR_SURFACE_EXTENSION_NAME,
-        VK_KHR_XCB_SURFACE_EXTENSION_NAME};
+        VK_KHR_XCB_SURFACE_EXTENSION_NAME,
+        // Lets detectPresentTimingSupport() query VkPresentTimingSurfaceCapabilitiesEXT.
+        VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME};
 
     return createInstance(requiredExtensions);
 }
@@ -358,6 +604,7 @@ bool X11StandaloneVulkanBackend::initSwapchain()
 
     // Fresh swapchain images carry no usable previous contents.
     resetDamageTracking();
+    setupPresentTimingQueue();
 
     return true;
 }
@@ -405,24 +652,38 @@ bool X11StandaloneVulkanBackend::present(Output *output, const std::shared_ptr<O
         return false;
     }
 
+    // Tag the present for VK_EXT_present_timing feedback when that path is active.
+    uint64_t presentId = 0;
+    if (m_presentTimingActive) {
+        presentId = m_nextPresentId++;
+        // Drain completed timing results *before* presenting: it keeps the timing
+        // queue from filling up, and refreshes the anchor estimatePresentTime()
+        // extrapolates from.
+        drainPresentTiming();
+    }
+
     // Present the rendered frame to the swapchain, hinting the changed region
-    // (VK_KHR_incremental_present). Cleared afterwards so a present that is not
-    // preceded by a doEndFrame() (e.g. a failed beginFrame) falls back to a
-    // regionless full present.
-    bool presentSuccess = m_swapchain->present(m_presentDamage);
+    // (VK_KHR_incremental_present). m_presentDamage is cleared afterwards so a
+    // present not preceded by a doEndFrame() (e.g. a failed beginFrame) falls
+    // back to a regionless full present.
+    bool presentSuccess = m_swapchain->present(m_presentDamage, presentId);
     m_presentDamage = QRegion();
 
     if (presentSuccess) {
-        // The real present timestamp is reported asynchronously by the vsync
-        // monitor: arm it now, and vblank() forwards the timestamp to the
-        // OutputFrame. Without a monitor, fall back to an immediate (approximate)
-        // timestamp so the RenderLoop still gets feedback.
-        if (m_vsyncMonitor) {
+        if (m_presentTimingActive) {
+            // Report this frame *synchronously* with an extrapolated timestamp.
+            // Never deferring presented() to a later present() is what keeps
+            // RenderLoop from deadlocking.
+            if (m_frame) {
+                m_frame->presented(estimatePresentTime(presentId), PresentationMode::VSync);
+                m_frame.reset();
+            }
+        } else if (m_vsyncMonitor) {
+            // Real present timestamp arrives asynchronously via vblank().
             m_vsyncMonitor->arm();
         } else if (m_frame) {
-            m_frame->presented(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                   std::chrono::steady_clock::now().time_since_epoch()),
-                               PresentationMode::VSync);
+            // No feedback source — immediate approximate timestamp.
+            m_frame->presented(monotonicNow(), PresentationMode::VSync);
             m_frame.reset();
         }
     } else {
@@ -436,14 +697,17 @@ bool X11StandaloneVulkanBackend::present(Output *output, const std::shared_ptr<O
             } else {
                 // Recreated images start blank — drop stale age tracking.
                 resetDamageTracking();
+                // The new swapchain restarts timing; drop the stale anchor and
+                // re-arm the timing queue on it.
+                m_lastTimedPresentId = 0;
+                m_presentInterval = std::chrono::nanoseconds{};
+                setupPresentTimingQueue();
             }
         }
-        // No vblank will be reported for a failed present; mark the frame
+        // No timing will be reported for a failed present; mark the frame
         // presented immediately so the RenderLoop is not left waiting.
         if (m_frame) {
-            m_frame->presented(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                   std::chrono::steady_clock::now().time_since_epoch()),
-                               PresentationMode::VSync);
+            m_frame->presented(monotonicNow(), PresentationMode::VSync);
             m_frame.reset();
         }
     }

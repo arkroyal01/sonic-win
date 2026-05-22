@@ -139,6 +139,35 @@ private:
      */
     void vblank(std::chrono::nanoseconds timestamp);
 
+    /**
+     * @brief Determine whether VK_EXT_present_timing can be used: device support
+     * (set in createDevice), the env override, and — queried here — the surface
+     * supporting present timing and VK_KHR_present_id2. Sets presentTimingEnabled()
+     * and the present-stage mask. Must run after the surface exists and before
+     * the swapchain is created.
+     */
+    void detectPresentTimingSupport();
+
+    /**
+     * @brief (Re)size the swapchain's VK_EXT_present_timing result queue. Called
+     * after the swapchain is (re)created when present timing is active.
+     */
+    void setupPresentTimingQueue();
+
+    /**
+     * @brief Poll vkGetPastPresentationTimingEXT and advance the timing anchor
+     * (m_lastTimedPresentId / m_lastTimedPresentTime / m_presentInterval) that
+     * estimatePresentTime() extrapolates from.
+     */
+    void drainPresentTiming();
+
+    /**
+     * @brief Estimated on-screen time for present @p presentId: the most recent
+     * measured present time plus whole refresh intervals. Falls back to
+     * monotonicNow() until the anchor is established, or if it has gone stale.
+     */
+    std::chrono::nanoseconds estimatePresentTime(uint64_t presentId) const;
+
     std::unique_ptr<OverlayWindow> m_overlayWindow;
     xcb_window_t m_window = XCB_WINDOW_NONE;
     xcb_colormap_t m_colormap = XCB_COLORMAP_NONE;
@@ -157,8 +186,21 @@ private:
 
     // Reports real vblank timestamps; present() arms it and vblank() forwards the
     // timestamp to the in-flight OutputFrame. Hardware monitor where available,
-    // software (timer) fallback otherwise.
+    // software (timer) fallback otherwise. Used only when present timing is not.
     std::unique_ptr<VsyncMonitor> m_vsyncMonitor;
+
+    // VK_EXT_present_timing path. When active it replaces the VsyncMonitor.
+    // present() reports each frame *synchronously* — deferring presented() to a
+    // later present() would deadlock RenderLoop — using a timestamp extrapolated
+    // by estimatePresentTime() from the most recent present the extension
+    // reported a real on-screen time for. Disable with KWIN_VULKAN_PRESENT_TIMING=0.
+    bool m_presentTimingActive = false;
+    uint64_t m_nextPresentId = 1;
+    // Timing anchor, advanced by drainPresentTiming() from vkGetPastPresentationTimingEXT.
+    uint64_t m_lastTimedPresentId = 0;
+    std::chrono::nanoseconds m_lastTimedPresentTime{};
+    std::chrono::nanoseconds m_presentInterval{};
+    bool m_loggedPresentTiming = false;
 
     // --- Partial repaint / manual buffer-age tracking ---
     // Enabled via KWIN_VULKAN_PARTIAL_REPAINT=1.

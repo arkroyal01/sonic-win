@@ -141,6 +141,73 @@ public:
     }
 
     /**
+     * @brief Check if VK_EXT_present_timing (with VK_KHR_present_id) is enabled.
+     *
+     * When true, presents can be tagged with a presentId and their real on-screen
+     * timestamps retrieved via vkGetPastPresentationTimingEXT() — used to feed
+     * RenderLoop accurate per-frame presentation feedback.
+     */
+    bool supportsPresentTiming() const
+    {
+        return m_supportsPresentTiming;
+    }
+
+    /** @brief vkSetSwapchainPresentTimingQueueSizeEXT (valid iff supportsPresentTiming()). */
+    PFN_vkSetSwapchainPresentTimingQueueSizeEXT setSwapchainPresentTimingQueueSizeEXT() const
+    {
+        return m_vkSetSwapchainPresentTimingQueueSizeEXT;
+    }
+
+    /** @brief vkGetPastPresentationTimingEXT (valid iff supportsPresentTiming()). */
+    PFN_vkGetPastPresentationTimingEXT getPastPresentationTimingEXT() const
+    {
+        return m_vkGetPastPresentationTimingEXT;
+    }
+
+    /** @brief vkGetSwapchainTimeDomainPropertiesEXT (valid iff supportsPresentTiming()). */
+    PFN_vkGetSwapchainTimeDomainPropertiesEXT getSwapchainTimeDomainPropertiesEXT() const
+    {
+        return m_vkGetSwapchainTimeDomainPropertiesEXT;
+    }
+
+    /**
+     * @brief The time-domain id put in VkPresentTimingInfoEXT — chosen by the
+     * concrete backend from the swapchain's reported time domains.
+     */
+    uint64_t presentTimeDomainId() const
+    {
+        return m_presentTimeDomainId;
+    }
+    void setPresentTimeDomainId(uint64_t id)
+    {
+        m_presentTimeDomainId = id;
+    }
+
+    /**
+     * @brief Whether present timing is enabled for use — device support plus the
+     * surface actually supporting it, and not disabled via the env override. Set
+     * by the concrete backend once it has verified surface support.
+     */
+    bool presentTimingEnabled() const
+    {
+        return m_presentTimingEnabled;
+    }
+    void setPresentTimingEnabled(bool enabled)
+    {
+        m_presentTimingEnabled = enabled;
+    }
+
+    /** @brief Present stages (VkPresentStageFlagsEXT) to request timing for. */
+    VkPresentStageFlagsEXT presentTimingStages() const
+    {
+        return m_presentTimingStages;
+    }
+    void setPresentTimingStages(VkPresentStageFlagsEXT stages)
+    {
+        m_presentTimingStages = stages;
+    }
+
+    /**
      * @brief Get the vkGetFenceFdKHR function pointer (only valid if supportsExternalFenceFd() returns true)
      */
     PFN_vkGetFenceFdKHR vkGetFenceFdKHR() const
@@ -210,6 +277,15 @@ private:
 
     // VK_KHR_incremental_present support (changed-region hints in vkQueuePresentKHR)
     bool m_supportsIncrementalPresent = false;
+
+    // VK_EXT_present_timing support (real per-frame presentation timestamps)
+    bool m_supportsPresentTiming = false;
+    bool m_presentTimingEnabled = false;
+    VkPresentStageFlagsEXT m_presentTimingStages = 0;
+    uint64_t m_presentTimeDomainId = 0;
+    PFN_vkSetSwapchainPresentTimingQueueSizeEXT m_vkSetSwapchainPresentTimingQueueSizeEXT = nullptr;
+    PFN_vkGetPastPresentationTimingEXT m_vkGetPastPresentationTimingEXT = nullptr;
+    PFN_vkGetSwapchainTimeDomainPropertiesEXT m_vkGetSwapchainTimeDomainPropertiesEXT = nullptr;
 
     // QVulkanInstance wrapping m_instance; created lazily for native Qt Quick.
     std::unique_ptr<QVulkanInstance> m_qVulkanInstance;

@@ -318,6 +318,8 @@ bool VulkanBackend::createDevice(const QList<const char *> &requiredDeviceExtens
     bool hasExternalFenceFd = false;
     bool hasExternalFenceCapabilities = false;
     bool hasIncrementalPresent = false;
+    bool hasPresentTiming = false;
+    bool hasPresentId = false;
     for (const auto &ext : availableExtensions) {
         if (strcmp(ext.extensionName, VK_KHR_EXTERNAL_FENCE_FD_EXTENSION_NAME) == 0) {
             hasExternalFenceFd = true;
@@ -327,6 +329,12 @@ bool VulkanBackend::createDevice(const QList<const char *> &requiredDeviceExtens
         }
         if (strcmp(ext.extensionName, VK_KHR_INCREMENTAL_PRESENT_EXTENSION_NAME) == 0) {
             hasIncrementalPresent = true;
+        }
+        if (strcmp(ext.extensionName, VK_EXT_PRESENT_TIMING_EXTENSION_NAME) == 0) {
+            hasPresentTiming = true;
+        }
+        if (strcmp(ext.extensionName, VK_KHR_PRESENT_ID_2_EXTENSION_NAME) == 0) {
+            hasPresentId = true;
         }
     }
 
@@ -343,6 +351,37 @@ bool VulkanBackend::createDevice(const QList<const char *> &requiredDeviceExtens
         extensions.push_back(VK_KHR_INCREMENTAL_PRESENT_EXTENSION_NAME);
         m_supportsIncrementalPresent = true;
         qCDebug(KWIN_VULKAN) << "VK_KHR_incremental_present extension enabled";
+    }
+
+    // Enable VK_EXT_present_timing (+ its VK_KHR_present_id2 dependency) for real
+    // per-frame presentation feedback. Both have a device feature that must be
+    // queried and then enabled by chaining the feature structs into device
+    // creation. The structs are declared at function scope so they outlive
+    // vkCreateDevice below.
+    VkPhysicalDevicePresentTimingFeaturesEXT presentTimingFeatures{};
+    presentTimingFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_TIMING_FEATURES_EXT;
+    VkPhysicalDevicePresentId2FeaturesKHR presentIdFeatures{};
+    presentIdFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_2_FEATURES_KHR;
+    if (hasPresentTiming && hasPresentId) {
+        presentTimingFeatures.pNext = &presentIdFeatures;
+        VkPhysicalDeviceFeatures2 features2{};
+        features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        features2.pNext = &presentTimingFeatures;
+        vkGetPhysicalDeviceFeatures2(m_physicalDevice, &features2);
+
+        if (presentTimingFeatures.presentTiming && presentIdFeatures.presentId2) {
+            extensions.push_back(VK_EXT_PRESENT_TIMING_EXTENSION_NAME);
+            extensions.push_back(VK_KHR_PRESENT_ID_2_EXTENSION_NAME);
+            // Enable only what we use: presentTiming + presentId2. The optional
+            // target-time features stay off (no present scheduling yet).
+            presentTimingFeatures.presentAtAbsoluteTime = VK_FALSE;
+            presentTimingFeatures.presentAtRelativeTime = VK_FALSE;
+            presentIdFeatures.pNext = nullptr;
+            presentTimingFeatures.pNext = &presentIdFeatures;
+            createInfo.pNext = &presentTimingFeatures;
+            m_supportsPresentTiming = true;
+            qCDebug(KWIN_VULKAN) << "VK_EXT_present_timing extension enabled";
+        }
     }
 
     createInfo.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
@@ -372,6 +411,20 @@ bool VulkanBackend::createDevice(const QList<const char *> &requiredDeviceExtens
         if (!m_vkGetFenceFdKHR) {
             qCWarning(KWIN_VULKAN) << "Failed to load vkGetFenceFdKHR, disabling external fence support";
             m_supportsExternalFenceFd = false;
+        }
+    }
+
+    if (m_supportsPresentTiming) {
+        m_vkSetSwapchainPresentTimingQueueSizeEXT = reinterpret_cast<PFN_vkSetSwapchainPresentTimingQueueSizeEXT>(
+            vkGetDeviceProcAddr(m_device, "vkSetSwapchainPresentTimingQueueSizeEXT"));
+        m_vkGetPastPresentationTimingEXT = reinterpret_cast<PFN_vkGetPastPresentationTimingEXT>(
+            vkGetDeviceProcAddr(m_device, "vkGetPastPresentationTimingEXT"));
+        m_vkGetSwapchainTimeDomainPropertiesEXT = reinterpret_cast<PFN_vkGetSwapchainTimeDomainPropertiesEXT>(
+            vkGetDeviceProcAddr(m_device, "vkGetSwapchainTimeDomainPropertiesEXT"));
+        if (!m_vkSetSwapchainPresentTimingQueueSizeEXT || !m_vkGetPastPresentationTimingEXT
+            || !m_vkGetSwapchainTimeDomainPropertiesEXT) {
+            qCWarning(KWIN_VULKAN) << "Failed to load VK_EXT_present_timing functions, disabling present timing";
+            m_supportsPresentTiming = false;
         }
     }
 

@@ -290,6 +290,12 @@ bool VulkanSwapchain::createSwapchain(const QSize &size)
 
     VkSwapchainCreateInfoKHR createInfo{};
     createInfo.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
+    // Enable VK_EXT_present_timing on this swapchain so its timing queue can
+    // collect timestamps — a prerequisite for vkSetSwapchainPresentTimingQueueSizeEXT
+    // and vkGetPastPresentationTimingEXT to return anything.
+    if (m_context->backend()->presentTimingEnabled()) {
+        createInfo.flags |= VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT;
+    }
     createInfo.surface = m_surface;
     createInfo.minImageCount = imageCount;
     createInfo.imageFormat = surfaceFormat.format;
@@ -451,7 +457,7 @@ uint32_t VulkanSwapchain::acquireNextImage(uint64_t timeout)
     return m_currentImageIndex;
 }
 
-bool VulkanSwapchain::present(const QRegion &damage)
+bool VulkanSwapchain::present(const QRegion &damage, uint64_t presentId)
 {
     VkSemaphore signalSemaphores[] = {m_renderFinishedSemaphores[m_currentFrame]};
 
@@ -463,11 +469,14 @@ bool VulkanSwapchain::present(const QRegion &damage)
     presentInfo.pSwapchains = &m_swapchain;
     presentInfo.pImageIndices = &m_currentImageIndex;
 
+    // Optional pNext structs are appended to this chain below; each must outlive
+    // the vkQueuePresentKHR call.
+    const void **pNextTail = &presentInfo.pNext;
+
     // VK_KHR_incremental_present: tell the presentation engine which rectangles
     // changed relative to the previously presented image, so it can copy only
     // those. Skipped when the extension is unavailable or the damage is empty
     // (a regionless present always presents the whole image — the safe default).
-    // rectLayers must outlive the vkQueuePresentKHR call below.
     std::vector<VkRectLayerKHR> rectLayers;
     VkPresentRegionKHR presentRegion{};
     VkPresentRegionsKHR presentRegions{};
@@ -490,8 +499,32 @@ bool VulkanSwapchain::present(const QRegion &damage)
             presentRegions.sType = VK_STRUCTURE_TYPE_PRESENT_REGIONS_KHR;
             presentRegions.swapchainCount = 1;
             presentRegions.pRegions = &presentRegion;
-            presentInfo.pNext = &presentRegions;
+            *pNextTail = &presentRegions;
+            pNextTail = &presentRegions.pNext;
         }
+    }
+
+    // VK_EXT_present_timing: tag the present with a presentId (VK_KHR_present_id2)
+    // and request timing for the surface-supported present stages, so the frame's
+    // real on-screen timestamp can be retrieved via vkGetPastPresentationTimingEXT.
+    VkPresentId2KHR presentIdInfo{};
+    VkPresentTimingInfoEXT timingInfo{};
+    VkPresentTimingsInfoEXT timingsInfo{};
+    if (presentId != 0 && m_context->backend()->presentTimingEnabled()) {
+        presentIdInfo.sType = VK_STRUCTURE_TYPE_PRESENT_ID_2_KHR;
+        presentIdInfo.swapchainCount = 1;
+        presentIdInfo.pPresentIds = &presentId;
+        *pNextTail = &presentIdInfo;
+        pNextTail = &presentIdInfo.pNext;
+
+        timingInfo.sType = VK_STRUCTURE_TYPE_PRESENT_TIMING_INFO_EXT;
+        timingInfo.timeDomainId = m_context->backend()->presentTimeDomainId();
+        timingInfo.presentStageQueries = m_context->backend()->presentTimingStages();
+        timingsInfo.sType = VK_STRUCTURE_TYPE_PRESENT_TIMINGS_INFO_EXT;
+        timingsInfo.swapchainCount = 1;
+        timingsInfo.pTimingInfos = &timingInfo;
+        *pNextTail = &timingsInfo;
+        pNextTail = &timingsInfo.pNext;
     }
 
     VkResult result = vkQueuePresentKHR(m_context->backend()->graphicsQueue(), &presentInfo);
@@ -502,6 +535,11 @@ bool VulkanSwapchain::present(const QRegion &damage)
     } else if (result == VK_SUBOPTIMAL_KHR) {
         qCDebug(KWIN_VULKAN) << "Swapchain suboptimal after present, needs recreation";
         m_needsRecreation = true;
+    } else if (result == VK_ERROR_PRESENT_TIMING_QUEUE_FULL_EXT) {
+        // The VK_EXT_present_timing result queue is full — the backend drains it
+        // every frame so this is not expected. Not fatal: the frame was still
+        // presented, only its timing was not recorded. Do not recreate.
+        qCWarning(KWIN_VULKAN) << "Present-timing queue full; timing for this frame dropped";
     } else if (result != VK_SUCCESS) {
         qCWarning(KWIN_VULKAN) << "Failed to present swapchain image:" << result << "(" << getVulkanResultString(result) << ")";
         return false;
