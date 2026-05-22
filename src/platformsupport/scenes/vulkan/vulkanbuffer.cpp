@@ -68,6 +68,25 @@ bool VulkanAllocator::isInitialized()
     return s_initialized;
 }
 
+void VulkanAllocator::logStatistics(const char *tag)
+{
+    if (!s_initialized || s_allocator == VK_NULL_HANDLE) {
+        return;
+    }
+    VmaTotalStatistics stats{};
+    vmaCalculateStatistics(s_allocator, &stats);
+    const VmaStatistics &t = stats.total.statistics;
+    // Logged at warning level so it appears without tweaking logging rules; the
+    // KWIN_VULKAN_VMA_STATS env var is the opt-in.
+    qCWarning(KWIN_VULKAN,
+              "VMA stats [%s]: %u live allocations, %llu KiB used, %llu KiB reserved across %u blocks",
+              tag,
+              t.allocationCount,
+              static_cast<unsigned long long>(t.allocationBytes / 1024),
+              static_cast<unsigned long long>(t.blockBytes / 1024),
+              t.blockCount);
+}
+
 // VulkanBuffer implementation
 
 VulkanBuffer::VulkanBuffer(VulkanContext *context, VkBuffer buffer, VmaAllocation allocation,

@@ -267,6 +267,15 @@ public:
     static VmaAllocator allocator();
     static bool isInitialized();
 
+    /**
+     * @brief Log a one-line summary of current VMA memory usage.
+     *
+     * Reports the number of live allocations and the bytes allocated/reserved.
+     * Intended for leak diagnosis — call it periodically and watch whether the
+     * allocation count climbs. @p tag identifies the call site in the log.
+     */
+    static void logStatistics(const char *tag);
+
 private:
     static VmaAllocator s_allocator;
     static bool s_initialized;

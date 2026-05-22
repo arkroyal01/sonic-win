@@ -173,6 +173,14 @@ void ItemRendererVulkan::beginFrame(const RenderTarget &renderTarget, const Rend
     m_outputsInFlight++;
     m_frameNumber++;
 
+    // Periodic VMA memory dump for leak diagnosis. Flag-agnostic (independent of
+    // KWIN_VULKAN_PARTIAL_REPAINT) so usage can be compared between modes.
+    // Enable with KWIN_VULKAN_VMA_STATS=1.
+    static const bool s_vmaStats = qEnvironmentVariableIsSet("KWIN_VULKAN_VMA_STATS");
+    if (s_vmaStats && (m_frameNumber == 1 || m_frameNumber % 300 == 0)) {
+        VulkanAllocator::logStatistics("frame");
+    }
+
     // Reset vertex buffer offset for new frame - all items will upload vertices sequentially
     m_vertexBufferOffset = 0;
 
