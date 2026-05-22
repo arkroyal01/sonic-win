@@ -15,6 +15,10 @@
 
 #include <epoxy/gl.h>
 
+#if HAVE_VULKAN
+#include "platformsupport/scenes/vulkan/vulkancontext.h" // VulkanSubmitHandle
+#endif
+
 namespace KWin
 {
 class Window;
@@ -25,6 +29,7 @@ class WindowThumbnailSource;
 #if HAVE_VULKAN
 class VulkanRenderPass;
 class VulkanFramebuffer;
+class VulkanTexture;
 #endif
 class WindowThumbnailSource : public QObject
 {
@@ -45,6 +50,26 @@ public:
     Frame acquire();
     QImage acquireImage() const;
 
+#if HAVE_VULKAN
+    /**
+     * @brief A zero-copy reference to the most recently rendered Vulkan
+     *        thumbnail.
+     *
+     * The texture is owned by this source and lives until the next size
+     * change (or destruction). @c handle identifies the GPU submission that
+     * produced the current contents — consumers must wait on it before
+     * sampling, either via @c VulkanContext::waitForSubmit() or by chaining
+     * a semaphore. Replaces the old QImage readback+reupload round-trip.
+     */
+    struct VulkanFrame
+    {
+        VulkanTexture *texture = nullptr;
+        VulkanSubmitHandle handle;
+        QSize size;
+    };
+    VulkanFrame acquireVulkan() const;
+#endif
+
 Q_SIGNALS:
     void changed();
 
@@ -63,9 +88,16 @@ private:
     bool m_dirty = true;
 
 #if HAVE_VULKAN
-    QImage m_cachedImage; // legacy / fallback path; unused by the current Vulkan thumbnail flow
+    // Persistent offscreen target: render pass + framebuffer (which owns the
+    // color texture). Recreated only when the thumbnail size changes; sampled
+    // zero-copy by QtQuick via QSGVulkanTexture::fromNative.
     std::unique_ptr<VulkanRenderPass> m_vkRenderPass;
     std::unique_ptr<VulkanFramebuffer> m_vkOffscreenFbo;
+    // Identifies the most recent updateVulkan() submission. updatePaintNode()
+    // waits on this before letting QtQuick sample the texture, so the GPU's
+    // writes are visible. Stays usable across frames — a completed handle is
+    // a no-op wait.
+    VulkanSubmitHandle m_vkSubmitHandle;
     qreal m_vkLastDpr = 1.0;
 #endif
 };

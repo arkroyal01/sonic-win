@@ -149,6 +149,21 @@ public:
     VkCommandBuffer activeCommandBuffer(const RenderTarget &renderTarget) const;
 
     /**
+     * Returns the render pass currently being drawn into for @p renderTarget.
+     * Prefers the render pass of @c renderTarget.vulkanTarget()->framebuffer()
+     * (recursive offscreen flow), falling back to the swapchain framebuffer's
+     * render pass otherwise.
+     *
+     * Used to look up pipelines via the format-aware
+     * @c VulkanPipelineManager::pipeline(traits, renderPass) overload, so an
+     * offscreen consumer rendering into a non-swapchain format (e.g. RGBA for
+     * zero-copy QtQuick import) gets pipelines compiled against the matching
+     * render pass — never the swapchain's, which would violate Vulkan spec
+     * §8.2 render-pass compatibility.
+     */
+    VkRenderPass activeRenderPass(const RenderTarget &renderTarget) const;
+
+    /**
      * RAII scope that marks the enclosing block as "recording into a
      * recursive offscreen RenderTarget". Effects that invoke
      * @c effects->paintScreen() or @c effects->drawWindow() with their own
@@ -283,7 +298,7 @@ public:
 private:
     QVector4D modulate(float opacity, float brightness) const;
     void createRenderNode(Item *item, RenderContext *context);
-    void renderNodes(const RenderContext &context, VkCommandBuffer cmd);
+    void renderNodes(const RenderContext &context, VkCommandBuffer cmd, VkRenderPass renderPass);
 
     VulkanBackend *m_backend;
     VulkanContext *m_context;

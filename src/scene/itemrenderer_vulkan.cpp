@@ -91,6 +91,23 @@ VkCommandBuffer ItemRendererVulkan::activeCommandBuffer(const RenderTarget &rend
     return m_currentCommandBuffer;
 }
 
+VkRenderPass ItemRendererVulkan::activeRenderPass(const RenderTarget &renderTarget) const
+{
+    // Mirror activeCommandBuffer's routing so a recursive offscreen caller
+    // gets the render pass that matches its own framebuffer, not the
+    // swapchain's. Pipelines are looked up by (traits, renderPass) and a
+    // mismatch here would silently violate render-pass compatibility.
+    if (const auto *vt = renderTarget.vulkanTarget()) {
+        if (auto *fb = vt->framebuffer(); fb && fb->renderPass()) {
+            return fb->renderPass()->renderPass();
+        }
+    }
+    if (m_currentFramebuffer && m_currentFramebuffer->renderPass()) {
+        return m_currentFramebuffer->renderPass()->renderPass();
+    }
+    return VK_NULL_HANDLE;
+}
+
 ItemRendererVulkan::ItemRendererVulkan(VulkanBackend *backend)
     : m_backend(backend)
     , m_context(backend->vulkanContext())
@@ -1262,7 +1279,7 @@ void ItemRendererVulkan::createRenderNode(Item *item, RenderContext *context)
     }
 }
 
-void ItemRendererVulkan::renderNodes(const RenderContext &context, VkCommandBuffer cmd)
+void ItemRendererVulkan::renderNodes(const RenderContext &context, VkCommandBuffer cmd, VkRenderPass renderPass)
 {
     if (context.renderNodes.isEmpty()) {
         return;
@@ -1342,8 +1359,12 @@ void ItemRendererVulkan::renderNodes(const RenderContext &context, VkCommandBuff
             effectiveTraits |= VulkanShaderTrait::AdjustSaturation;
         }
 
-        // Get or create pipeline for this node's traits
-        VulkanPipeline *pipeline = pipelineManager->pipeline(effectiveTraits);
+        // Get or create pipeline for this node's traits, scoped to the
+        // currently-active render pass. The format-aware lookup keeps the
+        // swapchain's BGRA pipelines and an offscreen RGBA caller's pipelines
+        // in separate cache buckets, so a single render thread can interleave
+        // both without violating Vulkan §8.2 render-pass compatibility.
+        VulkanPipeline *pipeline = pipelineManager->pipeline(effectiveTraits, renderPass);
         if (!pipeline) {
             qCWarning(KWIN_CORE) << "Failed to get pipeline for traits:" << static_cast<int>(effectiveTraits);
             continue;
@@ -1533,8 +1554,12 @@ void ItemRendererVulkan::renderItem(const RenderTarget &renderTarget, const Rend
     // Build render nodes from item tree
     createRenderNode(item, &context);
 
-    // Render all nodes using the appropriate command buffer
-    renderNodes(context, cmd);
+    // Render all nodes using the appropriate command buffer and render pass.
+    // activeRenderPass() routes via the renderTarget's framebuffer when set,
+    // so offscreen consumers (window thumbnails, screenshot, ...) get
+    // pipelines compiled against their own render pass.
+    const VkRenderPass renderPass = activeRenderPass(renderTarget);
+    renderNodes(context, cmd, renderPass);
 }
 
 } // namespace KWin

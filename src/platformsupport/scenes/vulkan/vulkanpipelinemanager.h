@@ -33,16 +33,38 @@ public:
     ~VulkanPipelineManager();
 
     /**
-     * @brief Get or create a pipeline for the given traits.
+     * @brief Get or create a pipeline for the given traits, built against
+     *        the current default render pass.
      *
-     * Pipelines are cached and reused for the same trait combinations.
+     * Equivalent to pipeline(traits, defaultRenderPass()). The cache is
+     * keyed by (traits, renderPass), so consumers using a different render
+     * pass — e.g. an offscreen target whose color format does not match the
+     * swapchain — should call the two-argument overload directly to keep
+     * their pipelines isolated from the main scene's.
      */
     VulkanPipeline *pipeline(VulkanShaderTraits traits);
 
     /**
-     * @brief Set the render pass to use for pipeline creation.
+     * @brief Get or create a pipeline for (traits, renderPass).
      *
-     * Must be called before requesting pipelines.
+     * Pipelines are not interchangeable across render passes of different
+     * color formats (Vulkan spec §8.2 render-pass compatibility), so this
+     * overload is the canonical entry point for offscreen consumers that
+     * render into a non-swapchain format — most notably the zero-copy
+     * window-thumbnail path which targets RGBA so QtQuick can import the
+     * VkImage directly without an R/B swap.
+     */
+    VulkanPipeline *pipeline(VulkanShaderTraits traits, VkRenderPass renderPass);
+
+    /**
+     * @brief Set the default render pass used by the single-argument
+     *        pipeline(traits) overload.
+     *
+     * Changing the default render pass invalidates every cached pipeline,
+     * since most callers in the codebase request pipelines without naming
+     * a render pass and the previous defaults would no longer match.
+     * Render-pass-explicit consumers (the two-argument overload) are
+     * unaffected by this beyond a rebuild-on-next-use.
      */
     void setRenderPass(VkRenderPass renderPass);
 
@@ -93,7 +115,8 @@ private:
     VulkanContext *m_context;
     VkRenderPass m_renderPass = VK_NULL_HANDLE;
 
-    std::map<VulkanShaderTraits, std::unique_ptr<VulkanPipeline>> m_pipelines;
+    using PipelineKey = std::pair<VulkanShaderTraits, VkRenderPass>;
+    std::map<PipelineKey, std::unique_ptr<VulkanPipeline>> m_pipelines;
     QStack<VulkanPipeline *> m_pipelineStack;
 
     QByteArray m_vertexShaderSpirv;

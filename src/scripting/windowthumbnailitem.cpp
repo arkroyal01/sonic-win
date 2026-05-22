@@ -180,14 +180,26 @@ void WindowThumbnailSource::update()
 
 QImage WindowThumbnailSource::acquireImage() const
 {
-#if HAVE_VULKAN
-    return m_cachedImage;
-#else
+    // Returns a null image: the Vulkan thumbnail path is now zero-copy and
+    // never produces a CPU-side QImage. Kept only to satisfy the cross-
+    // backend WindowThumbnailItem call site; the Vulkan branch there uses
+    // acquireVulkan() instead.
     return QImage();
-#endif
 }
 
 #if HAVE_VULKAN
+WindowThumbnailSource::VulkanFrame WindowThumbnailSource::acquireVulkan() const
+{
+    if (!m_vkOffscreenFbo) {
+        return VulkanFrame{};
+    }
+    return VulkanFrame{
+        .texture = m_vkOffscreenFbo->colorTexture(),
+        .handle = m_vkSubmitHandle,
+        .size = m_vkOffscreenFbo->size(),
+    };
+}
+
 void WindowThumbnailSource::updateVulkan()
 {
     Q_ASSERT(m_view);
@@ -214,9 +226,14 @@ void WindowThumbnailSource::updateVulkan()
     const qreal devicePixelRatio = m_view->devicePixelRatio();
     const QSize textureSize = (geometry.toAlignedRect().size() * devicePixelRatio).expandedTo(QSize(1, 1));
 
-    const VkFormat fmt = ctx->backend()->colorFormat();
+    // RGBA_SRGB so QSGVulkanTexture::fromNative samples the channels in the
+    // order Qt's RHI expects (RGBA), avoiding the R/B swap that forced the
+    // old code through a CPU readback + reupload. The sRGB encoding matches
+    // the swapchain's typical BGRA_SRGB so blending math stays linear and
+    // the visual result is identical.
+    constexpr VkFormat kThumbnailFormat = VK_FORMAT_R8G8B8A8_SRGB;
     if (!m_vkRenderPass) {
-        m_vkRenderPass = VulkanRenderPass::createForOffscreen(ctx, fmt, /*withDepth=*/false);
+        m_vkRenderPass = VulkanRenderPass::createForOffscreen(ctx, kThumbnailFormat, /*withDepth=*/false);
         if (!m_vkRenderPass || !m_vkRenderPass->isValid()) {
             qCWarning(KWIN_SCRIPTING) << "VulkanThumbnail: failed to create offscreen render pass";
             m_vkRenderPass.reset();
@@ -224,14 +241,29 @@ void WindowThumbnailSource::updateVulkan()
         }
     }
     if (!m_vkOffscreenFbo || m_vkOffscreenFbo->size() != textureSize) {
-        m_vkOffscreenFbo = VulkanFramebuffer::createWithTexture(ctx, m_vkRenderPass.get(), textureSize, fmt);
+        // A size change retires the texture QtQuick has cached — the next
+        // updatePaintNode() will rebuild the QSGTexture against the new
+        // VkImage. The submit handle from any prior frame is invalidated
+        // here too; nothing references the old texture anymore.
+        m_vkOffscreenFbo = VulkanFramebuffer::createWithTexture(ctx, m_vkRenderPass.get(), textureSize, kThumbnailFormat);
         if (!m_vkOffscreenFbo || !m_vkOffscreenFbo->isValid()) {
             qCWarning(KWIN_SCRIPTING) << "VulkanThumbnail: failed to create offscreen framebuffer" << textureSize;
             m_vkOffscreenFbo.reset();
             return;
         }
+        m_vkSubmitHandle = VulkanSubmitHandle{};
     }
     m_vkLastDpr = devicePixelRatio;
+
+    // If a previous submit is still in flight, wait for it before recording
+    // a new one that will write the same texture. In steady state this is a
+    // no-op (the fence will already be signaled by the next time we get
+    // here), but it guarantees we never alias GPU writes to the texture
+    // QtQuick may also be sampling.
+    if (m_vkSubmitHandle.isValid()) {
+        ctx->waitForSubmit(m_vkSubmitHandle);
+        m_vkSubmitHandle = VulkanSubmitHandle{};
+    }
 
     VkCommandBuffer cmd = ctx->beginSingleTimeCommands();
     if (cmd == VK_NULL_HANDLE) {
@@ -260,9 +292,10 @@ void WindowThumbnailSource::updateVulkan()
     VkRect2D scissor{{0, 0}, {uint32_t(textureSize.width()), uint32_t(textureSize.height())}};
     vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-    // Save/restore vertex buffer offset: renderItem() advances the shared streaming
-    // buffer. beginSingleTimeCommands' vkQueueWaitIdle on end ensures the GPU has
-    // finished before the offset is reusable.
+    // Save/restore vertex buffer offset: renderItem() advances the shared
+    // streaming buffer. With async submission the wait above (or, in steady
+    // state, the previous submission's fence already signaling) ensures the
+    // GPU is done with the offset region before we reuse it.
     const size_t savedOffset = vkRenderer->vertexBufferOffset();
     vkRenderer->renderItem(offscreenRT, viewport, m_handle->windowItem(),
                            Scene::PAINT_WINDOW_TRANSFORMED, infiniteRegion(), WindowPaintData{});
@@ -270,24 +303,18 @@ void WindowThumbnailSource::updateVulkan()
 
     m_vkRenderPass->end(cmd);
 
-    // Transition the color attachment to SHADER_READ_ONLY_OPTIMAL so readTextureToImage
-    // can copy it out (it expects that as the starting layout).
+    // Transition the color attachment to SHADER_READ_ONLY_OPTIMAL so the
+    // QtQuick scene graph can sample the VkImage directly on its next draw.
     m_vkOffscreenFbo->colorTexture()->transitionLayout(cmd,
                                                        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                                                        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                                                        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
 
-    ctx->endSingleTimeCommands(cmd);
-
-    // Read back into a QImage. Going through QSGVulkanTexture::fromNative looked
-    // appealing for zero-copy, but Qt's fromNative wrapper has no format parameter
-    // and treats the bytes as RGBA — when our render target is BGRA_SRGB (matching
-    // the swapchain's pipelines), red and blue end up swapped on display. The
-    // readback path lets readTextureToImage tag the QImage as ARGB32 for BGRA, which
-    // createTextureFromImage then converts canonically.
-    m_cachedImage = ctx->readTextureToImage(m_vkOffscreenFbo->colorTexture());
-    m_cachedImage.setDevicePixelRatio(devicePixelRatio);
+    // Fire and forget: no vkQueueWaitIdle, no readback, no QImage. The
+    // returned handle is stored so updatePaintNode() can wait on it before
+    // the SG thread samples the texture.
+    m_vkSubmitHandle = ctx->submitSingleTimeCommandsAsync(cmd);
 
     m_dirty = false;
     Q_EMIT changed();
@@ -302,11 +329,29 @@ public:
     QSGTexture *texture() const override;
     void setTexture(const std::shared_ptr<GLTexture> &nativeTexture);
     void setTexture(QSGTexture *texture);
+#if HAVE_VULKAN
+    /**
+     * @brief Adopt a VulkanTexture's VkImage as the provider's QSGTexture
+     *        via QNativeInterface::QSGVulkanTexture::fromNative — zero-copy.
+     *
+     * The QSGTexture wrapper is cached and only rebuilt when @p image or
+     * @p size changes. The texture's content can update freely under the
+     * fixed VkImage handle (the renderer just re-renders into it), and the
+     * caller is responsible for synchronizing the GPU before sampling.
+     */
+    void setVulkanTexture(VkImage image, const QSize &size);
+#endif
 
 private:
     QQuickWindow *m_window;
     std::shared_ptr<GLTexture> m_nativeTexture;
     std::unique_ptr<QSGTexture> m_texture;
+#if HAVE_VULKAN
+    // Tracks the VkImage currently wrapped by m_texture so updates that
+    // reuse the same image don't churn QSGTexture allocations every frame.
+    VkImage m_vkImage = VK_NULL_HANDLE;
+    QSize m_vkSize;
+#endif
 };
 
 ThumbnailTextureProvider::ThumbnailTextureProvider(QQuickWindow *window)
@@ -339,9 +384,45 @@ void ThumbnailTextureProvider::setTexture(const std::shared_ptr<GLTexture> &nati
 void ThumbnailTextureProvider::setTexture(QSGTexture *texture)
 {
     m_nativeTexture = nullptr;
+#if HAVE_VULKAN
+    m_vkImage = VK_NULL_HANDLE;
+    m_vkSize = QSize();
+#endif
     m_texture.reset(texture);
     Q_EMIT textureChanged();
 }
+
+#if HAVE_VULKAN
+void ThumbnailTextureProvider::setVulkanTexture(VkImage image, const QSize &size)
+{
+    m_nativeTexture = nullptr;
+    if (image != m_vkImage || size != m_vkSize) {
+        // The texture content has been re-rendered into the same VkImage,
+        // but the QSGTexture wrapper itself only needs to be rebuilt when
+        // the underlying image or its size actually changes. Qt's RHI keeps
+        // sampling the live image content otherwise — the whole point of
+        // zero-copy import.
+        m_vkImage = image;
+        m_vkSize = size;
+        if (image != VK_NULL_HANDLE) {
+            m_texture.reset(QNativeInterface::QSGVulkanTexture::fromNative(
+                image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, m_window, size,
+                QQuickWindow::TextureHasAlphaChannel));
+            if (m_texture) {
+                m_texture->setFiltering(QSGTexture::Linear);
+                m_texture->setHorizontalWrapMode(QSGTexture::ClampToEdge);
+                m_texture->setVerticalWrapMode(QSGTexture::ClampToEdge);
+            }
+        } else {
+            m_texture.reset();
+        }
+    }
+    // textureChanged is still emitted unconditionally: even when the wrapper
+    // is reused, the texture *content* has changed (that is the whole reason
+    // updatePaintNode() was invoked) and downstream nodes must rebind.
+    Q_EMIT textureChanged();
+}
+#endif
 
 class ThumbnailTextureProviderCleanupJob : public QRunnable
 {
@@ -443,15 +524,30 @@ QSGNode *WindowThumbnailItem::updatePaintNode(QSGNode *oldNode, QQuickItem::Upda
 
 #if HAVE_VULKAN
         if (useVulkanThumbnails()) {
-            const QImage img = m_source->acquireImage();
-            if (img.isNull()) {
-                qCDebug(KWIN_SCRIPTING) << "VulkanThumbnail: updatePaintNode: image still null";
+            const auto frame = m_source->acquireVulkan();
+            if (!frame.texture) {
+                // First update hasn't run yet or rendering failed; reuse
+                // whatever node is already on screen.
                 return oldNode;
             }
+
+            // Wait on the most recent updateVulkan() submission before the
+            // SG thread reads its pixels. The wait is scoped to just that
+            // submission's fence; the main compositor thread is unaffected.
+            // In steady state the fence is already signaled (rendered N
+            // frames ago) so this is a no-op.
+            if (frame.handle.isValid()) {
+                if (auto *vkScene = dynamic_cast<WorkspaceSceneVulkan *>(Compositor::self()->scene())) {
+                    if (auto *ctx = vkScene->backend()->vulkanContext()) {
+                        ctx->waitForSubmit(frame.handle);
+                    }
+                }
+            }
+
             if (!m_provider) {
                 m_provider = new ThumbnailTextureProvider(window());
             }
-            m_provider->setTexture(window()->createTextureFromImage(img));
+            m_provider->setVulkanTexture(frame.texture->image(), frame.size);
         } else
 #endif
         {

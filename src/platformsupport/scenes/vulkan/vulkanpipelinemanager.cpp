@@ -141,7 +141,12 @@ void VulkanPipelineManager::setRenderPass(VkRenderPass renderPass)
 
 VulkanPipeline *VulkanPipelineManager::pipeline(VulkanShaderTraits traits)
 {
-    if (m_renderPass == VK_NULL_HANDLE) {
+    return pipeline(traits, m_renderPass);
+}
+
+VulkanPipeline *VulkanPipelineManager::pipeline(VulkanShaderTraits traits, VkRenderPass renderPass)
+{
+    if (renderPass == VK_NULL_HANDLE) {
         qCWarning(KWIN_VULKAN) << "Cannot get pipeline: render pass not set";
         return nullptr;
     }
@@ -151,14 +156,20 @@ VulkanPipeline *VulkanPipelineManager::pipeline(VulkanShaderTraits traits)
         return nullptr;
     }
 
-    // Check cache
-    auto it = m_pipelines.find(traits);
+    // Cache key is (traits, renderPass) because Vulkan graphics pipelines
+    // are bound to the render pass they were created against. Reusing a
+    // pipeline on a non-compatible pass (different color format / sample
+    // count / attachment layout) is undefined behavior — keying by both
+    // keeps offscreen consumers like the zero-copy thumbnail path safely
+    // isolated from the main swapchain pipelines.
+    const PipelineKey key{traits, renderPass};
+    auto it = m_pipelines.find(key);
     if (it != m_pipelines.end()) {
         return it->second.get();
     }
 
     // Create new pipeline
-    auto newPipeline = VulkanPipeline::create(m_context, m_renderPass, traits,
+    auto newPipeline = VulkanPipeline::create(m_context, renderPass, traits,
                                               m_vertexShaderSpirv, m_fragmentShaderSpirv);
     if (!newPipeline) {
         qCWarning(KWIN_VULKAN) << "Failed to create pipeline for traits:" << static_cast<int>(traits);
@@ -170,11 +181,11 @@ VulkanPipeline *VulkanPipelineManager::pipeline(VulkanShaderTraits traits)
         // Only try fallback if it's different from the requested traits
         if (fallbackTraits != traits) {
             qCDebug(KWIN_VULKAN) << "Trying fallback pipeline with traits:" << static_cast<int>(fallbackTraits);
-            auto fallbackPipeline = VulkanPipeline::create(m_context, m_renderPass, fallbackTraits,
+            auto fallbackPipeline = VulkanPipeline::create(m_context, renderPass, fallbackTraits,
                                                            m_vertexShaderSpirv, m_fragmentShaderSpirv);
             if (fallbackPipeline) {
                 VulkanPipeline *result = fallbackPipeline.get();
-                m_pipelines[traits] = std::move(fallbackPipeline);
+                m_pipelines[key] = std::move(fallbackPipeline);
                 qCDebug(KWIN_VULKAN) << "Created fallback Vulkan pipeline for traits:" << static_cast<int>(traits);
                 return result;
             }
@@ -183,7 +194,7 @@ VulkanPipeline *VulkanPipelineManager::pipeline(VulkanShaderTraits traits)
     }
 
     VulkanPipeline *result = newPipeline.get();
-    m_pipelines[traits] = std::move(newPipeline);
+    m_pipelines[key] = std::move(newPipeline);
 
     qCDebug(KWIN_VULKAN) << "Created Vulkan pipeline for traits:" << static_cast<int>(traits);
     return result;
