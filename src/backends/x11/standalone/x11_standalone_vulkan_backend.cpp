@@ -149,12 +149,12 @@ X11StandaloneVulkanBackend::X11StandaloneVulkanBackend(X11StandaloneBackend *bac
     m_overlayWindow = std::make_unique<OverlayWindowX11>(backend);
     m_layer = std::make_unique<VulkanLayer>(this);
 
-    // Damage-driven partial repaint is opt-in for now (KWIN_VULKAN_PARTIAL_REPAINT=1)
-    // so it can be A/B-tested against the full-repaint path.
-    m_partialRepaint = qEnvironmentVariableIntValue("KWIN_VULKAN_PARTIAL_REPAINT") != 0;
-    if (m_partialRepaint) {
-        qCInfo(KWIN_X11STANDALONE) << "Vulkan: damage-driven partial repaint enabled";
-    }
+    // Damage-driven partial repaint is on by default; KWIN_VULKAN_PARTIAL_REPAINT=0
+    // forces the full-repaint path.
+    m_partialRepaint = !(qEnvironmentVariableIsSet("KWIN_VULKAN_PARTIAL_REPAINT")
+                         && qEnvironmentVariableIntValue("KWIN_VULKAN_PARTIAL_REPAINT") == 0);
+    qCWarning(KWIN_X11STANDALONE) << "Vulkan: damage-driven partial repaint"
+                                  << (m_partialRepaint ? "enabled" : "disabled");
 
     // Note: We can't connect to workspace() here as it might not be available yet
     // This connection should be made after workspace is initialized
