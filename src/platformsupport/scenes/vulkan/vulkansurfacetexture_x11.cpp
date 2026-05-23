@@ -553,19 +553,23 @@ void VulkanSurfaceTextureX11::updateWithCpuUpload(const QRegion &region)
                                  VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                                  VK_PIPELINE_STAGE_TRANSFER_BIT);
 
-    // Copy buffer to image
+    // Copy only the damaged region from the staging buffer into the image.
+    // bufferOffset points at the damage rect's top-left in the full-sized
+    // staging buffer; bufferRowLength keeps the row stride at the texture's
+    // width so the copy walks down the rows correctly. The previous code
+    // re-copied the whole texture every damage event, which for a
+    // single-window damage rect of a few hundred pixels in a 1080p surface
+    // moved ~8 MB instead of the few KB that actually changed.
     VkBufferImageCopy copyRegion{};
-    copyRegion.bufferOffset = 0;
-    // bufferRowLength specifies the row stride in PIXELS (not bytes)
-    // We always write with full texture stride, so set this to full width
+    copyRegion.bufferOffset = (VkDeviceSize(y) * m_size.width() + x) * 4; // RGBA8 = 4 B/pixel
     copyRegion.bufferRowLength = static_cast<uint32_t>(m_size.width());
     copyRegion.bufferImageHeight = static_cast<uint32_t>(m_size.height());
     copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     copyRegion.imageSubresource.mipLevel = 0;
     copyRegion.imageSubresource.baseArrayLayer = 0;
     copyRegion.imageSubresource.layerCount = 1;
-    copyRegion.imageOffset = {0, 0, 0};
-    copyRegion.imageExtent = {static_cast<uint32_t>(m_size.width()), static_cast<uint32_t>(m_size.height()), 1};
+    copyRegion.imageOffset = {x, y, 0};
+    copyRegion.imageExtent = {static_cast<uint32_t>(width), static_cast<uint32_t>(height), 1};
 
     vkCmdCopyBufferToImage(cmd,
                            m_stagingBuffer->buffer(),
