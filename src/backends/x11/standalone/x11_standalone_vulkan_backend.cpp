@@ -521,8 +521,27 @@ void X11StandaloneVulkanBackend::drainPresentTiming()
         }
     }
     if (newestId == 0) {
+        // The drain produced data but we kept none of it (wrong domain, wrong
+        // stage, NotUsable PRESENT_STAGE_LOCAL, etc.). Empty drains don't
+        // count — only ones with data we should have used.
+        if (props.presentationTimingCount > 0) {
+            constexpr uint32_t kStaleDrainLogThreshold = 60;
+            if (++m_presentTimingStaleDrains == kStaleDrainLogThreshold
+                && !m_loggedPresentTimingStale) {
+                m_loggedPresentTimingStale = true;
+                qCWarning(KWIN_X11STANDALONE).nospace()
+                    << "VK_EXT_present_timing: anchor not advanced after "
+                    << m_presentTimingStaleDrains << " drains with data; "
+                    << "every timing was rejected (domain/stage filter or "
+                    << "PRESENT_STAGE_LOCAL_EXT calibration). "
+                    << "estimatePresentTime() will use monotonicNow().";
+            }
+        }
         return;
     }
+    // Anchor advanced — reset the watchdog so a later breakage can re-log.
+    m_presentTimingStaleDrains = 0;
+    m_loggedPresentTimingStale = false;
 
     // Advance the anchor and update the running per-frame interval from the gap
     // to the previous anchor (exponentially smoothed to ride out jitter).
@@ -737,6 +756,8 @@ bool X11StandaloneVulkanBackend::present(Output *output, const std::shared_ptr<O
                 m_lastTimedPresentId = 0;
                 m_presentInterval = std::chrono::nanoseconds{};
                 m_presentTimingLocalDomain = LocalDomainStatus::Unknown;
+                m_presentTimingStaleDrains = 0;
+                m_loggedPresentTimingStale = false;
                 setupPresentTimingQueue();
             }
         }

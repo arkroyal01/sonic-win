@@ -212,6 +212,14 @@ private:
                                              NotUsable };
     LocalDomainStatus m_presentTimingLocalDomain = LocalDomainStatus::Unknown;
 
+    // Watchdog: counts drains that returned data but where the consumer
+    // rejected every entry (so the anchor never advances). If this crosses a
+    // threshold the path is effectively a no-op and we log once — the next
+    // time we silently break this surfaces immediately instead of needing 150
+    // lines of KWIN_VULKAN_PRESENT_TIMING_DEBUG output to spot.
+    uint32_t m_presentTimingStaleDrains = 0;
+    bool m_loggedPresentTimingStale = false;
+
     // --- Partial repaint / manual buffer-age tracking ---
     // Enabled via KWIN_VULKAN_PARTIAL_REPAINT=1.
     bool m_partialRepaint = false;
