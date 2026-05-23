@@ -320,6 +320,7 @@ bool VulkanBackend::createDevice(const QList<const char *> &requiredDeviceExtens
     bool hasIncrementalPresent = false;
     bool hasPresentTiming = false;
     bool hasPresentId = false;
+    bool hasPresentWait2 = false;
     for (const auto &ext : availableExtensions) {
         if (strcmp(ext.extensionName, VK_KHR_EXTERNAL_FENCE_FD_EXTENSION_NAME) == 0) {
             hasExternalFenceFd = true;
@@ -335,6 +336,9 @@ bool VulkanBackend::createDevice(const QList<const char *> &requiredDeviceExtens
         }
         if (strcmp(ext.extensionName, VK_KHR_PRESENT_ID_2_EXTENSION_NAME) == 0) {
             hasPresentId = true;
+        }
+        if (strcmp(ext.extensionName, VK_KHR_PRESENT_WAIT_2_EXTENSION_NAME) == 0) {
+            hasPresentWait2 = true;
         }
     }
 
@@ -354,16 +358,22 @@ bool VulkanBackend::createDevice(const QList<const char *> &requiredDeviceExtens
     }
 
     // Enable VK_EXT_present_timing (+ its VK_KHR_present_id2 dependency) for real
-    // per-frame presentation feedback. Both have a device feature that must be
-    // queried and then enabled by chaining the feature structs into device
-    // creation. The structs are declared at function scope so they outlive
-    // vkCreateDevice below.
+    // per-frame presentation feedback, and VK_KHR_present_wait2 so the async
+    // monitor can block on a specific presentId without a busy poll. Each has
+    // a device feature that must be queried and then enabled by chaining the
+    // feature structs into device creation. The structs are declared at function
+    // scope so they outlive vkCreateDevice below.
     VkPhysicalDevicePresentTimingFeaturesEXT presentTimingFeatures{};
     presentTimingFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_TIMING_FEATURES_EXT;
     VkPhysicalDevicePresentId2FeaturesKHR presentIdFeatures{};
     presentIdFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_2_FEATURES_KHR;
+    VkPhysicalDevicePresentWait2FeaturesKHR presentWait2Features{};
+    presentWait2Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_2_FEATURES_KHR;
     if (hasPresentTiming && hasPresentId) {
         presentTimingFeatures.pNext = &presentIdFeatures;
+        if (hasPresentWait2) {
+            presentIdFeatures.pNext = &presentWait2Features;
+        }
         VkPhysicalDeviceFeatures2 features2{};
         features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
         features2.pNext = &presentTimingFeatures;
@@ -381,6 +391,17 @@ bool VulkanBackend::createDevice(const QList<const char *> &requiredDeviceExtens
             createInfo.pNext = &presentTimingFeatures;
             m_supportsPresentTiming = true;
             qCDebug(KWIN_VULKAN) << "VK_EXT_present_timing extension enabled";
+
+            // present_wait2 is optional: if available, chain it into the device
+            // create. The async monitor needs it; absence forces a fallback to
+            // VsyncMonitor.
+            if (hasPresentWait2 && presentWait2Features.presentWait2) {
+                extensions.push_back(VK_KHR_PRESENT_WAIT_2_EXTENSION_NAME);
+                presentIdFeatures.pNext = &presentWait2Features;
+                presentWait2Features.pNext = nullptr;
+                m_supportsPresentWait2 = true;
+                qCDebug(KWIN_VULKAN) << "VK_KHR_present_wait2 extension enabled";
+            }
         }
     }
 
@@ -425,6 +446,15 @@ bool VulkanBackend::createDevice(const QList<const char *> &requiredDeviceExtens
             || !m_vkGetSwapchainTimeDomainPropertiesEXT) {
             qCWarning(KWIN_VULKAN) << "Failed to load VK_EXT_present_timing functions, disabling present timing";
             m_supportsPresentTiming = false;
+        }
+    }
+
+    if (m_supportsPresentWait2) {
+        m_vkWaitForPresent2KHR = reinterpret_cast<PFN_vkWaitForPresent2KHR>(
+            vkGetDeviceProcAddr(m_device, "vkWaitForPresent2KHR"));
+        if (!m_vkWaitForPresent2KHR) {
+            qCWarning(KWIN_VULKAN) << "Failed to load vkWaitForPresent2KHR, disabling present wait";
+            m_supportsPresentWait2 = false;
         }
     }
 

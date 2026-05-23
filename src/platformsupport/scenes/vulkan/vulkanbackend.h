@@ -171,6 +171,24 @@ public:
     }
 
     /**
+     * @brief Whether VK_KHR_present_wait2 is enabled on the device.
+     *
+     * Required to wait synchronously on a specific presentId completing — the
+     * primitive the async presentation-timing monitor uses to deliver real
+     * past timestamps to RenderLoop without blocking the main thread.
+     */
+    bool supportsPresentWait2() const
+    {
+        return m_supportsPresentWait2;
+    }
+
+    /** @brief vkWaitForPresent2KHR (valid iff supportsPresentWait2()). */
+    PFN_vkWaitForPresent2KHR waitForPresent2KHR() const
+    {
+        return m_vkWaitForPresent2KHR;
+    }
+
+    /**
      * @brief The time-domain id put in VkPresentTimingInfoEXT — chosen by the
      * concrete backend from the swapchain's reported time domains.
      */
@@ -286,6 +304,11 @@ private:
     PFN_vkSetSwapchainPresentTimingQueueSizeEXT m_vkSetSwapchainPresentTimingQueueSizeEXT = nullptr;
     PFN_vkGetPastPresentationTimingEXT m_vkGetPastPresentationTimingEXT = nullptr;
     PFN_vkGetSwapchainTimeDomainPropertiesEXT m_vkGetSwapchainTimeDomainPropertiesEXT = nullptr;
+
+    // VK_KHR_present_wait2 — block on a specific presentId completing. Used by
+    // the async present-timing monitor running on its own worker thread.
+    bool m_supportsPresentWait2 = false;
+    PFN_vkWaitForPresent2KHR m_vkWaitForPresent2KHR = nullptr;
 
     // QVulkanInstance wrapping m_instance; created lazily for native Qt Quick.
     std::unique_ptr<QVulkanInstance> m_qVulkanInstance;
