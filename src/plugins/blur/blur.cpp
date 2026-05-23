@@ -1402,8 +1402,24 @@ void BlurEffect::blurVulkan(const RenderTarget &renderTarget, const RenderViewpo
 
     VkDevice device = m_vulkanCtx->backend()->device();
 
-    // Compute blur region in device pixels
+    // Compute blur region in device pixels. Mirror the GL path so the blur follows
+    // window transforms (e.g. slidingpopups translates the window while it animates;
+    // without this the blur snaps to the final geometry on frame one).
     QRegion blurShape = blurRegion(w).translated(w->pos().toPoint());
+    if (data.xScale() != 1 || data.yScale() != 1) {
+        QPoint pt = blurShape.boundingRect().topLeft();
+        QRegion scaledShape;
+        for (const QRect &r : blurShape) {
+            const QPointF topLeft(pt.x() + (r.x() - pt.x()) * data.xScale() + data.xTranslation(),
+                                  pt.y() + (r.y() - pt.y()) * data.yScale() + data.yTranslation());
+            const QPoint bottomRight(std::floor(topLeft.x() + r.width() * data.xScale()) - 1,
+                                     std::floor(topLeft.y() + r.height() * data.yScale()) - 1);
+            scaledShape += QRect(QPoint(std::floor(topLeft.x()), std::floor(topLeft.y())), bottomRight);
+        }
+        blurShape = scaledShape;
+    } else if (data.xTranslation() || data.yTranslation()) {
+        blurShape.translate(std::round(data.xTranslation()), std::round(data.yTranslation()));
+    }
     blurShape &= region;
     if (blurShape.isEmpty()) {
         return;
