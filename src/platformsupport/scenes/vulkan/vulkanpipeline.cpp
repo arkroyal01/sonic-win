@@ -97,6 +97,16 @@ bool VulkanPipeline::createDescriptorSetLayout()
     layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
     layoutInfo.pBindings = bindings.data();
+    // Push-descriptor flag: lets vkCmdPushDescriptorSetKHR encode this layout's
+    // descriptor writes inline into the command buffer, removing the per-draw
+    // vkAllocateDescriptorSets + vkUpdateDescriptorSets pair. All consumers of
+    // this layout go through VulkanContext::bindDescriptors(), which dispatches
+    // on supportsPushDescriptor() to match: layouts created with the flag are
+    // only ever used via push, never via pool allocation (spec forbids the
+    // latter — VUID-vkAllocateDescriptorSets-pSetLayouts-00308).
+    if (m_context->backend()->supportsPushDescriptor()) {
+        layoutInfo.flags |= VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+    }
 
     VkResult result = vkCreateDescriptorSetLayout(m_context->backend()->device(), &layoutInfo,
                                                   nullptr, &m_descriptorSetLayout);

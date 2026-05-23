@@ -559,10 +559,23 @@ bool VulkanContext::bindDescriptors(VkCommandBuffer cmd,
                                     uint32_t writeCount,
                                     VkWriteDescriptorSet *writes)
 {
-    // Pool path. A later commit will flip selected layouts to push descriptors
-    // and dispatch here based on the layout / supportsPushDescriptor() — until
-    // then this is a straight wrap of the old alloc/update/bind sequence so
-    // callsites can be migrated incrementally.
+    // Push path. Layouts created by VulkanPipeline carry
+    // VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR whenever the
+    // extension is enabled (see vulkanpipeline.cpp), so the descriptor writes
+    // are encoded inline in the command buffer — no pool allocation, no
+    // vkUpdateDescriptorSets, no per-draw set binding. dstSet in each write
+    // is ignored by the push entry point so we leave it as the caller left
+    // it (unset).
+    if (m_backend->supportsPushDescriptor()) {
+        if (auto fn = m_backend->cmdPushDescriptorSetKHR()) {
+            fn(cmd, bindPoint, pipelineLayout, setIndex, writeCount, writes);
+            return true;
+        }
+    }
+
+    // Pool fallback (extension unavailable). The layout in this branch must
+    // have been created *without* the push-descriptor flag — which it is
+    // when supportsPushDescriptor() is false, so the dispatch is consistent.
     VkDescriptorSet ds = allocateDescriptorSet(setLayout);
     if (ds == VK_NULL_HANDLE) {
         return false;
