@@ -93,6 +93,9 @@ target_sources(kwin PRIVATE
     # Surface textures
     vulkansurfacetexture.cpp
     vulkansurfacetexture_x11.cpp
+
+    # Async present-timing monitor (VK_KHR_present_wait2 + VK_EXT_present_timing)
+    vulkanpresenttimingmonitor.cpp
 )
 
 target_link_libraries(kwin PRIVATE
