@@ -567,19 +567,36 @@ void X11StandaloneVulkanBackend::drainPresentTiming()
     }
 }
 
-std::chrono::nanoseconds X11StandaloneVulkanBackend::estimatePresentTime(uint64_t presentId) const
+std::chrono::nanoseconds X11StandaloneVulkanBackend::estimatePresentTime(uint64_t presentId)
 {
     // Extrapolate from the last measured present: lastTime + N refresh intervals.
     // Until two timing samples have anchored the interval — or if the anchor has
     // gone stale because timing results stopped arriving — fall back to "now".
+    std::chrono::nanoseconds estimate;
     if (m_lastTimedPresentId != 0 && m_presentInterval.count() > 0
         && presentId >= m_lastTimedPresentId
         && presentId - m_lastTimedPresentId <= kPresentTimingMaxExtrapolation) {
-        return m_lastTimedPresentTime
+        estimate = m_lastTimedPresentTime
             + std::chrono::nanoseconds(m_presentInterval.count()
                                        * static_cast<int64_t>(presentId - m_lastTimedPresentId));
+    } else {
+        estimate = monotonicNow();
     }
-    return monotonicNow();
+
+    // Clamp: the extrapolation slightly overshoots reality every now and then
+    // (the smoothed interval is a prediction, not a measurement), and the
+    // staleness fallback to monotonicNow() lives on a different baseline than
+    // the extrapolated stream — either can land microseconds-to-millis behind
+    // the previous reported value. Letting that through trips RenderLoop's
+    // backwards-timestamp guard, which resets lastPresentationTimestamp to
+    // steady_clock::now() and disrupts the pageflip scheduler enough to feel
+    // like a framerate drop. A non-decreasing sequence here keeps RenderLoop
+    // consistent; the clamp plateau resolves as soon as a fresh anchor lands.
+    if (estimate < m_lastReportedPresentTime) {
+        estimate = m_lastReportedPresentTime;
+    }
+    m_lastReportedPresentTime = estimate;
+    return estimate;
 }
 
 bool X11StandaloneVulkanBackend::initInstance()

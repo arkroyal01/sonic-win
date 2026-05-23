@@ -165,8 +165,18 @@ private:
      * @brief Estimated on-screen time for present @p presentId: the most recent
      * measured present time plus whole refresh intervals. Falls back to
      * monotonicNow() until the anchor is established, or if it has gone stale.
+     *
+     * Clamped to be monotonically non-decreasing across calls — RenderLoop's
+     * notifyVblank() treats a backwards timestamp as a bug and resets its
+     * own lastPresentationTimestamp to steady_clock::now(), which disrupts
+     * scheduleRepaint's pageflip math and drops framerate. Both the
+     * smoothed-interval extrapolation and the monotonicNow() fallback can
+     * legitimately produce values slightly behind the previously reported
+     * timestamp when the compositor goes idle and the anchor staleness
+     * window expires; the clamp papers over that transition until a fresh
+     * anchor lands.
      */
-    std::chrono::nanoseconds estimatePresentTime(uint64_t presentId) const;
+    std::chrono::nanoseconds estimatePresentTime(uint64_t presentId);
 
     std::unique_ptr<OverlayWindow> m_overlayWindow;
     xcb_window_t m_window = XCB_WINDOW_NONE;
@@ -201,6 +211,12 @@ private:
     std::chrono::nanoseconds m_lastTimedPresentTime{};
     std::chrono::nanoseconds m_presentInterval{};
     bool m_loggedPresentTiming = false;
+
+    // Monotonic clamp for estimatePresentTime(). Tracks the largest timestamp
+    // we have already handed to OutputFrame::presented(). A subsequent
+    // estimate that would land before this value is clamped up to it so the
+    // sequence fed to RenderLoop::notifyVblank() stays non-decreasing.
+    std::chrono::nanoseconds m_lastReportedPresentTime{};
 
     // VK_TIME_DOMAIN_PRESENT_STAGE_LOCAL_EXT is implementation-defined; on
     // Mesa/X11 the values are CLOCK_MONOTONIC nanoseconds (sourced from the
