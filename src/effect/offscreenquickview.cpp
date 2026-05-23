@@ -71,6 +71,13 @@ public:
     // Layout the image is in when handed back to Qt for the next frame. Qt's RHI
     // accepts UNDEFINED for the very first frame, then SHADER_READ_ONLY_OPTIMAL.
     VkImageLayout m_vkLastLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    // Escape-hatch fallback (KWIN_FORCE_QT_GL_RHI=1 on Vulkan compositor):
+    // Qt rendered into a GL FBO, m_image was populated from it via the blit
+    // path, and we upload that into a VulkanTexture so the Vulkan compositor
+    // consumer (EffectsHandler::renderOffscreenQuickView's Vulkan branch)
+    // can still sample it. Refreshed only when m_image's cache key changes.
+    std::unique_ptr<VulkanTexture> m_vkUploadedFromImage;
+    qint64 m_vkUploadedCacheKey = 0;
 #endif
 
     std::optional<qreal> m_explicitDpr;
@@ -102,7 +109,16 @@ OffscreenQuickView::OffscreenQuickView(ExportMode exportMode, bool alpha)
     : d(new OffscreenQuickView::Private)
 {
 #if HAVE_VULKAN
-    const bool useVulkan = effects && effects->compositingType() == VulkanCompositing;
+    // KWIN_FORCE_QT_GL_RHI=1 routes Qt Quick onto the OpenGL RHI even when
+    // kwin's compositor is Vulkan — the escape hatch for bisecting Qt
+    // Vulkan-RHI regressions and for drivers where Qt's Vulkan backend is
+    // known broken. The flag is read once at process start to match the
+    // process-global nature of setGraphicsApi(). compositor_x11.cpp gates
+    // its own setGraphicsApi(OpenGL) on the same env var; both gates have
+    // to agree, since OffscreenQuickView is the first thing to actually
+    // create a QQuickWindow and Qt locks the API at that point.
+    static const bool s_forceQtGl = qEnvironmentVariableIsSet("KWIN_FORCE_QT_GL_RHI");
+    const bool useVulkan = effects && effects->compositingType() == VulkanCompositing && !s_forceQtGl;
 #else
     const bool useVulkan = false;
 #endif
@@ -704,7 +720,29 @@ QImage OffscreenQuickView::bufferAsImage() const
 #if HAVE_VULKAN
 VulkanTexture *OffscreenQuickView::vulkanTexture() const
 {
-    return d->m_vkColorTexture.get();
+    if (d->m_vkColorTexture) {
+        return d->m_vkColorTexture.get();
+    }
+    // Escape-hatch path: Qt rendered into a GL FBO and we have a CPU-side
+    // QImage of it. Lazily upload to a cached VulkanTexture so the
+    // consumer can sample without changing its code. Per-frame upload is
+    // expected on this path — it's only taken when KWIN_FORCE_QT_GL_RHI=1
+    // intentionally trades performance for a working escape from Qt's
+    // Vulkan RHI.
+    if (d->m_image.isNull()) {
+        return nullptr;
+    }
+    const qint64 currentKey = d->m_image.cacheKey();
+    if (!d->m_vkUploadedFromImage || d->m_vkUploadedCacheKey != currentKey) {
+        if (VulkanContext *ctx = VulkanContext::currentContext()) {
+            auto uploaded = VulkanTexture::upload(ctx, d->m_image);
+            if (uploaded && uploaded->isValid()) {
+                d->m_vkUploadedFromImage = std::move(uploaded);
+                d->m_vkUploadedCacheKey = currentKey;
+            }
+        }
+    }
+    return d->m_vkUploadedFromImage.get();
 }
 #endif
 
