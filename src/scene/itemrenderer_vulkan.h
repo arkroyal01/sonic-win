@@ -26,6 +26,7 @@
 #include <functional>
 #include <memory>
 #include <unordered_set>
+#include <vector>
 #include <vulkan/vulkan.h>
 
 namespace KWin
@@ -194,14 +195,32 @@ public:
     /**
      * Snapshot / restore the streaming-buffer write position.
      *
-     * Offscreen effects call effects->drawWindow() which flows through renderNodes()
-     * and advances m_vertexBufferOffset into the shared streaming buffer. Because
-     * endSingleTimeCommands() blocks (vkQueueWaitIdle) before returning, the GPU has
-     * finished using that buffer region, so the offset can be safely restored and the
-     * main frame can reuse it without a hazard.
+     * Effects that flow through renderNodes() outside the main beginFrame /
+     * endFrame cycle (e.g. screenshot, recursive paints) advance this offset
+     * into the shared streaming buffer. With Phase 0 in place, single-time
+     * submissions wait on a per-submission fence rather than draining the
+     * queue, so save/restore around such a call still works — the wait
+     * ensures the GPU is done with the offset region before the main frame
+     * reuses it. The newer pushOffscreenSlot() / popOffscreenSlot() pair
+     * avoids the wait entirely by writing into the dedicated offscreen slot.
      */
     size_t vertexBufferOffset() const { return m_vertexBufferOffset; }
     void setVertexBufferOffset(size_t offset) { m_vertexBufferOffset = offset; }
+
+    /**
+     * Switch the renderer to the dedicated offscreen streaming-buffer slot
+     * (@c kOffscreenSlot) and save the prior swapchain-slot state.
+     *
+     * Pair with @c popOffscreenSlot() to bracket an offscreen render that
+     * flows through @c renderItem() / @c drawWindow(). The offscreen slot's
+     * vertex/uniform writes never alias a swapchain frame's buffers, so the
+     * outer frame's GPU work can proceed concurrently — no need to wait on
+     * the offscreen submission's fence before letting the main frame reuse
+     * its own buffer region. Within a frame the offscreen slot accumulates
+     * across calls; it resets at the next @c beginFrame.
+     */
+    void pushOffscreenSlot();
+    void popOffscreenSlot();
 
     VulkanTexture *defaultWhiteTexture() const
     {
@@ -331,6 +350,23 @@ private:
     uint32_t m_currentFrameIndex = 0;
     // Per-draw uniform slot cursor, reset to 0 at the start of every frame.
     uint32_t m_uniformDrawIndex = 0;
+
+    // Accumulated cursors for the dedicated offscreen slot (kOffscreenSlot).
+    // Persist across pushOffscreenSlot() calls within a single frame so
+    // multiple async offscreen renders can pack into the same slot's
+    // streaming and uniform buffers without overwriting each other. Both
+    // reset at beginFrame().
+    size_t m_offscreenVertexOffset = 0;
+    uint32_t m_offscreenUniformDrawIndex = 0;
+
+    // Save/restore stack for pushOffscreenSlot()/popOffscreenSlot().
+    struct OffscreenSlotSave
+    {
+        uint32_t frameIndex;
+        size_t vertexOffset;
+        uint32_t uniformDrawIndex;
+    };
+    std::vector<OffscreenSlotSave> m_offscreenSlotStack;
 
     // --- Partial repaint state (per frame) ---
     // True when this frame only repaints a damage sub-region of a swapchain

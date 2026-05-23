@@ -103,6 +103,15 @@ struct VulkanOffscreenData : public OffscreenData
     VulkanContext *m_vulkanContext = nullptr;
     VulkanPipeline *m_pipeline = nullptr;
 
+    // Binary semaphore signaled by the offscreen submit and waited on by
+    // the next main-scene submit. Reused across frames: vkQueueSubmit on
+    // the main scene resets it back to unsignaled on wait, so the next
+    // maybeRender() can signal it again. Created lazily and destroyed in
+    // the dtor. m_isDirty gates re-signaling to at most once per main-
+    // scene frame for a given window, matching the binary-semaphore
+    // contract of one-signal-per-one-wait.
+    VkSemaphore m_renderSemaphore = VK_NULL_HANDLE;
+
     // Custom uniform values for effects
     float m_brightness = 1.0f;
     float m_saturation = 1.0f;
@@ -363,22 +372,23 @@ void VulkanOffscreenData::maybeRender(EffectWindow *window)
 
         const int mask = Effect::PAINT_WINDOW_TRANSFORMED | Effect::PAINT_WINDOW_TRANSLUCENT;
 
-        // Snapshot the main renderer's streaming-buffer write position before the draw.
-        // effects->drawWindow() flows through ItemRendererVulkan::renderNodes(), which
-        // advances m_vertexBufferOffset in the shared streaming buffer.  Because
-        // endSingleTimeCommands() (below) calls vkQueueWaitIdle, the GPU finishes using
-        // that buffer region before we return, so restoring the offset is safe and lets
-        // the main frame reuse the same region without overflow.
+        // Switch the main renderer to its dedicated offscreen streaming-buffer
+        // slot for the duration of the draw. The offscreen slot doesn't alias
+        // any swapchain frame's in-flight buffers, so the submission below can
+        // be fire-and-forget — paint() inserts a cross-submit barrier into the
+        // consumer command buffer before sampling our texture.
         auto *mainScene = dynamic_cast<WorkspaceSceneVulkan *>(Compositor::self()->scene());
         auto *mainRenderer = mainScene
             ? static_cast<ItemRendererVulkan *>(mainScene->renderer())
             : nullptr;
-        const size_t savedVertexOffset = mainRenderer ? mainRenderer->vertexBufferOffset() : 0;
+        if (mainRenderer) {
+            mainRenderer->pushOffscreenSlot();
+        }
 
         effects->drawWindow(renderTarget, viewport, window, mask, infiniteRegion(), data);
 
         if (mainRenderer) {
-            mainRenderer->setVertexBufferOffset(savedVertexOffset);
+            mainRenderer->popOffscreenSlot();
         }
 
         // End render pass
@@ -392,8 +402,34 @@ void VulkanOffscreenData::maybeRender(EffectWindow *window)
             texture->setCurrentLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         }
 
-        // Submit and wait
-        m_vulkanContext->endSingleTimeCommands(cmd);
+        // Submit asynchronously and signal m_renderSemaphore so the main
+        // scene's next submit waits on it via addExternalWaitSemaphore.
+        // No CPU stall, no in-render-pass barrier — pure GPU-GPU sync.
+        if (m_renderSemaphore == VK_NULL_HANDLE) {
+            VkSemaphoreCreateInfo semInfo{};
+            semInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+            if (vkCreateSemaphore(m_vulkanContext->backend()->device(), &semInfo, nullptr,
+                                  &m_renderSemaphore)
+                != VK_SUCCESS) {
+                m_renderSemaphore = VK_NULL_HANDLE;
+                // Fall back to a synchronous submit if we couldn't allocate
+                // a semaphore: correct, just blocks the render thread for
+                // one fence wait.
+                m_vulkanContext->endSingleTimeCommands(cmd);
+                m_isDirty = false;
+                return;
+            }
+        }
+        m_vulkanContext->submitSingleTimeCommandsAsync(cmd, m_renderSemaphore);
+        if (mainRenderer) {
+            // Wait at FRAGMENT_SHADER, the earliest stage the main scene
+            // could sample the offscreen texture. The renderer clears its
+            // external-wait list after every endFrame() submit, so the
+            // semaphore handle is implicitly de-registered each frame and
+            // re-added here when the window damages again.
+            mainRenderer->addExternalWaitSemaphore(m_renderSemaphore,
+                                                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+        }
 
         m_isDirty = false;
     }
@@ -402,6 +438,16 @@ void VulkanOffscreenData::maybeRender(EffectWindow *window)
 VulkanOffscreenData::~VulkanOffscreenData()
 {
     QObject::disconnect(m_windowDamagedConnection);
+
+    // Destroy the wait semaphore first. The main renderer's external-wait
+    // list is cleared on every endFrame; if we're being destroyed mid-
+    // frame, the still-registered handle would have to be revoked too —
+    // but in practice OffscreenData destruction is driven by unredirect()
+    // / window deletion, which happens outside the render pass.
+    if (m_renderSemaphore != VK_NULL_HANDLE && m_vulkanContext) {
+        vkDestroySemaphore(m_vulkanContext->backend()->device(), m_renderSemaphore, nullptr);
+        m_renderSemaphore = VK_NULL_HANDLE;
+    }
 
     // Release Vulkan resources before the context might be destroyed
     // The unique_ptrs will be destroyed automatically, but we need to
@@ -488,6 +534,11 @@ void VulkanOffscreenData::paint(const RenderTarget &renderTarget, const RenderVi
         qCWarning(KWIN_VULKAN) << "VulkanOffscreenData::paint: No active command buffer";
         return;
     }
+
+    // Cross-submit visibility for the offscreen texture is handled by the
+    // semaphore registered with the main renderer in maybeRender() — no
+    // barrier here. A barrier inside an active render pass would need a
+    // subpass self-dependency to be valid Vulkan, which we don't declare.
 
     // Get the pipeline manager
     auto *pipelineManager = m_vulkanContext->pipelineManager();

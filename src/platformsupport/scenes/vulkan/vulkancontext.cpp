@@ -432,6 +432,11 @@ VkCommandBuffer VulkanContext::beginSingleTimeCommands()
 
 VulkanSubmitHandle VulkanContext::submitSingleTimeCommandsAsync(VkCommandBuffer commandBuffer)
 {
+    return submitSingleTimeCommandsAsync(commandBuffer, VK_NULL_HANDLE);
+}
+
+VulkanSubmitHandle VulkanContext::submitSingleTimeCommandsAsync(VkCommandBuffer commandBuffer, VkSemaphore signalSemaphore)
+{
     const int idx = findSingleTimeSlotByCmd(commandBuffer);
     if (idx < 0) {
         qCWarning(KWIN_VULKAN) << "submitSingleTimeCommandsAsync: unknown command buffer";
@@ -452,6 +457,10 @@ VulkanSubmitHandle VulkanContext::submitSingleTimeCommandsAsync(VkCommandBuffer 
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &slot.cmd;
+    if (signalSemaphore != VK_NULL_HANDLE) {
+        submitInfo.signalSemaphoreCount = 1;
+        submitInfo.pSignalSemaphores = &signalSemaphore;
+    }
 
     const VkResult result = vkQueueSubmit(m_backend->graphicsQueue(), 1, &submitInfo, slot.fence);
     if (result != VK_SUCCESS) {

@@ -163,6 +163,19 @@ public:
     VulkanSubmitHandle submitSingleTimeCommandsAsync(VkCommandBuffer commandBuffer);
 
     /**
+     * @brief Variant of submitSingleTimeCommandsAsync that also signals
+     *        @p signalSemaphore when the GPU finishes this submission.
+     *
+     * The semaphore must be a binary semaphore in the unsignaled state. The
+     * caller is responsible for its lifetime and for ensuring exactly one
+     * consumer waits on it before it's reused. Typical use: an offscreen
+     * effect's render submit signals its texture-ready semaphore, then the
+     * main scene's submit waits on it via @c addExternalWaitSemaphore — no
+     * CPU stall, no barrier inside the render pass.
+     */
+    VulkanSubmitHandle submitSingleTimeCommandsAsync(VkCommandBuffer commandBuffer, VkSemaphore signalSemaphore);
+
+    /**
      * @brief Block until the submission identified by @p handle completes.
      *
      * No-op if the submission has already completed and been reclaimed —

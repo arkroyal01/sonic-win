@@ -91,6 +91,34 @@ VkCommandBuffer ItemRendererVulkan::activeCommandBuffer(const RenderTarget &rend
     return m_currentCommandBuffer;
 }
 
+void ItemRendererVulkan::pushOffscreenSlot()
+{
+    m_offscreenSlotStack.push_back({m_currentFrameIndex, m_vertexBufferOffset, m_uniformDrawIndex});
+    m_currentFrameIndex = kOffscreenSlot;
+    // Resume where the last offscreen render in this frame left off, so
+    // independent async offscreen submissions pack into the same slot
+    // without aliasing each other's still-in-flight vertex/uniform data.
+    m_vertexBufferOffset = m_offscreenVertexOffset;
+    m_uniformDrawIndex = m_offscreenUniformDrawIndex;
+}
+
+void ItemRendererVulkan::popOffscreenSlot()
+{
+    Q_ASSERT(!m_offscreenSlotStack.empty());
+    if (m_offscreenSlotStack.empty()) {
+        return;
+    }
+    // Persist the offscreen-slot cursors so a subsequent pushOffscreenSlot
+    // in the same frame appends instead of overwriting.
+    m_offscreenVertexOffset = m_vertexBufferOffset;
+    m_offscreenUniformDrawIndex = m_uniformDrawIndex;
+    const auto save = m_offscreenSlotStack.back();
+    m_offscreenSlotStack.pop_back();
+    m_currentFrameIndex = save.frameIndex;
+    m_vertexBufferOffset = save.vertexOffset;
+    m_uniformDrawIndex = save.uniformDrawIndex;
+}
+
 VkRenderPass ItemRendererVulkan::activeRenderPass(const RenderTarget &renderTarget) const
 {
     // Mirror activeCommandBuffer's routing so a recursive offscreen caller
@@ -200,6 +228,12 @@ void ItemRendererVulkan::beginFrame(const RenderTarget &renderTarget, const Rend
 
     // Reset vertex buffer offset for new frame - all items will upload vertices sequentially
     m_vertexBufferOffset = 0;
+    // Same for the offscreen slot's accumulating cursors: independent of the
+    // swapchain frame's offset, they only need to last across the offscreen
+    // submissions a single frame may queue up before being recycled.
+    m_offscreenVertexOffset = 0;
+    m_offscreenUniformDrawIndex = 0;
+    m_offscreenSlotStack.clear();
 
     // Clear descriptor sets from previous frame (should be empty after endFrame cleanup)
     m_frameDescriptorSets.clear();
