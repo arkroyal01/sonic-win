@@ -245,6 +245,38 @@ static const uint32_t s_blurUpsampleSpv[] = {
     0x00000007, 0x00000096, 0x00000090, 0x0000009a, 0x0003003e, 0x00000092,
     0x00000096, 0x000100fd, 0x00010038,
 };
+
+// Composite fragment shader: samples the blurred result; the pipeline applies
+// constant-alpha blending so it cross-fades with the swapchain underneath
+// (matches the GL contrast pass).
+//
+// #version 450
+// layout(set = 0, binding = 0) uniform sampler2D blurTex;
+// layout(location = 0) in vec2 uv;
+// layout(location = 0) out vec4 fragColor;
+// void main() { fragColor = texture(blurTex, uv); }
+static const uint32_t s_blurCompositeSpv[] = {
+    0x07230203, 0x00010000, 0x000d000b, 0x00000014, 0x00000000, 0x00020011,
+    0x00000001, 0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e,
+    0x00000000, 0x0003000e, 0x00000000, 0x00000001, 0x0007000f, 0x00000004,
+    0x00000004, 0x6e69616d, 0x00000000, 0x00000009, 0x00000011, 0x00030010,
+    0x00000004, 0x00000007, 0x00040047, 0x00000009, 0x0000001e, 0x00000000,
+    0x00040047, 0x0000000d, 0x00000021, 0x00000000, 0x00040047, 0x0000000d,
+    0x00000022, 0x00000000, 0x00040047, 0x00000011, 0x0000001e, 0x00000000,
+    0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00030016,
+    0x00000006, 0x00000020, 0x00040017, 0x00000007, 0x00000006, 0x00000004,
+    0x00040020, 0x00000008, 0x00000003, 0x00000007, 0x0004003b, 0x00000008,
+    0x00000009, 0x00000003, 0x00090019, 0x0000000a, 0x00000006, 0x00000001,
+    0x00000000, 0x00000000, 0x00000000, 0x00000001, 0x00000000, 0x0003001b,
+    0x0000000b, 0x0000000a, 0x00040020, 0x0000000c, 0x00000000, 0x0000000b,
+    0x0004003b, 0x0000000c, 0x0000000d, 0x00000000, 0x00040017, 0x0000000f,
+    0x00000006, 0x00000002, 0x00040020, 0x00000010, 0x00000001, 0x0000000f,
+    0x0004003b, 0x00000010, 0x00000011, 0x00000001, 0x00050036, 0x00000002,
+    0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x0004003d,
+    0x0000000b, 0x0000000e, 0x0000000d, 0x0004003d, 0x0000000f, 0x00000012,
+    0x00000011, 0x00050057, 0x00000007, 0x00000013, 0x0000000e, 0x00000012,
+    0x0003003e, 0x00000009, 0x00000013, 0x000100fd, 0x00010038,
+};
 // clang-format on
 #endif // HAVE_VULKAN
 
@@ -379,6 +411,8 @@ BlurEffect::~BlurEffect()
             vkDestroyPipeline(dev, m_vulkanDownsamplePipeline, nullptr);
         if (m_vulkanUpsamplePipeline != VK_NULL_HANDLE)
             vkDestroyPipeline(dev, m_vulkanUpsamplePipeline, nullptr);
+        if (m_vulkanCompositePipeline != VK_NULL_HANDLE)
+            vkDestroyPipeline(dev, m_vulkanCompositePipeline, nullptr);
         if (m_vulkanBlurPipelineLayout != VK_NULL_HANDLE)
             vkDestroyPipelineLayout(dev, m_vulkanBlurPipelineLayout, nullptr);
         if (m_vulkanBlurDsLayout != VK_NULL_HANDLE)
@@ -386,6 +420,8 @@ BlurEffect::~BlurEffect()
         if (m_vulkanBlurSampler != VK_NULL_HANDLE)
             vkDestroySampler(dev, m_vulkanBlurSampler, nullptr);
         m_vulkanBlurPass.reset();
+        if (m_vulkanCompositePass != VK_NULL_HANDLE)
+            vkDestroyRenderPass(dev, m_vulkanCompositePass, nullptr);
         if (m_vulkanResumePass != VK_NULL_HANDLE)
             vkDestroyRenderPass(dev, m_vulkanResumePass, nullptr);
     }
@@ -1233,19 +1269,28 @@ bool BlurEffect::initVulkanResources()
     VkShaderModule vertMod = makeModule(s_blurVertSpv, sizeof(s_blurVertSpv));
     VkShaderModule dsMod = makeModule(s_blurDownsampleSpv, sizeof(s_blurDownsampleSpv));
     VkShaderModule usMod = makeModule(s_blurUpsampleSpv, sizeof(s_blurUpsampleSpv));
+    VkShaderModule compositeMod = makeModule(s_blurCompositeSpv, sizeof(s_blurCompositeSpv));
 
-    if (!vertMod || !dsMod || !usMod) {
+    if (!vertMod || !dsMod || !usMod || !compositeMod) {
         if (vertMod)
             vkDestroyShaderModule(device, vertMod, nullptr);
         if (dsMod)
             vkDestroyShaderModule(device, dsMod, nullptr);
         if (usMod)
             vkDestroyShaderModule(device, usMod, nullptr);
+        if (compositeMod)
+            vkDestroyShaderModule(device, compositeMod, nullptr);
         return false;
     }
 
-    // Graphics pipelines (downsample and upsample share the same render pass)
-    auto makePipeline = [&](VkShaderModule fragMod) -> VkPipeline {
+    // Graphics pipelines. Kawase passes share m_vulkanBlurPass; the composite
+    // pipeline targets the swapchain via m_vulkanCompositePass (created below)
+    // and enables constant-alpha blending so the blur can crossfade with the
+    // existing scene during opacity animations (matches the GL contrast pass).
+    auto makePipeline = [&](VkShaderModule fragMod,
+                            VkRenderPass renderPass,
+                            const VkPipelineColorBlendAttachmentState &blendAttach,
+                            std::initializer_list<VkDynamicState> dynamicStates) -> VkPipeline {
         VkPipelineShaderStageCreateInfo stages[2]{};
         stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -1279,19 +1324,16 @@ bool BlurEffect::initVulkanResources()
         ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
         ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
-        VkPipelineColorBlendAttachmentState blendAttach{};
-        blendAttach.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-
         VkPipelineColorBlendStateCreateInfo blend{};
         blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
         blend.attachmentCount = 1;
         blend.pAttachments = &blendAttach;
 
-        VkDynamicState dynamics[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+        std::vector<VkDynamicState> dynamics(dynamicStates);
         VkPipelineDynamicStateCreateInfo dyn{};
         dyn.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-        dyn.dynamicStateCount = 2;
-        dyn.pDynamicStates = dynamics;
+        dyn.dynamicStateCount = static_cast<uint32_t>(dynamics.size());
+        dyn.pDynamicStates = dynamics.data();
 
         VkGraphicsPipelineCreateInfo pipeInfo{};
         pipeInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
@@ -1305,21 +1347,112 @@ bool BlurEffect::initVulkanResources()
         pipeInfo.pColorBlendState = &blend;
         pipeInfo.pDynamicState = &dyn;
         pipeInfo.layout = m_vulkanBlurPipelineLayout;
-        pipeInfo.renderPass = m_vulkanBlurPass->renderPass();
+        pipeInfo.renderPass = renderPass;
 
         VkPipeline p = VK_NULL_HANDLE;
         vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &p);
         return p;
     };
 
-    m_vulkanDownsamplePipeline = makePipeline(dsMod);
-    m_vulkanUpsamplePipeline = makePipeline(usMod);
+    VkPipelineColorBlendAttachmentState kawaseBlend{};
+    kawaseBlend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+        | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+
+    m_vulkanDownsamplePipeline = makePipeline(dsMod, m_vulkanBlurPass->renderPass(), kawaseBlend,
+                                              {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR});
+    m_vulkanUpsamplePipeline = makePipeline(usMod, m_vulkanBlurPass->renderPass(), kawaseBlend,
+                                            {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR});
+
+    if (!m_vulkanDownsamplePipeline || !m_vulkanUpsamplePipeline) {
+        vkDestroyShaderModule(device, vertMod, nullptr);
+        vkDestroyShaderModule(device, dsMod, nullptr);
+        vkDestroyShaderModule(device, usMod, nullptr);
+        vkDestroyShaderModule(device, compositeMod, nullptr);
+        return false;
+    }
+
+    // Composite render pass: a small LOAD_OP_LOAD pass that draws the blurred
+    // texture onto the swapchain through constant-alpha blending. We leave the
+    // swapchain in COLOR_ATTACHMENT_OPTIMAL so the existing m_vulkanResumePass
+    // can pick up directly afterwards for the window draw on top.
+    {
+        VkAttachmentDescription colorAttachment{};
+        colorAttachment.format = swapchainFormat;
+        colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+        colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        colorAttachment.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        colorAttachment.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+        VkAttachmentReference colorRef{};
+        colorRef.attachment = 0;
+        colorRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+        VkSubpassDescription subpass{};
+        subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        subpass.colorAttachmentCount = 1;
+        subpass.pColorAttachments = &colorRef;
+
+        // Capture blit (TRANSFER read of the swapchain) and the upsample
+        // chain's writes into tex[0] must both finish before we sample/blend.
+        VkSubpassDependency dependency{};
+        dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+        dependency.dstSubpass = 0;
+        dependency.srcStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT
+            | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+            | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        dependency.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT
+            | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT
+            | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+
+        VkRenderPassCreateInfo rpInfo{};
+        rpInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+        rpInfo.attachmentCount = 1;
+        rpInfo.pAttachments = &colorAttachment;
+        rpInfo.subpassCount = 1;
+        rpInfo.pSubpasses = &subpass;
+        rpInfo.dependencyCount = 1;
+        rpInfo.pDependencies = &dependency;
+
+        if (vkCreateRenderPass(device, &rpInfo, nullptr, &m_vulkanCompositePass) != VK_SUCCESS) {
+            vkDestroyShaderModule(device, vertMod, nullptr);
+            vkDestroyShaderModule(device, dsMod, nullptr);
+            vkDestroyShaderModule(device, usMod, nullptr);
+            vkDestroyShaderModule(device, compositeMod, nullptr);
+            return false;
+        }
+    }
+
+    // Composite pipeline: writes only RGB through constant-alpha blending so the
+    // pre-existing scene under the blur shows through during fades.
+    {
+        VkPipelineColorBlendAttachmentState compositeBlend{};
+        compositeBlend.blendEnable = VK_TRUE;
+        compositeBlend.srcColorBlendFactor = VK_BLEND_FACTOR_CONSTANT_ALPHA;
+        compositeBlend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
+        compositeBlend.colorBlendOp = VK_BLEND_OP_ADD;
+        compositeBlend.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+        compositeBlend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        compositeBlend.alphaBlendOp = VK_BLEND_OP_ADD;
+        compositeBlend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT
+            | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT;
+
+        m_vulkanCompositePipeline = makePipeline(compositeMod, m_vulkanCompositePass, compositeBlend,
+                                                 {VK_DYNAMIC_STATE_VIEWPORT,
+                                                  VK_DYNAMIC_STATE_SCISSOR,
+                                                  VK_DYNAMIC_STATE_BLEND_CONSTANTS});
+    }
 
     vkDestroyShaderModule(device, vertMod, nullptr);
     vkDestroyShaderModule(device, dsMod, nullptr);
     vkDestroyShaderModule(device, usMod, nullptr);
+    vkDestroyShaderModule(device, compositeMod, nullptr);
 
-    if (!m_vulkanDownsamplePipeline || !m_vulkanUpsamplePipeline)
+    if (!m_vulkanCompositePipeline)
         return false;
 
     // Swapchain resume render pass: LOAD_OP_LOAD so subsequent draw calls land on top of blur
@@ -1432,6 +1565,10 @@ void BlurEffect::blurVulkan(const RenderTarget &renderTarget, const RenderViewpo
     if (deviceRect.isEmpty()) {
         return;
     }
+    const qreal opacity = w->opacity() * data.opacity();
+    if (opacity <= 0.0) {
+        return;
+    }
 
     // Allocate/resize intermediate texture chain
     BlurVulkanRenderData &vkData = blurInfo.vulkanRender;
@@ -1532,11 +1669,12 @@ void BlurEffect::blurVulkan(const RenderTarget &renderTarget, const RenderViewpo
                        1, &blit, VK_FILTER_LINEAR);
     }
 
-    // Swapchain: TRANSFER_SRC → TRANSFER_DST (for final writeback)
+    // Swapchain: TRANSFER_SRC → COLOR_ATTACHMENT_OPTIMAL (ready for the composite pass).
     imgBarrier(swapchainImage,
-               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-               VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-               VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+               VK_ACCESS_TRANSFER_READ_BIT,
+               VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+               VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
 
     // Make blit to tex[0] visible to fragment shaders
     memBarrier(VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
@@ -1641,27 +1779,48 @@ void BlurEffect::blurVulkan(const RenderTarget &renderTarget, const RenderViewpo
                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT);
     }
 
-    // Blit blurred tex[0] → swapchain blur region (swapchain is in TRANSFER_DST)
+    // Composite blurred tex[0] onto the swapchain through constant-alpha blending,
+    // so the blur fades smoothly with the window during slidingpopups/fadingpopups
+    // animations instead of snapping in/out at full intensity.
     {
-        VkImageBlit blit{};
-        blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        blit.srcOffsets[0] = {0, 0, 0};
-        blit.srcOffsets[1] = {vkData.textures[0]->width(), vkData.textures[0]->height(), 1};
-        blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        blit.dstOffsets[0] = {deviceRect.x(), deviceRect.y(), 0};
-        blit.dstOffsets[1] = {deviceRect.x() + deviceRect.width(), deviceRect.y() + deviceRect.height(), 1};
-        vkCmdBlitImage(cmd,
-                       vkData.textures[0]->image(), VK_IMAGE_LAYOUT_GENERAL,
-                       swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                       1, &blit, VK_FILTER_LINEAR);
-    }
+        const float alpha = static_cast<float>(opacity * opacity);
 
-    // Swapchain: TRANSFER_DST → COLOR_ATTACHMENT_OPTIMAL (for resumed rendering)
-    imgBarrier(swapchainImage,
-               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-               VK_ACCESS_TRANSFER_WRITE_BIT,
-               VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-               VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+        VkRenderPassBeginInfo rpBegin{};
+        rpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        rpBegin.renderPass = m_vulkanCompositePass;
+        rpBegin.framebuffer = fb->framebuffer();
+        rpBegin.renderArea.offset = {deviceRect.x(), deviceRect.y()};
+        rpBegin.renderArea.extent = {static_cast<uint32_t>(deviceRect.width()),
+                                     static_cast<uint32_t>(deviceRect.height())};
+        vkCmdBeginRenderPass(cmd, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_vulkanCompositePipeline);
+        bindSrc(vkData.textures[0].get());
+
+        // Fullscreen triangle in the composite vertex shader spans NDC [-1, 1].
+        // A negative-height viewport positioned at deviceRect maps that to the
+        // blur target rect on the swapchain (and preserves UV.y orientation).
+        VkViewport vp{};
+        vp.x = static_cast<float>(deviceRect.x());
+        vp.y = static_cast<float>(deviceRect.y() + deviceRect.height());
+        vp.width = static_cast<float>(deviceRect.width());
+        vp.height = -static_cast<float>(deviceRect.height());
+        vp.minDepth = 0.0f;
+        vp.maxDepth = 1.0f;
+        VkRect2D sc{};
+        sc.offset = {deviceRect.x(), deviceRect.y()};
+        sc.extent = {static_cast<uint32_t>(deviceRect.width()),
+                     static_cast<uint32_t>(deviceRect.height())};
+        vkCmdSetViewport(cmd, 0, 1, &vp);
+        vkCmdSetScissor(cmd, 0, 1, &sc);
+
+        const float blendConstants[4] = {0.0f, 0.0f, 0.0f, alpha};
+        vkCmdSetBlendConstants(cmd, blendConstants);
+
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+
+        vkCmdEndRenderPass(cmd);
+    }
 
     // Restore full-screen viewport/scissor — our Kawase passes set these to the intermediate
     // texture sizes and dynamic state persists across render passes in the command buffer.

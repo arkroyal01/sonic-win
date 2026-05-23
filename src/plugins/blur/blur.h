@@ -122,6 +122,8 @@ private:
     VkPipelineLayout m_vulkanBlurPipelineLayout = VK_NULL_HANDLE;
     VkPipeline m_vulkanDownsamplePipeline = VK_NULL_HANDLE;
     VkPipeline m_vulkanUpsamplePipeline = VK_NULL_HANDLE;
+    VkPipeline m_vulkanCompositePipeline = VK_NULL_HANDLE;
+    VkRenderPass m_vulkanCompositePass = VK_NULL_HANDLE;
     VkSampler m_vulkanBlurSampler = VK_NULL_HANDLE;
 #endif
 
