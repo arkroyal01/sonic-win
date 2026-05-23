@@ -608,13 +608,6 @@ void VulkanOffscreenData::paint(const RenderTarget &renderTarget, const RenderVi
     VkDeviceSize offsets[] = {0};
     vkCmdBindVertexBuffers(cmd, 0, 1, vertexBuffers, offsets);
 
-    // Allocate descriptor set
-    VkDescriptorSet descriptorSet = m_vulkanContext->allocateDescriptorSet(pipeline->descriptorSetLayout());
-    if (descriptorSet == VK_NULL_HANDLE) {
-        qCWarning(KWIN_VULKAN) << "VulkanOffscreenData::paint: Failed to allocate descriptor set";
-        return;
-    }
-
     // Set up texture image info
     std::array<VkDescriptorImageInfo, 4> imageInfos{};
     // Use the framebuffer's texture for slot 0 (this is the texture we rendered to)
@@ -709,10 +702,9 @@ void VulkanOffscreenData::paint(const RenderTarget &renderTarget, const RenderVi
     bufferInfo.offset = 0;
     bufferInfo.range = sizeof(VulkanUniforms);
 
-    // Update descriptor set
+    // Bind 4 samplers + 1 UBO. dstSet is filled in by the helper.
     std::array<VkWriteDescriptorSet, 2> descriptorWrites{};
     descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    descriptorWrites[0].dstSet = descriptorSet;
     descriptorWrites[0].dstBinding = 0;
     descriptorWrites[0].dstArrayElement = 0;
     descriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -720,20 +712,18 @@ void VulkanOffscreenData::paint(const RenderTarget &renderTarget, const RenderVi
     descriptorWrites[0].pImageInfo = imageInfos.data();
 
     descriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    descriptorWrites[1].dstSet = descriptorSet;
     descriptorWrites[1].dstBinding = 1;
     descriptorWrites[1].dstArrayElement = 0;
     descriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     descriptorWrites[1].descriptorCount = 1;
     descriptorWrites[1].pBufferInfo = &bufferInfo;
 
-    vkUpdateDescriptorSets(m_vulkanContext->backend()->device(),
-                           static_cast<uint32_t>(descriptorWrites.size()),
-                           descriptorWrites.data(), 0, nullptr);
-
-    // Bind descriptor sets
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            pipeline->layout(), 0, 1, &descriptorSet, 0, nullptr);
+    if (!m_vulkanContext->bindDescriptors(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                          pipeline->layout(), pipeline->descriptorSetLayout(),
+                                          0, descriptorWrites.size(), descriptorWrites.data())) {
+        qCWarning(KWIN_VULKAN) << "VulkanOffscreenData::paint: Failed to bind descriptors";
+        return;
+    }
 
     // Handle clipping region - same as OpenGL implementation
     // OpenGL enables GL_SCISSOR_TEST only when clipping, then disables it after

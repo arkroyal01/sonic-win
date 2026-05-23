@@ -1619,11 +1619,6 @@ void EffectsHandler::renderOffscreenQuickView(const RenderTarget &renderTarget, 
         u.saturation = 1.0f;
         ubo->upload(&u, sizeof(u));
 
-        VkDescriptorSet ds = ctx->allocateDescriptorSet(pipeline->descriptorSetLayout());
-        if (ds == VK_NULL_HANDLE) {
-            return;
-        }
-
         // Fill all 4 texture slots with the overlay texture (shader uses slot 0 for MapTexture).
         // The OffscreenQuickView texture is mutable-format: the underlying image is UNORM
         // (Qt wrote its sRGB-encoded values into it raw) and the alias view is SRGB, so
@@ -1642,21 +1637,21 @@ void EffectsHandler::renderOffscreenQuickView(const RenderTarget &renderTarget, 
 
         std::array<VkWriteDescriptorSet, 2> writes{};
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[0].dstSet = ds;
         writes[0].dstBinding = 0;
         writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         writes[0].descriptorCount = 4;
         writes[0].pImageInfo = imageInfos.data();
         writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[1].dstSet = ds;
         writes[1].dstBinding = 1;
         writes[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         writes[1].descriptorCount = 1;
         writes[1].pBufferInfo = &bufInfo;
 
-        vkUpdateDescriptorSets(ctx->backend()->device(), 2, writes.data(), 0, nullptr);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                pipeline->layout(), 0, 1, &ds, 0, nullptr);
+        if (!ctx->bindDescriptors(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                  pipeline->layout(), pipeline->descriptorSetLayout(),
+                                  0, writes.size(), writes.data())) {
+            return;
+        }
 
         // Quad covering the overlay rect in local (0,0)-(width,height) space
         const float qw = static_cast<float>(rect.width());
