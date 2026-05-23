@@ -281,7 +281,7 @@ public:
         const RenderViewport &viewport)>;
     int registerFullscreenPostPass(FullscreenPostPassCallback callback);
     void unregisterFullscreenPostPass(int id);
-    bool hasFullscreenPostPasses() const
+    bool hasFullscreenPostPasses() const override
     {
         return !m_fullscreenPostPasses.empty();
     }

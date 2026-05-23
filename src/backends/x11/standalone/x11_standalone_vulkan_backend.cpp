@@ -16,7 +16,9 @@
 #include "platformsupport/scenes/vulkan/vulkanrenderpass.h"
 #include "platformsupport/scenes/vulkan/vulkanrendertarget.h"
 #include "platformsupport/scenes/vulkan/vulkansurfacetexture_x11.h"
+#include "scene/itemrenderer.h"
 #include "scene/surfaceitem_x11.h"
+#include "scene/workspacescene.h"
 #include "utils/softwarevsyncmonitor.h"
 #include "utils/vsyncmonitor.h"
 #include "utils/xcbutils.h"
@@ -838,6 +840,19 @@ QRegion X11StandaloneVulkanBackend::bufferDamage(uint32_t imageIndex) const
 {
     if (!m_partialRepaint || imageIndex >= m_imageLastRenderFrame.size()) {
         return infiniteRegion();
+    }
+    // Fullscreen post-passes (invert, colorblindness correction) resample the
+    // entire framebuffer, so the scene must paint every pixel each frame.
+    // Returning a sub-screen region here would leave undamaged pixels at the
+    // main pass's clear value, which the post-pass would then process as if it
+    // were the scene — manifesting as black/white flicker over the static parts
+    // of the screen. Force a full repaint while any post-pass is registered.
+    if (auto *compositor = Compositor::self()) {
+        if (auto *scene = compositor->scene()) {
+            if (auto *renderer = scene->renderer(); renderer && renderer->hasFullscreenPostPasses()) {
+                return infiniteRegion();
+            }
+        }
     }
     const uint64_t last = m_imageLastRenderFrame[imageIndex];
     if (last == 0 || last >= m_frameCounter) {

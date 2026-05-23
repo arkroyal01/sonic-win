@@ -55,6 +55,18 @@ public:
      */
     virtual void runFullscreenPostPasses(const RenderTarget &renderTarget, const RenderViewport &viewport);
 
+    /**
+     * Whether any fullscreen post-pass is currently registered. Backends that
+     * support sub-screen partial repaint must widen the per-frame paint region
+     * to the whole screen while this is true: post-passes resample the entire
+     * framebuffer, so any pixels left untouched by the scene would be processed
+     * as cleared / stale data and appear as flicker. Default: false.
+     */
+    virtual bool hasFullscreenPostPasses() const
+    {
+        return false;
+    }
+
     virtual std::unique_ptr<ImageItem> createImageItem(Item *parent = nullptr) = 0;
 };
 
