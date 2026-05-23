@@ -13,6 +13,7 @@
 #include "core/overlaywindow.h"
 #include "core/renderloop.h"
 #include "platformsupport/scenes/vulkan/vulkanpipelinemanager.h"
+#include "platformsupport/scenes/vulkan/vulkanpresenttimingmonitor.h"
 #include "platformsupport/scenes/vulkan/vulkanrenderpass.h"
 #include "platformsupport/scenes/vulkan/vulkanrendertarget.h"
 #include "platformsupport/scenes/vulkan/vulkansurfacetexture_x11.h"
@@ -181,7 +182,12 @@ X11StandaloneVulkanBackend::X11StandaloneVulkanBackend(X11StandaloneBackend *bac
 
 X11StandaloneVulkanBackend::~X11StandaloneVulkanBackend()
 {
-    // Stop the vsync monitor first so no vblank() callback fires during teardown.
+    // Stop the present-timing monitor first: its helper thread may be blocked
+    // in vkWaitForPresent2KHR against m_swapchain, and that handle must outlive
+    // the wait. Destroying the monitor joins the helper thread.
+    m_presentTimingMonitor.reset();
+
+    // Stop the vsync monitor next so no vblank() callback fires during teardown.
     m_vsyncMonitor.reset();
 
     if (isFailed()) {
@@ -268,8 +274,11 @@ void X11StandaloneVulkanBackend::init()
     connect(workspace(), &Workspace::geometryChanged, this, &X11StandaloneVulkanBackend::screenGeometryChanged);
 
     // Real presentation-timing feedback for the RenderLoop. The VsyncMonitor is
-    // only the fallback — when VK_EXT_present_timing is active, present()/
-    // drainPresentTiming() report timestamps instead.
+    // the fallback — when VK_EXT_present_timing + VK_KHR_present_wait2 are
+    // active, the async monitor created in setupPresentTimingQueue() (called
+    // from initSwapchain()) reports timestamps instead. Keep a VsyncMonitor on
+    // standby anyway so handlePresentTimingMonitorError() can hand off cleanly
+    // when the EXT path drops out — its arm() is a no-op until that happens.
     if (!m_presentTimingActive) {
         initVsyncMonitor();
     }
@@ -313,14 +322,11 @@ void X11StandaloneVulkanBackend::vblank(std::chrono::nanoseconds timestamp)
     }
 }
 
-// Depth of the swapchain's VK_EXT_present_timing result queue. The compositor
-// drains it every frame, so only a couple of entries are ever pending; this is
-// generous headroom and also bounds the drain scratch arrays.
+// Depth of the swapchain's VK_EXT_present_timing result queue. The monitor's
+// helper thread drains the entry matching the awaited presentId after each
+// vkWaitForPresent2KHR unblock, so only a few entries are ever pending; this is
+// generous headroom.
 static constexpr uint32_t kPresentTimingQueueSize = 16;
-
-// If the timing anchor is more than this many presents old, the extrapolation
-// is no longer trustworthy and estimatePresentTime() falls back to "now".
-static constexpr uint64_t kPresentTimingMaxExtrapolation = 8;
 
 static std::chrono::nanoseconds monotonicNow()
 {
@@ -335,17 +341,23 @@ void X11StandaloneVulkanBackend::detectPresentTimingSupport()
 
     // Device-level support (extensions + features) was established in
     // createDevice(); honour the env override and require surface support too.
+    // The present-wait2 device extension is required: without it the monitor
+    // would have to busy-poll vkGetPastPresentationTimingEXT, which defeats the
+    // point — fall back to VsyncMonitor in that case.
     const bool disabled = qEnvironmentVariableIsSet("KWIN_VULKAN_PRESENT_TIMING")
         && qEnvironmentVariableIntValue("KWIN_VULKAN_PRESENT_TIMING") == 0;
-    if (!supportsPresentTiming() || disabled || m_surface == VK_NULL_HANDLE) {
+    if (!supportsPresentTiming() || !supportsPresentWait2() || disabled || m_surface == VK_NULL_HANDLE) {
         return;
     }
 
     // VK_EXT_present_timing also requires the surface to support present timing
-    // and VK_KHR_present_id2 — query VkPresentTimingSurfaceCapabilitiesEXT and
-    // VkSurfaceCapabilitiesPresentId2KHR via vkGetPhysicalDeviceSurfaceCapabilities2KHR.
+    // and VK_KHR_present_id2; VK_KHR_present_wait2 likewise needs surface support.
+    // Query them all via vkGetPhysicalDeviceSurfaceCapabilities2KHR.
+    VkSurfaceCapabilitiesPresentWait2KHR wait2Caps{};
+    wait2Caps.sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_PRESENT_WAIT_2_KHR;
     VkSurfaceCapabilitiesPresentId2KHR id2Caps{};
     id2Caps.sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_PRESENT_ID_2_KHR;
+    id2Caps.pNext = &wait2Caps;
     VkPresentTimingSurfaceCapabilitiesEXT timingCaps{};
     timingCaps.sType = VK_STRUCTURE_TYPE_PRESENT_TIMING_SURFACE_CAPABILITIES_EXT;
     timingCaps.pNext = &id2Caps;
@@ -362,9 +374,11 @@ void X11StandaloneVulkanBackend::detectPresentTimingSupport()
         << "VK_EXT_present_timing surface check: result=" << int(r)
         << " presentTimingSupported=" << bool(timingCaps.presentTimingSupported)
         << " presentId2Supported=" << bool(id2Caps.presentId2Supported)
+        << " presentWait2Supported=" << bool(wait2Caps.presentWait2Supported)
         << " supportedStages=0x" << QString::number(timingCaps.presentStageQueries, 16);
 
-    if (r != VK_SUCCESS || !timingCaps.presentTimingSupported || !id2Caps.presentId2Supported) {
+    if (r != VK_SUCCESS || !timingCaps.presentTimingSupported || !id2Caps.presentId2Supported
+        || !wait2Caps.presentWait2Supported) {
         return;
     }
 
@@ -384,6 +398,12 @@ void X11StandaloneVulkanBackend::detectPresentTimingSupport()
 
 void X11StandaloneVulkanBackend::setupPresentTimingQueue()
 {
+    // Tear down any previous monitor before its bound VkSwapchainKHR becomes
+    // stale. Destruction joins the helper thread; the worker may be blocked in
+    // vkWaitForPresent2KHR but will unblock at the timeout if the swapchain
+    // teardown hasn't already caused it to return VK_ERROR_OUT_OF_DATE_KHR.
+    m_presentTimingMonitor.reset();
+
     if (!m_presentTimingActive || !m_swapchain || !m_swapchain->isValid()) {
         return;
     }
@@ -418,149 +438,37 @@ void X11StandaloneVulkanBackend::setupPresentTimingQueue()
             }
         }
     }
-}
 
-void X11StandaloneVulkanBackend::drainPresentTiming()
-{
-    if (!m_presentTimingActive || !m_swapchain) {
-        return;
-    }
-    auto fn = getPastPresentationTimingEXT();
-    if (!fn) {
-        return;
-    }
-
-    // Pre-size the doubly-nested result arrays: at most kPresentTimingQueueSize
-    // timings, each with at most the four defined present stages.
-    constexpr uint32_t kMaxStages = 4;
-    VkPresentStageTimeEXT stageStorage[kPresentTimingQueueSize][kMaxStages];
-    VkPastPresentationTimingEXT timings[kPresentTimingQueueSize];
-    for (uint32_t i = 0; i < kPresentTimingQueueSize; ++i) {
-        timings[i] = {};
-        timings[i].sType = VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_EXT;
-        timings[i].presentStageCount = kMaxStages;
-        timings[i].pPresentStages = stageStorage[i];
-    }
-
-    VkPastPresentationTimingPropertiesEXT props{};
-    props.sType = VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_PROPERTIES_EXT;
-    props.presentationTimingCount = kPresentTimingQueueSize;
-    props.pPresentationTimings = timings;
-
-    VkPastPresentationTimingInfoEXT info{};
-    info.sType = VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_INFO_EXT;
-    info.swapchain = m_swapchain->swapchain();
-
-    const VkResult r = fn(device(), &info, &props);
-
-    // Diagnostic dump of the raw vkGetPastPresentationTimingEXT output, enabled
-    // with KWIN_VULKAN_PRESENT_TIMING_DEBUG=1. Budget-limited so it does not
-    // spam indefinitely.
-    static int s_debugBudget = qEnvironmentVariableIsSet("KWIN_VULKAN_PRESENT_TIMING_DEBUG") ? 150 : 0;
-    if (s_debugBudget > 0) {
-        --s_debugBudget;
-        qCWarning(KWIN_X11STANDALONE).nospace()
-            << "present-timing drain: result=" << int(r)
-            << " count=" << props.presentationTimingCount
-            << " anchorId=" << static_cast<qulonglong>(m_lastTimedPresentId);
-        for (uint32_t i = 0; i < props.presentationTimingCount; ++i) {
-            const VkPastPresentationTimingEXT &t = timings[i];
-            QString stages;
-            for (uint32_t s = 0; s < t.presentStageCount; ++s) {
-                stages += QStringLiteral(" {stage=0x%1,time=%2}")
-                              .arg(t.pPresentStages[s].stage, 0, 16)
-                              .arg(static_cast<qulonglong>(t.pPresentStages[s].time));
-            }
-            qCWarning(KWIN_X11STANDALONE).nospace()
-                << "  timing id=" << static_cast<qulonglong>(t.presentId)
-                << " timeDomain=" << int(t.timeDomain)
-                << " stageCount=" << t.presentStageCount
-                << " reportComplete=" << bool(t.reportComplete)
-                << " stages:" << stages;
-        }
-    }
-
-    if (r != VK_SUCCESS && r != VK_INCOMPLETE) {
-        return;
-    }
-
-    // Pick the newest completed present that carries an on-screen
-    // (FIRST_PIXEL_VISIBLE) timestamp in a monotonic time domain.
-    uint64_t newestId = 0;
-    std::chrono::nanoseconds newestTime{};
-    for (uint32_t i = 0; i < props.presentationTimingCount; ++i) {
-        const VkPastPresentationTimingEXT &t = timings[i];
-        if (t.presentId <= m_lastTimedPresentId || t.presentId <= newestId) {
-            continue;
-        }
-        if (t.timeDomain != VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR
-            && t.timeDomain != VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_KHR) {
-            // A time domain we cannot relate to steady_clock — skip it.
-            continue;
-        }
-        for (uint32_t s = 0; s < t.presentStageCount; ++s) {
-            if (t.pPresentStages[s].stage & VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_VISIBLE_BIT_EXT) {
-                newestId = t.presentId;
-                newestTime = std::chrono::nanoseconds(static_cast<int64_t>(t.pPresentStages[s].time));
-            }
-        }
-    }
-    if (newestId == 0) {
-        return;
-    }
-
-    // Advance the anchor and update the running per-frame interval from the gap
-    // to the previous anchor (exponentially smoothed to ride out jitter).
-    if (m_lastTimedPresentId != 0) {
-        const std::chrono::nanoseconds delta = newestTime - m_lastTimedPresentTime;
-        const uint64_t frames = newestId - m_lastTimedPresentId;
-        if (frames > 0 && delta.count() > 0) {
-            const std::chrono::nanoseconds perFrame = delta / static_cast<int64_t>(frames);
-            m_presentInterval = m_presentInterval.count() == 0
-                ? perFrame
-                : (m_presentInterval * 7 + perFrame) / 8;
-        }
-    }
-    m_lastTimedPresentId = newestId;
-    m_lastTimedPresentTime = newestTime;
-
-    if (!m_loggedPresentTiming && m_presentInterval.count() > 0) {
-        m_loggedPresentTiming = true;
-        qCWarning(KWIN_X11STANDALONE) << "VK_EXT_present_timing delivering; measured present interval"
-                                      << (m_presentInterval.count() / 1000) << "us";
-    }
-}
-
-std::chrono::nanoseconds X11StandaloneVulkanBackend::estimatePresentTime(uint64_t presentId)
-{
-    // Extrapolate from the last measured present: lastTime + N refresh intervals.
-    // Until two timing samples have anchored the interval — or if the anchor has
-    // gone stale because timing results stopped arriving — fall back to "now".
-    std::chrono::nanoseconds estimate;
-    if (m_lastTimedPresentId != 0 && m_presentInterval.count() > 0
-        && presentId >= m_lastTimedPresentId
-        && presentId - m_lastTimedPresentId <= kPresentTimingMaxExtrapolation) {
-        estimate = m_lastTimedPresentTime
-            + std::chrono::nanoseconds(m_presentInterval.count()
-                                       * static_cast<int64_t>(presentId - m_lastTimedPresentId));
+    // Bring up the async monitor against the current swapchain handle. If
+    // creation fails for any reason, fall through to the VsyncMonitor path —
+    // detectPresentTimingSupport() already verified the extensions, so this
+    // should not normally happen.
+    m_presentTimingMonitor = VulkanPresentTimingMonitor::create(this, m_swapchain.get());
+    if (m_presentTimingMonitor) {
+        connect(m_presentTimingMonitor.get(), &VsyncMonitor::vblankOccurred,
+                this, &X11StandaloneVulkanBackend::vblank);
+        connect(m_presentTimingMonitor.get(), &VsyncMonitor::errorOccurred,
+                this, &X11StandaloneVulkanBackend::handlePresentTimingMonitorError);
     } else {
-        estimate = monotonicNow();
+        qCWarning(KWIN_X11STANDALONE) << "Failed to create VulkanPresentTimingMonitor; falling back to VsyncMonitor";
+        m_presentTimingActive = false;
+        if (!m_vsyncMonitor) {
+            initVsyncMonitor();
+        }
     }
+}
 
-    // Clamp: the extrapolation slightly overshoots reality every now and then
-    // (the smoothed interval is a prediction, not a measurement), and the
-    // staleness fallback to monotonicNow() lives on a different baseline than
-    // the extrapolated stream — either can land microseconds-to-millis behind
-    // the previous reported value. Letting that through trips RenderLoop's
-    // backwards-timestamp guard, which resets lastPresentationTimestamp to
-    // steady_clock::now() and disrupts the pageflip scheduler enough to feel
-    // like a framerate drop. A non-decreasing sequence here keeps RenderLoop
-    // consistent; the clamp plateau resolves as soon as a fresh anchor lands.
-    if (estimate < m_lastReportedPresentTime) {
-        estimate = m_lastReportedPresentTime;
+void X11StandaloneVulkanBackend::handlePresentTimingMonitorError()
+{
+    // The helper signalled an unrecoverable error (typically the swapchain
+    // going out-of-date). Tear it down here on the main thread and let the
+    // next swapchain recreation rebuild it. Until then, fall back to the
+    // VsyncMonitor cascade so presentation feedback keeps flowing.
+    qCWarning(KWIN_X11STANDALONE) << "Vulkan present-timing monitor reported an error; falling back to VsyncMonitor";
+    m_presentTimingMonitor.reset();
+    if (!m_vsyncMonitor) {
+        initVsyncMonitor();
     }
-    m_lastReportedPresentTime = estimate;
-    return estimate;
 }
 
 bool X11StandaloneVulkanBackend::initInstance()
@@ -689,13 +597,13 @@ bool X11StandaloneVulkanBackend::present(Output *output, const std::shared_ptr<O
     }
 
     // Tag the present for VK_EXT_present_timing feedback when that path is active.
+    // The monitor's worker thread will block on this presentId via
+    // vkWaitForPresent2KHR and emit vblankOccurred() with its real on-screen
+    // timestamp — same async shape as the VsyncMonitor, no extrapolation, no
+    // future timestamps fed to RenderLoop.
     uint64_t presentId = 0;
-    if (m_presentTimingActive) {
+    if (m_presentTimingActive && m_presentTimingMonitor) {
         presentId = m_nextPresentId++;
-        // Drain completed timing results *before* presenting: it keeps the timing
-        // queue from filling up, and refreshes the anchor estimatePresentTime()
-        // extrapolates from.
-        drainPresentTiming();
     }
 
     // Present the rendered frame to the swapchain, hinting the changed region
@@ -706,14 +614,10 @@ bool X11StandaloneVulkanBackend::present(Output *output, const std::shared_ptr<O
     m_presentDamage = QRegion();
 
     if (presentSuccess) {
-        if (m_presentTimingActive) {
-            // Report this frame *synchronously* with an extrapolated timestamp.
-            // Never deferring presented() to a later present() is what keeps
-            // RenderLoop from deadlocking.
-            if (m_frame) {
-                m_frame->presented(estimatePresentTime(presentId), PresentationMode::VSync);
-                m_frame.reset();
-            }
+        if (m_presentTimingActive && m_presentTimingMonitor) {
+            // Real present timestamp arrives asynchronously via vblank() once
+            // the helper thread's vkWaitForPresent2KHR(presentId) returns.
+            m_presentTimingMonitor->armWithPresentId(presentId);
         } else if (m_vsyncMonitor) {
             // Real present timestamp arrives asynchronously via vblank().
             m_vsyncMonitor->arm();
@@ -813,10 +717,10 @@ bool X11StandaloneVulkanBackend::recreateSwapchainIfNeeded()
     // Recreated images start blank — drop stale buffer-age tracking.
     resetDamageTracking();
     // The new swapchain restarts present-id numbering and its EXT_present
-    // _timing queue is empty. Drop the stale timing anchor and rebuild the
-    // queue against the new swapchain.
-    m_lastTimedPresentId = 0;
-    m_presentInterval = std::chrono::nanoseconds{};
+    // _timing queue is empty. Rebuild the queue and the async monitor against
+    // the new swapchain handle. setupPresentTimingQueue() resets the monitor
+    // before recreating it, so the helper thread is joined before the old
+    // VkSwapchainKHR is destroyed.
     setupPresentTimingQueue();
     return true;
 }
