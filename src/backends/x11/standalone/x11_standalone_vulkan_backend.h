@@ -108,6 +108,20 @@ public:
      */
     void recordFrameDamage(const QRegion &damage);
 
+    /**
+     * @brief If the swapchain is flagged as needing recreation (typically
+     *        VK_SUBOPTIMAL_KHR / VK_ERROR_OUT_OF_DATE_KHR from acquire or
+     *        present after a display reconfiguration), recreate it and
+     *        reset the dependent state (buffer-age tracking, present-timing
+     *        anchor, present-timing queue).
+     *
+     * Idempotent — does nothing when the flag is clear. Returns true if no
+     * recreate was needed *or* recreate succeeded; false if recreate
+     * failed. The caller is expected to skip the frame when this returns
+     * false and try again next time.
+     */
+    bool recreateSwapchainIfNeeded();
+
 private:
     bool initInstance();
     bool initPhysicalDevice();

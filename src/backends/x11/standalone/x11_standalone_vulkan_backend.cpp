@@ -63,6 +63,23 @@ std::optional<OutputLayerBeginFrameInfo> VulkanLayer::doBeginFrame()
         return std::nullopt;
     }
 
+    // VK_SUBOPTIMAL_KHR from a previous acquire or present is technically a
+    // success — the spec lets us proceed with the suboptimal swapchain — but
+    // every subsequent frame will keep flagging suboptimal until the
+    // swapchain is rebuilt against the new surface. Without acting on the
+    // flag here that turns into a recreation-loop log spam after a display
+    // reconfiguration. Recreate up front; if recreation fails just skip the
+    // frame and try again next time.
+    if (swapchain->needsRecreation()) {
+        if (!x11Backend->recreateSwapchainIfNeeded()) {
+            return std::nullopt;
+        }
+        swapchain = x11Backend->swapchain();
+        if (!swapchain || !swapchain->isValid()) {
+            return std::nullopt;
+        }
+    }
+
     // Wait for the previous frame's fence to complete (CPU wait is still needed
     // to ensure the command buffer from the previous frame is not in use).
     // Reset is deferred until after a successful acquire: if we reset before
@@ -708,21 +725,7 @@ bool X11StandaloneVulkanBackend::present(Output *output, const std::shared_ptr<O
     } else {
         // Present failed, likely the swapchain needs recreation.
         qCWarning(KWIN_X11STANDALONE) << "Present failed, checking if swapchain needs recreation";
-        if (m_swapchain->needsRecreation()) {
-            qCDebug(KWIN_X11STANDALONE) << "Swapchain needs recreation after present failure";
-            const QSize size = workspace()->geometry().size();
-            if (!m_swapchain->recreate(size)) {
-                qCWarning(KWIN_X11STANDALONE) << "Failed to recreate swapchain";
-            } else {
-                // Recreated images start blank — drop stale age tracking.
-                resetDamageTracking();
-                // The new swapchain restarts timing; drop the stale anchor and
-                // re-arm the timing queue on it.
-                m_lastTimedPresentId = 0;
-                m_presentInterval = std::chrono::nanoseconds{};
-                setupPresentTimingQueue();
-            }
-        }
+        recreateSwapchainIfNeeded();
         // No timing will be reported for a failed present; mark the frame
         // presented immediately so the RenderLoop is not left waiting.
         if (m_frame) {
@@ -794,6 +797,28 @@ void X11StandaloneVulkanBackend::resetDamageTracking()
     m_damageJournal.clear();
     m_frameCounter = 1;
     m_imageLastRenderFrame.assign(m_swapchain ? m_swapchain->imageCount() : 0, 0);
+}
+
+bool X11StandaloneVulkanBackend::recreateSwapchainIfNeeded()
+{
+    if (!m_swapchain || !m_swapchain->needsRecreation()) {
+        return true;
+    }
+    qCDebug(KWIN_X11STANDALONE) << "Swapchain needs recreation; rebuilding";
+    const QSize size = workspace()->geometry().size();
+    if (!m_swapchain->recreate(size)) {
+        qCWarning(KWIN_X11STANDALONE) << "Failed to recreate swapchain";
+        return false;
+    }
+    // Recreated images start blank — drop stale buffer-age tracking.
+    resetDamageTracking();
+    // The new swapchain restarts present-id numbering and its EXT_present
+    // _timing queue is empty. Drop the stale timing anchor and rebuild the
+    // queue against the new swapchain.
+    m_lastTimedPresentId = 0;
+    m_presentInterval = std::chrono::nanoseconds{};
+    setupPresentTimingQueue();
+    return true;
 }
 
 QRegion X11StandaloneVulkanBackend::bufferDamage(uint32_t imageIndex) const
