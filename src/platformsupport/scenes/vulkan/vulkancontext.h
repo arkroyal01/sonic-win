@@ -216,6 +216,30 @@ public:
     void resetDescriptorPool();
 
     /**
+     * @brief Bind descriptors for the next draw on @p cmd, picking the cheapest
+     * available path.
+     *
+     * Currently always takes the pool route: allocates a fresh descriptor set
+     * for @p setLayout, fills each write's dstSet, calls vkUpdateDescriptorSets,
+     * and binds the set. Returns false on allocation failure (the caller should
+     * skip the draw). The writes' dstSet field is overwritten — caller does not
+     * need to populate it.
+     *
+     * Designed so callsites can migrate off the manual allocate→update→bind
+     * boilerplate one at a time. Once every consumer of a given descriptor set
+     * layout uses this helper, the layout can be flipped to push descriptors
+     * (VK_KHR_push_descriptor) and the helper can switch its internal dispatch
+     * — call sites stay unchanged across that flip.
+     */
+    bool bindDescriptors(VkCommandBuffer cmd,
+                         VkPipelineBindPoint bindPoint,
+                         VkPipelineLayout pipelineLayout,
+                         VkDescriptorSetLayout setLayout,
+                         uint32_t setIndex,
+                         uint32_t writeCount,
+                         VkWriteDescriptorSet *writes);
+
+    /**
      * @brief Import a DMA-BUF as a Vulkan texture (if supported).
      */
     std::unique_ptr<VulkanTexture> importDmaBufAsTexture(const DmaBufAttributes &attributes);

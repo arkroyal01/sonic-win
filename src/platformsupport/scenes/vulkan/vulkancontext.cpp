@@ -551,6 +551,30 @@ void VulkanContext::resetDescriptorPool()
     }
 }
 
+bool VulkanContext::bindDescriptors(VkCommandBuffer cmd,
+                                    VkPipelineBindPoint bindPoint,
+                                    VkPipelineLayout pipelineLayout,
+                                    VkDescriptorSetLayout setLayout,
+                                    uint32_t setIndex,
+                                    uint32_t writeCount,
+                                    VkWriteDescriptorSet *writes)
+{
+    // Pool path. A later commit will flip selected layouts to push descriptors
+    // and dispatch here based on the layout / supportsPushDescriptor() — until
+    // then this is a straight wrap of the old alloc/update/bind sequence so
+    // callsites can be migrated incrementally.
+    VkDescriptorSet ds = allocateDescriptorSet(setLayout);
+    if (ds == VK_NULL_HANDLE) {
+        return false;
+    }
+    for (uint32_t i = 0; i < writeCount; ++i) {
+        writes[i].dstSet = ds;
+    }
+    vkUpdateDescriptorSets(m_backend->device(), writeCount, writes, 0, nullptr);
+    vkCmdBindDescriptorSets(cmd, bindPoint, pipelineLayout, setIndex, 1, &ds, 0, nullptr);
+    return true;
+}
+
 void VulkanContext::queueDmaBufBarrier(VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout)
 {
     m_pendingDmaBufBarriers.append({image, oldLayout, newLayout});
