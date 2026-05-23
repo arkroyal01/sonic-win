@@ -44,6 +44,7 @@ public:
     static bool enabledByDefault();
 
     static QMatrix4x4 colorMatrix(qreal contrast, qreal intensity, qreal saturation);
+    void prePaintWindow(EffectWindow *w, WindowPrePaintData &data, std::chrono::milliseconds presentTime) override;
     void drawWindow(const RenderTarget &renderTarget, const RenderViewport &viewport, EffectWindow *w, int mask, const QRegion &region, WindowPaintData &data) override;
 
     bool provides(Feature feature) override;

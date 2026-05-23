@@ -537,6 +537,39 @@ bool ContrastEffect::shouldContrast(const EffectWindow *w, int mask, const Windo
     return true;
 }
 
+void ContrastEffect::prePaintWindow(EffectWindow *w, WindowPrePaintData &data, std::chrono::milliseconds presentTime)
+{
+    effects->prePaintWindow(w, data, presentTime);
+
+    // Force partial repaint to include the contrast region so doContrast*()'s
+    // blit/sample sees a freshly-rendered background. Without this, if nothing
+    // below the contrast window dirtied this region, the swapchain still holds
+    // the previous frame's composite (already-contrasted background + window
+    // pixels on top), the capture pulls that in, and the contrast transform
+    // compounds frame-over-frame — visible as the plasmoid background "copying
+    // itself" onto its own panel area.
+    if (m_windowData.contains(w)) {
+        QRegion shape = contrastRegion(w).translated(w->pos().toPoint());
+        if (!shape.isEmpty()) {
+            // If a sibling effect (e.g. slidingpopups) has marked the window
+            // transformed, drawWindow() will apply translation/scale before
+            // doContrast*() captures — so the capture rect won't be at
+            // w->pos() any more. The shape we just added covers only the
+            // static position; expand it by a window-size margin in every
+            // cardinal direction to also cover the animation trajectory
+            // (slidingpopups slides by up to one window dim). Without this,
+            // mid-animation captures land on stale swapchain pixels and the
+            // contrast snapshot smears across the slide direction.
+            if (data.mask & PAINT_WINDOW_TRANSFORMED) {
+                const QRect frameGeo = w->frameGeometry().toAlignedRect();
+                shape += frameGeo.adjusted(-frameGeo.width(), -frameGeo.height(),
+                                           frameGeo.width(), frameGeo.height());
+            }
+            data.paint += shape;
+        }
+    }
+}
+
 void ContrastEffect::drawWindow(const RenderTarget &renderTarget, const RenderViewport &viewport, EffectWindow *w, int mask, const QRegion &region, WindowPaintData &data)
 {
     if (shouldContrast(w, mask, data)) {
