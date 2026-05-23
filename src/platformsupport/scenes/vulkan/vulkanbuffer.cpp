@@ -207,8 +207,22 @@ std::unique_ptr<VulkanBuffer> VulkanBuffer::create(VulkanContext *context, VkDev
         mappedData = allocationInfo.pMappedData;
     }
 
-    return std::unique_ptr<VulkanBuffer>(new VulkanBuffer(context, buffer, allocation, size,
-                                                          usageHint, persistentMap, mappedData));
+    // Cache whether the allocation ended up host-coherent — VMA's
+    // VMA_MEMORY_USAGE_AUTO_PREFER_HOST + requiredFlags above ask for it
+    // and on every driver we care about it is honored, but we still query
+    // once here so the per-call flush() path doesn't have to hit VMA twice
+    // for what is, in steady state, always a no-op.
+    bool hostCoherent = true;
+    {
+        VkMemoryPropertyFlags memProps = 0;
+        vmaGetAllocationMemoryProperties(VulkanAllocator::allocator(), allocation, &memProps);
+        hostCoherent = (memProps & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+    }
+
+    auto buf = std::unique_ptr<VulkanBuffer>(new VulkanBuffer(context, buffer, allocation, size,
+                                                              usageHint, persistentMap, mappedData));
+    buf->m_hostCoherent = hostCoherent;
+    return buf;
 }
 
 std::unique_ptr<VulkanBuffer> VulkanBuffer::createVertexBuffer(VulkanContext *context, VkDeviceSize size, MemoryHint memoryHint)
@@ -309,15 +323,12 @@ void VulkanBuffer::unmap()
 
 void VulkanBuffer::flush(VkDeviceSize offset, VkDeviceSize size)
 {
-    // With VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, flushes are unnecessary
-    VmaAllocationInfo allocInfo;
-    vmaGetAllocationInfo(VulkanAllocator::allocator(), m_allocation, &allocInfo);
-
-    VkMemoryPropertyFlags memProps;
-    vmaGetAllocationMemoryProperties(VulkanAllocator::allocator(), m_allocation, &memProps);
-
-    // Only flush if memory is NOT coherent
-    if (!(memProps & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+    // Coherency is determined once at creation. The hot path — uniform
+    // buffer uploads inside renderNodes — hits this per node per frame,
+    // so dropping the per-call vmaGetAllocationInfo + vmaGetAllocationMemoryProperties
+    // pair turns flush() into a single predicted branch when the memory
+    // is coherent (which it is on every driver we care about).
+    if (!m_hostCoherent) {
         vmaFlushAllocation(VulkanAllocator::allocator(), m_allocation, offset, size);
     }
 }

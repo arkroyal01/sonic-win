@@ -252,6 +252,9 @@ private:
     VkDeviceSize m_size = 0;
     UsageHint m_usage;
     bool m_persistentlyMapped = false;
+    // Resolved at allocation time so flush() doesn't have to ask VMA every
+    // call. Coherent memory makes vmaFlushAllocation a no-op.
+    bool m_hostCoherent = true;
     void *m_mappedData = nullptr;
     VkDeviceSize m_currentOffset = 0;
 };

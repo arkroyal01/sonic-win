@@ -153,7 +153,7 @@ ItemRendererVulkan::ItemRendererVulkan(VulkanBackend *backend)
         fr.streamingBuffer = VulkanBuffer::createStreamingBuffer(m_context, 4 * 1024 * 1024);
         fr.uniformBuffer = VulkanBuffer::createUniformBuffer(
             m_context,
-            sizeof(VulkanUniforms) * 1024); // Support up to 1024 draws per frame
+            sizeof(VulkanUniforms) * kMaxUniformDrawsPerFrame);
     }
 
     // Create default 1x1 white texture for non-textured draws
@@ -1467,7 +1467,15 @@ void ItemRendererVulkan::renderNodes(const RenderContext &context, VkCommandBuff
 
         // Uniform slot cursor is per-frame (reset in beginFrame) and indexes this
         // frame slot's own uniform buffer, so there is no cross-frame aliasing.
-        const VkDeviceSize uniformOffset = (m_uniformDrawIndex % 1024) * sizeof(VulkanUniforms);
+        // Within a frame the index wraps at kMaxUniformDrawsPerFrame; if a frame
+        // ever exceeds that, the wrap silently aliases an earlier draw's
+        // uniforms — warn once so the constant can be raised.
+        if (m_uniformDrawIndex == kMaxUniformDrawsPerFrame) {
+            qCWarning(KWIN_CORE) << "Uniform buffer slot count" << kMaxUniformDrawsPerFrame
+                                 << "exceeded this frame; subsequent draws alias earlier ones."
+                                 << "Raise kMaxUniformDrawsPerFrame.";
+        }
+        const VkDeviceSize uniformOffset = (m_uniformDrawIndex % kMaxUniformDrawsPerFrame) * sizeof(VulkanUniforms);
         uniformBuffer->upload(&uniforms, sizeof(VulkanUniforms), uniformOffset);
         m_uniformDrawIndex++;
 

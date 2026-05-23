@@ -339,6 +339,12 @@ private:
     static constexpr uint32_t kFramesInFlight = 2;
     static constexpr uint32_t kOffscreenSlot = kFramesInFlight;
     static constexpr uint32_t kBufferSlots = kFramesInFlight + 1;
+    // Slots in each frame's uniform buffer; m_uniformDrawIndex is taken
+    // modulo this to address the slot. Sized for a busy multi-window
+    // session — exceeding it would silently alias an earlier draw's
+    // uniforms, so renderNodes() warns once when m_uniformDrawIndex would
+    // wrap so the size can be raised before the silent corruption.
+    static constexpr uint32_t kMaxUniformDrawsPerFrame = 1024;
 
     struct FrameResources
     {
