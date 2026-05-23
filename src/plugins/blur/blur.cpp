@@ -1224,6 +1224,13 @@ bool BlurEffect::initVulkanResources()
     dsLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     dsLayoutInfo.bindingCount = 1;
     dsLayoutInfo.pBindings = &dsBinding;
+    // Push-descriptor flag: each blur pass binds one input texture per draw,
+    // so push avoids an allocate/update for every iteration. The immutable
+    // sampler is unaffected — VkDescriptorImageInfo.sampler is ignored for
+    // immutable-sampler bindings whether via pool or push.
+    if (m_vulkanCtx->backend()->supportsPushDescriptor()) {
+        dsLayoutInfo.flags |= VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+    }
     if (vkCreateDescriptorSetLayout(device, &dsLayoutInfo, nullptr, &m_vulkanBlurDsLayout) != VK_SUCCESS)
         return false;
 
@@ -1533,8 +1540,6 @@ void BlurEffect::blurVulkan(const RenderTarget &renderTarget, const RenderViewpo
         return;
     }
 
-    VkDevice device = m_vulkanCtx->backend()->device();
-
     // Compute blur region in device pixels. Mirror the GL path so the blur follows
     // window transforms (e.g. slidingpopups translates the window while it animates;
     // without this the blur snaps to the final geometry on frame one).
@@ -1682,20 +1687,18 @@ void BlurEffect::blurVulkan(const RenderTarget &renderTarget, const RenderViewpo
 
     // Helper: bind source texture as descriptor set
     auto bindSrc = [&](VulkanTexture *src) {
-        VkDescriptorSet ds = m_vulkanCtx->allocateDescriptorSet(m_vulkanBlurDsLayout);
         VkDescriptorImageInfo imgInfo{};
         imgInfo.imageView = src->imageView();
         imgInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         VkWriteDescriptorSet wr{};
         wr.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        wr.dstSet = ds;
         wr.dstBinding = 0;
         wr.descriptorCount = 1;
         wr.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         wr.pImageInfo = &imgInfo;
-        vkUpdateDescriptorSets(device, 1, &wr, 0, nullptr);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                m_vulkanBlurPipelineLayout, 0, 1, &ds, 0, nullptr);
+        m_vulkanCtx->bindDescriptors(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                     m_vulkanBlurPipelineLayout, m_vulkanBlurDsLayout,
+                                     0, 1, &wr);
     };
 
     // Helper: set full-texture viewport/scissor (with Y-flip)

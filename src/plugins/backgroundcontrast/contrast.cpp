@@ -727,6 +727,11 @@ bool ContrastEffect::initVulkanResources()
     dsLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     dsLayoutInfo.bindingCount = 1;
     dsLayoutInfo.pBindings = &dsBinding;
+    // Push-descriptor flag: contrast binds one capture texture per affected
+    // window per frame, so push avoids the per-window pool allocate/update.
+    if (m_vulkanCtx->backend()->supportsPushDescriptor()) {
+        dsLayoutInfo.flags |= VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+    }
     if (vkCreateDescriptorSetLayout(device, &dsLayoutInfo, nullptr, &m_vulkanDsLayout) != VK_SUCCESS)
         return false;
 
@@ -915,8 +920,6 @@ void ContrastEffect::doContrastVulkan(const RenderTarget &renderTarget, const Re
     if (swapchainImage == VK_NULL_HANDLE)
         return;
 
-    VkDevice device = m_vulkanCtx->backend()->device();
-
     const QRect backgroundRect = shape.boundingRect();
     if (backgroundRect.isEmpty())
         return;
@@ -1005,19 +1008,16 @@ void ContrastEffect::doContrastVulkan(const RenderTarget &renderTarget, const Re
                VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
 
-    // Allocate and write descriptor set for the capture texture
-    VkDescriptorSet ds = m_vulkanCtx->allocateDescriptorSet(m_vulkanDsLayout);
+    // Bind the capture texture for the contrast draw.
     VkDescriptorImageInfo imgInfo{};
     imgInfo.imageView = tex->imageView();
     imgInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     VkWriteDescriptorSet wr{};
     wr.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    wr.dstSet = ds;
     wr.dstBinding = 0;
     wr.descriptorCount = 1;
     wr.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     wr.pImageInfo = &imgInfo;
-    vkUpdateDescriptorSets(device, 1, &wr, 0, nullptr);
 
     // Push constants: 4x4 color matrix (column-major, matches GL convention) + opacity
     struct ContrastPc
@@ -1040,8 +1040,12 @@ void ContrastEffect::doContrastVulkan(const RenderTarget &renderTarget, const Re
     vkCmdBeginRenderPass(cmd, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_vulkanPipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_vulkanPipelineLayout,
-                            0, 1, &ds, 0, nullptr);
+    if (!m_vulkanCtx->bindDescriptors(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                      m_vulkanPipelineLayout, m_vulkanDsLayout,
+                                      0, 1, &wr)) {
+        vkCmdEndRenderPass(cmd);
+        return;
+    }
     vkCmdPushConstants(cmd, m_vulkanPipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT,
                        0, sizeof(pc), &pc);
 
