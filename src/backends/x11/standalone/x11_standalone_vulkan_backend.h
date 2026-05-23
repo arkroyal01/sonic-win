@@ -202,6 +202,16 @@ private:
     std::chrono::nanoseconds m_presentInterval{};
     bool m_loggedPresentTiming = false;
 
+    // VK_TIME_DOMAIN_PRESENT_STAGE_LOCAL_EXT is implementation-defined; on
+    // Mesa/X11 the values are CLOCK_MONOTONIC nanoseconds (sourced from the
+    // X11 PresentCompleteNotify ust), but the spec doesn't guarantee that.
+    // Calibrated against clock_gettime(CLOCK_MONOTONIC) on the first sample
+    // and either accepted or rejected for the lifetime of the swapchain.
+    enum class LocalDomainStatus : uint8_t { Unknown,
+                                             MonotonicNs,
+                                             NotUsable };
+    LocalDomainStatus m_presentTimingLocalDomain = LocalDomainStatus::Unknown;
+
     // --- Partial repaint / manual buffer-age tracking ---
     // Enabled via KWIN_VULKAN_PARTIAL_REPAINT=1.
     bool m_partialRepaint = false;

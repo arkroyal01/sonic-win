@@ -479,16 +479,45 @@ void X11StandaloneVulkanBackend::drainPresentTiming()
         if (t.presentId <= m_lastTimedPresentId || t.presentId <= newestId) {
             continue;
         }
-        if (t.timeDomain != VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR
+        const bool domainIsLocal = t.timeDomain == VK_TIME_DOMAIN_PRESENT_STAGE_LOCAL_EXT;
+        if (!domainIsLocal
+            && t.timeDomain != VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR
             && t.timeDomain != VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_KHR) {
             // A time domain we cannot relate to steady_clock — skip it.
             continue;
         }
+        if (domainIsLocal && m_presentTimingLocalDomain == LocalDomainStatus::NotUsable) {
+            continue;
+        }
         for (uint32_t s = 0; s < t.presentStageCount; ++s) {
-            if (t.pPresentStages[s].stage & kOnScreenStages) {
-                newestId = t.presentId;
-                newestTime = std::chrono::nanoseconds(static_cast<int64_t>(t.pPresentStages[s].time));
+            if (!(t.pPresentStages[s].stage & kOnScreenStages)) {
+                continue;
             }
+            const uint64_t stageTime = t.pPresentStages[s].time;
+            if (domainIsLocal && m_presentTimingLocalDomain == LocalDomainStatus::Unknown) {
+                // PRESENT_STAGE_LOCAL_EXT is implementation-defined. On Mesa/X11
+                // its values are CLOCK_MONOTONIC nanoseconds (the ust from
+                // PresentCompleteNotify); verify before trusting. A different
+                // driver could expose e.g. a swapchain-local counter that would
+                // look wildly off "now".
+                const int64_t nowNs = monotonicNow().count();
+                const int64_t diffMs = (static_cast<int64_t>(stageTime) - nowNs) / 1'000'000;
+                constexpr int64_t kSaneWindowMs = 60'000;
+                if (diffMs < -kSaneWindowMs || diffMs > kSaneWindowMs) {
+                    m_presentTimingLocalDomain = LocalDomainStatus::NotUsable;
+                    qCWarning(KWIN_X11STANDALONE).nospace()
+                        << "VK_EXT_present_timing: PRESENT_STAGE_LOCAL_EXT does not look "
+                        << "like CLOCK_MONOTONIC (off by " << diffMs << " ms); rejecting "
+                        << "this domain for this swapchain. estimatePresentTime() will "
+                        << "fall back to monotonicNow().";
+                    break;
+                }
+                m_presentTimingLocalDomain = LocalDomainStatus::MonotonicNs;
+                qCDebug(KWIN_X11STANDALONE) << "VK_EXT_present_timing: PRESENT_STAGE_LOCAL_EXT "
+                                               "calibrated as CLOCK_MONOTONIC nanoseconds";
+            }
+            newestId = t.presentId;
+            newestTime = std::chrono::nanoseconds(static_cast<int64_t>(stageTime));
         }
     }
     if (newestId == 0) {
@@ -703,9 +732,11 @@ bool X11StandaloneVulkanBackend::present(Output *output, const std::shared_ptr<O
                 // Recreated images start blank — drop stale age tracking.
                 resetDamageTracking();
                 // The new swapchain restarts timing; drop the stale anchor and
-                // re-arm the timing queue on it.
+                // re-arm the timing queue on it. PRESENT_STAGE_LOCAL_EXT
+                // semantics are per-swapchain, so re-calibrate from scratch.
                 m_lastTimedPresentId = 0;
                 m_presentInterval = std::chrono::nanoseconds{};
+                m_presentTimingLocalDomain = LocalDomainStatus::Unknown;
                 setupPresentTimingQueue();
             }
         }
