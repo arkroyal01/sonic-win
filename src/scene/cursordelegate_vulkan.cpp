@@ -237,13 +237,6 @@ void CursorDelegateVulkan::paint(const RenderTarget &renderTarget, const QRegion
                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                        0, sizeof(VulkanPushConstants), &pc);
 
-    VkDescriptorSet ds = m_context->allocateDescriptorSet(pipeline->descriptorSetLayout());
-    if (ds == VK_NULL_HANDLE) {
-        m_overlayRenderPass->end(cmd);
-        m_context->endSingleTimeCommands(cmd);
-        return;
-    }
-
     VulkanTexture *cursorTex = m_offscreenFramebuffer->colorTexture();
     VulkanTexture *whiteTex = m_defaultWhiteTexture.get();
 
@@ -266,22 +259,24 @@ void CursorDelegateVulkan::paint(const RenderTarget &renderTarget, const QRegion
 
     std::array<VkWriteDescriptorSet, 2> writes{};
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[0].dstSet = ds;
     writes[0].dstBinding = 0;
     writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     writes[0].descriptorCount = 4;
     writes[0].pImageInfo = imageInfos.data();
 
     writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[1].dstSet = ds;
     writes[1].dstBinding = 1;
     writes[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     writes[1].descriptorCount = 1;
     writes[1].pBufferInfo = &bufferInfo;
 
-    vkUpdateDescriptorSets(m_context->backend()->device(), 2, writes.data(), 0, nullptr);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            pipeline->layout(), 0, 1, &ds, 0, nullptr);
+    if (!m_context->bindDescriptors(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                    pipeline->layout(), pipeline->descriptorSetLayout(),
+                                    0, writes.size(), writes.data())) {
+        m_overlayRenderPass->end(cmd);
+        m_context->endSingleTimeCommands(cmd);
+        return;
+    }
 
     const VkBuffer vb = m_vertexBuffer->buffer();
     const VkDeviceSize vbOffset = 0;
