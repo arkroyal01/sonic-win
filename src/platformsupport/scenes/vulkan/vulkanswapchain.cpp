@@ -292,9 +292,17 @@ bool VulkanSwapchain::createSwapchain(const QSize &size)
     createInfo.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
     // Enable VK_EXT_present_timing on this swapchain so its timing queue can
     // collect timestamps — a prerequisite for vkSetSwapchainPresentTimingQueueSizeEXT
-    // and vkGetPastPresentationTimingEXT to return anything.
+    // and vkGetPastPresentationTimingEXT to return anything. The timing chain
+    // also uses VkPresentId2KHR (PRESENT_ID_2 flag) and the async monitor uses
+    // vkWaitForPresent2KHR (PRESENT_WAIT_2 flag) — opt the swapchain into both
+    // so the queue-present path inside Mesa accepts the corresponding pNext
+    // entries and the wait function has the per-image bookkeeping it needs.
     if (m_context->backend()->presentTimingEnabled()) {
         createInfo.flags |= VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT;
+        createInfo.flags |= VK_SWAPCHAIN_CREATE_PRESENT_ID_2_BIT_KHR;
+        if (m_context->backend()->supportsPresentWait2()) {
+            createInfo.flags |= VK_SWAPCHAIN_CREATE_PRESENT_WAIT_2_BIT_KHR;
+        }
     }
     createInfo.surface = m_surface;
     createInfo.minImageCount = imageCount;
