@@ -403,9 +403,6 @@ private:
     // Track vertex buffer offset for streaming (reset each frame)
     size_t m_vertexBufferOffset = 0;
 
-    // Track descriptor sets allocated during frame for cleanup
-    std::vector<VkDescriptorSet> m_frameDescriptorSets;
-
     // External wait semaphores attached by effects this frame (cleared in endFrame).
     std::vector<VkSemaphore> m_externalWaitSemaphores;
     std::vector<VkPipelineStageFlags> m_externalWaitStages;

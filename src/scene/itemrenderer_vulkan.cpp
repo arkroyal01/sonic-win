@@ -235,9 +235,6 @@ void ItemRendererVulkan::beginFrame(const RenderTarget &renderTarget, const Rend
     m_offscreenUniformDrawIndex = 0;
     m_offscreenSlotStack.clear();
 
-    // Clear descriptor sets from previous frame (should be empty after endFrame cleanup)
-    m_frameDescriptorSets.clear();
-
     // Allocate command buffer for this frame
     m_currentCommandBuffer = m_context->allocateCommandBuffer();
     if (m_currentCommandBuffer == VK_NULL_HANDLE) {
@@ -861,11 +858,6 @@ void ItemRendererVulkan::endFrame()
             }
         }
         m_releasePoints.clear();
-
-        // Descriptor sets are not explicitly freed here - they will be freed when
-        // the descriptor pool is reset at the start of the next frame when
-        // m_outputsInFlight reaches 0. This avoids CPU stalls from vkDeviceWaitIdle.
-        m_frameDescriptorSets.clear();
     } else {
         // Fallback: no swapchain semaphores, use non-blocking synchronization
         // This path is used for:
@@ -938,10 +930,6 @@ void ItemRendererVulkan::endFrame()
 
         m_context->freeCommandBuffer(m_currentCommandBuffer);
         m_currentCommandBuffer = VK_NULL_HANDLE;
-
-        // Descriptor sets will be freed when the descriptor pool is reset at the start
-        // of the next frame (when m_outputsInFlight reaches 0), avoiding CPU stalls
-        m_frameDescriptorSets.clear();
     }
 
     // Defer freeing to the start of the next beginFrame(), where doBeginFrame() has
