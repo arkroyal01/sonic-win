@@ -29,7 +29,6 @@ class WindowThumbnailSource;
 #if HAVE_VULKAN
 class VulkanRenderPass;
 class VulkanFramebuffer;
-class VulkanTexture;
 #endif
 class WindowThumbnailSource : public QObject
 {
@@ -50,26 +49,6 @@ public:
     Frame acquire();
     QImage acquireImage() const;
 
-#if HAVE_VULKAN
-    /**
-     * @brief A zero-copy reference to the most recently rendered Vulkan
-     *        thumbnail.
-     *
-     * The texture is owned by this source and lives until the next size
-     * change (or destruction). @c handle identifies the GPU submission that
-     * produced the current contents — consumers must wait on it before
-     * sampling, either via @c VulkanContext::waitForSubmit() or by chaining
-     * a semaphore. Replaces the old QImage readback+reupload round-trip.
-     */
-    struct VulkanFrame
-    {
-        VulkanTexture *texture = nullptr;
-        VulkanSubmitHandle handle;
-        QSize size;
-    };
-    VulkanFrame acquireVulkan() const;
-#endif
-
 Q_SIGNALS:
     void changed();
 
@@ -89,14 +68,23 @@ private:
 
 #if HAVE_VULKAN
     // Persistent offscreen target: render pass + framebuffer (which owns the
-    // color texture). Recreated only when the thumbnail size changes; sampled
-    // zero-copy by QtQuick via QSGVulkanTexture::fromNative.
+    // color texture). Recreated only when the thumbnail size changes — the
+    // hot path no longer reallocates VkImage memory per frame.
+    //
+    // QtQuick's RHI on this codebase is OpenGL even when the compositor is
+    // Vulkan (compositor_x11.cpp pins setGraphicsApi(OpenGL) for the Vulkan
+    // path), so zero-copy import via QSGVulkanTexture::fromNative is not
+    // available — that handed Qt a Vulkan handle Qt's GL backend could not
+    // interpret, producing the wrong-sized thumbnails / wallpaper regressed
+    // in earlier zero-copy attempts. Instead, render here, then read back
+    // into m_cachedImage which updatePaintNode() uploads via Qt's GL RHI.
     std::unique_ptr<VulkanRenderPass> m_vkRenderPass;
     std::unique_ptr<VulkanFramebuffer> m_vkOffscreenFbo;
-    // Identifies the most recent updateVulkan() submission. updatePaintNode()
-    // waits on this before letting QtQuick sample the texture, so the GPU's
-    // writes are visible. Stays usable across frames — a completed handle is
-    // a no-op wait.
+    QImage m_cachedImage;
+    // Identifies the most recent updateVulkan() submission. readTextureToImage
+    // already waits on its own fence-scoped submit; this handle is kept
+    // around so a future caller can switch to GPU-GPU sync without another
+    // schema change.
     VulkanSubmitHandle m_vkSubmitHandle;
     qreal m_vkLastDpr = 1.0;
 #endif
