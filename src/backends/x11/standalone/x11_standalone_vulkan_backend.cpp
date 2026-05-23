@@ -466,7 +466,12 @@ void X11StandaloneVulkanBackend::drainPresentTiming()
     }
 
     // Pick the newest completed present that carries an on-screen
-    // (FIRST_PIXEL_VISIBLE) timestamp in a monotonic time domain.
+    // (FIRST_PIXEL_VISIBLE or FIRST_PIXEL_OUT) timestamp in a monotonic time
+    // domain. Compositors that don't model per-display latency report
+    // FIRST_PIXEL_OUT — Mesa's WSI included — so treat it as on-screen too.
+    constexpr VkPresentStageFlagsEXT kOnScreenStages =
+        VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_VISIBLE_BIT_EXT
+        | VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT;
     uint64_t newestId = 0;
     std::chrono::nanoseconds newestTime{};
     for (uint32_t i = 0; i < props.presentationTimingCount; ++i) {
@@ -480,7 +485,7 @@ void X11StandaloneVulkanBackend::drainPresentTiming()
             continue;
         }
         for (uint32_t s = 0; s < t.presentStageCount; ++s) {
-            if (t.pPresentStages[s].stage & VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_VISIBLE_BIT_EXT) {
+            if (t.pPresentStages[s].stage & kOnScreenStages) {
                 newestId = t.presentId;
                 newestTime = std::chrono::nanoseconds(static_cast<int64_t>(t.pPresentStages[s].time));
             }
