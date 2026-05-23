@@ -29,6 +29,7 @@ class WindowThumbnailSource;
 #if HAVE_VULKAN
 class VulkanRenderPass;
 class VulkanFramebuffer;
+class VulkanTexture;
 #endif
 class WindowThumbnailSource : public QObject
 {
@@ -48,6 +49,27 @@ public:
 
     Frame acquire();
     QImage acquireImage() const;
+
+#if HAVE_VULKAN
+    /**
+     * @brief A reference to the most recently rendered Vulkan thumbnail target,
+     *        consumed zero-copy when Qt Quick's RHI is Vulkan.
+     *
+     * @c framebuffer is a shared_ptr so the provider can keep the underlying
+     * VulkanTexture alive across resize-induced replacements — without that,
+     * Qt's render node would briefly hold a QSGTexture wrapping a freed VkImage
+     * and produce the wrong-sized / flickering thumbnails the previous attempt
+     * regressed. @c handle identifies the GPU submission that produced the
+     * current contents; consumers must wait on it before sampling.
+     */
+    struct VulkanFrame
+    {
+        std::shared_ptr<VulkanFramebuffer> framebuffer;
+        VulkanSubmitHandle handle;
+        QSize size;
+    };
+    VulkanFrame acquireVulkan() const;
+#endif
 
 Q_SIGNALS:
     void changed();
@@ -71,22 +93,37 @@ private:
     // color texture). Recreated only when the thumbnail size changes — the
     // hot path no longer reallocates VkImage memory per frame.
     //
-    // QtQuick's RHI on this codebase is OpenGL even when the compositor is
-    // Vulkan (compositor_x11.cpp pins setGraphicsApi(OpenGL) for the Vulkan
-    // path), so zero-copy import via QSGVulkanTexture::fromNative is not
-    // available — that handed Qt a Vulkan handle Qt's GL backend could not
-    // interpret, producing the wrong-sized thumbnails / wallpaper regressed
-    // in earlier zero-copy attempts. Instead, render here, then read back
-    // into m_cachedImage which updatePaintNode() uploads via Qt's GL RHI.
+    // m_vkOffscreenFbo is shared_ptr so the texture provider can hold a
+    // reference while Qt's render node still wraps it. On a thumbnail resize
+    // we drop our reference and create a new framebuffer; the previous one
+    // stays alive in the provider until updatePaintNode() swaps to the new
+    // one. Without that, the QSGTexture from QSGVulkanTexture::fromNative
+    // would dangle pointing at a freed VkImage and the scene graph would
+    // sample garbage for a frame — the exact symptom (wrong-sized
+    // wallpaper, half-containment thumbnails, flicker) that retired the
+    // first zero-copy attempt.
+    //
+    // Two consumer paths, picked in updatePaintNode based on Qt Quick's
+    // graphics API:
+    //   * Vulkan RHI (Phase A): zero-copy import via QSGVulkanTexture
+    //     ::fromNative — no readback, no upload, no QImage.
+    //   * OpenGL RHI (fallback, e.g. KWIN_FORCE_QT_GL_RHI=1): readback
+    //     into m_cachedImage and upload via createTextureFromImage.
+    // The path is decided once and cached in m_qtRhiIsVulkan so the render
+    // side knows whether to spend the readback or skip it.
     std::unique_ptr<VulkanRenderPass> m_vkRenderPass;
-    std::unique_ptr<VulkanFramebuffer> m_vkOffscreenFbo;
+    std::shared_ptr<VulkanFramebuffer> m_vkOffscreenFbo;
     QImage m_cachedImage;
-    // Identifies the most recent updateVulkan() submission. readTextureToImage
-    // already waits on its own fence-scoped submit; this handle is kept
-    // around so a future caller can switch to GPU-GPU sync without another
-    // schema change.
     VulkanSubmitHandle m_vkSubmitHandle;
     qreal m_vkLastDpr = 1.0;
+    // Resolved once on first updateVulkan() call from
+    // m_view->rendererInterface()->graphicsApi(); selects whether to spend
+    // the GPU->CPU readback at render time. Stays valid for this source's
+    // lifetime — Qt's graphicsApi is process-global and set once.
+    enum class QtRhi : uint8_t { Unknown,
+                                 Vulkan,
+                                 OpenGL };
+    mutable QtRhi m_qtRhi = QtRhi::Unknown;
 #endif
 };
 
