@@ -369,11 +369,6 @@ void MouseMarkEffect::paintVulkan(const RenderTarget &renderTarget, const Render
     }
     uboBuf->upload(&ubo, sizeof(ubo));
 
-    VkDescriptorSet ds = ctx->allocateDescriptorSet(pipeline->descriptorSetLayout());
-    if (ds == VK_NULL_HANDLE) {
-        return;
-    }
-
     const VkDescriptorImageInfo imgInfo{whiteTex->sampler(), whiteTex->imageView(),
                                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     const std::array<VkDescriptorImageInfo, 4> imageInfos{imgInfo, imgInfo, imgInfo, imgInfo};
@@ -384,24 +379,25 @@ void MouseMarkEffect::paintVulkan(const RenderTarget &renderTarget, const Render
 
     std::array<VkWriteDescriptorSet, 2> writes{};
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[0].dstSet = ds;
     writes[0].dstBinding = 0;
     writes[0].descriptorCount = 4;
     writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     writes[0].pImageInfo = imageInfos.data();
     writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[1].dstSet = ds;
     writes[1].dstBinding = 1;
     writes[1].descriptorCount = 1;
     writes[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     writes[1].pBufferInfo = &bufInfo;
-    vkUpdateDescriptorSets(ctx->backend()->device(), 2, writes.data(), 0, nullptr);
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->pipeline());
     vkCmdPushConstants(cmd, pipeline->layout(),
                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                        0, sizeof(VulkanPushConstants), &pc);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->layout(), 0, 1, &ds, 0, nullptr);
+    if (!ctx->bindDescriptors(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                              pipeline->layout(), pipeline->descriptorSetLayout(),
+                              0, writes.size(), writes.data())) {
+        return;
+    }
 
     const VkBuffer vb = vertBuf->buffer();
     const VkDeviceSize vbOffset = 0;

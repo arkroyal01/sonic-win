@@ -459,11 +459,6 @@ void ColorBlindnessCorrectionEffect::paintVulkanCursor(const RenderTarget &rende
     }
     uboBuf->upload(&uniforms, sizeof(uniforms));
 
-    VkDescriptorSet ds = ctx->allocateDescriptorSet(m_vkCursorPipeline->descriptorSetLayout());
-    if (ds == VK_NULL_HANDLE) {
-        return;
-    }
-
     const VkDescriptorImageInfo imgInfo{m_vkCursorTexture->sampler(), m_vkCursorTexture->imageView(),
                                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     const std::array<VkDescriptorImageInfo, 4> imageInfos{imgInfo, imgInfo, imgInfo, imgInfo};
@@ -471,25 +466,25 @@ void ColorBlindnessCorrectionEffect::paintVulkanCursor(const RenderTarget &rende
 
     std::array<VkWriteDescriptorSet, 2> writes{};
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[0].dstSet = ds;
     writes[0].dstBinding = 0;
     writes[0].descriptorCount = 4;
     writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     writes[0].pImageInfo = imageInfos.data();
     writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[1].dstSet = ds;
     writes[1].dstBinding = 1;
     writes[1].descriptorCount = 1;
     writes[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     writes[1].pBufferInfo = &bufInfo;
-    vkUpdateDescriptorSets(ctx->backend()->device(), 2, writes.data(), 0, nullptr);
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_vkCursorPipeline->pipeline());
     vkCmdPushConstants(cmd, m_vkCursorPipeline->layout(),
                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                        0, sizeof(VulkanPushConstants), &pc);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            m_vkCursorPipeline->layout(), 0, 1, &ds, 0, nullptr);
+    if (!ctx->bindDescriptors(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                              m_vkCursorPipeline->layout(), m_vkCursorPipeline->descriptorSetLayout(),
+                              0, writes.size(), writes.data())) {
+        return;
+    }
     const VkBuffer vb = vertBuf->buffer();
     const VkDeviceSize vbOffset = 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &vbOffset);
@@ -594,11 +589,6 @@ void ColorBlindnessCorrectionEffect::colorBlindnessVulkanPostPass(VkCommandBuffe
     }
     uboBuf->upload(&uniforms, sizeof(uniforms));
 
-    VkDescriptorSet ds = ctx->allocateDescriptorSet(pipeline->descriptorSetLayout());
-    if (ds == VK_NULL_HANDLE) {
-        return;
-    }
-
     const VkDescriptorImageInfo imgInfo{sceneCapture->sampler(), sceneCapture->imageView(),
                                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     const std::array<VkDescriptorImageInfo, 4> imageInfos{imgInfo, imgInfo, imgInfo, imgInfo};
@@ -606,25 +596,25 @@ void ColorBlindnessCorrectionEffect::colorBlindnessVulkanPostPass(VkCommandBuffe
 
     std::array<VkWriteDescriptorSet, 2> writes{};
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[0].dstSet = ds;
     writes[0].dstBinding = 0;
     writes[0].descriptorCount = 4;
     writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     writes[0].pImageInfo = imageInfos.data();
     writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[1].dstSet = ds;
     writes[1].dstBinding = 1;
     writes[1].descriptorCount = 1;
     writes[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     writes[1].pBufferInfo = &bufInfo;
-    vkUpdateDescriptorSets(ctx->backend()->device(), 2, writes.data(), 0, nullptr);
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->pipeline());
     vkCmdPushConstants(cmd, pipeline->layout(),
                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                        0, sizeof(VulkanPushConstants), &pc);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            pipeline->layout(), 0, 1, &ds, 0, nullptr);
+    if (!ctx->bindDescriptors(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                              pipeline->layout(), pipeline->descriptorSetLayout(),
+                              0, writes.size(), writes.data())) {
+        return;
+    }
     const VkBuffer vb = vertBuf->buffer();
     const VkDeviceSize vbOffset = 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &vbOffset);
