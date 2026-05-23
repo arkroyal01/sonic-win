@@ -321,6 +321,7 @@ bool VulkanBackend::createDevice(const QList<const char *> &requiredDeviceExtens
     bool hasPresentTiming = false;
     bool hasPresentId = false;
     bool hasPresentWait2 = false;
+    bool hasPushDescriptor = false;
     for (const auto &ext : availableExtensions) {
         if (strcmp(ext.extensionName, VK_KHR_EXTERNAL_FENCE_FD_EXTENSION_NAME) == 0) {
             hasExternalFenceFd = true;
@@ -340,6 +341,9 @@ bool VulkanBackend::createDevice(const QList<const char *> &requiredDeviceExtens
         if (strcmp(ext.extensionName, VK_KHR_PRESENT_WAIT_2_EXTENSION_NAME) == 0) {
             hasPresentWait2 = true;
         }
+        if (strcmp(ext.extensionName, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME) == 0) {
+            hasPushDescriptor = true;
+        }
     }
 
     // Enable external fence fd extension if available (requires external_fence_capabilities)
@@ -355,6 +359,14 @@ bool VulkanBackend::createDevice(const QList<const char *> &requiredDeviceExtens
         extensions.push_back(VK_KHR_INCREMENTAL_PRESENT_EXTENSION_NAME);
         m_supportsIncrementalPresent = true;
         qCDebug(KWIN_VULKAN) << "VK_KHR_incremental_present extension enabled";
+    }
+
+    // Enable push descriptors if available — replaces the per-draw alloc/update/
+    // bind chain on the item renderer hot path with a single inline command.
+    if (hasPushDescriptor) {
+        extensions.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
+        m_supportsPushDescriptor = true;
+        qCDebug(KWIN_VULKAN) << "VK_KHR_push_descriptor extension enabled";
     }
 
     // Enable VK_EXT_present_timing (+ its VK_KHR_present_id2 dependency) for real
@@ -455,6 +467,15 @@ bool VulkanBackend::createDevice(const QList<const char *> &requiredDeviceExtens
         if (!m_vkWaitForPresent2KHR) {
             qCWarning(KWIN_VULKAN) << "Failed to load vkWaitForPresent2KHR, disabling present wait";
             m_supportsPresentWait2 = false;
+        }
+    }
+
+    if (m_supportsPushDescriptor) {
+        m_vkCmdPushDescriptorSetKHR = reinterpret_cast<PFN_vkCmdPushDescriptorSetKHR>(
+            vkGetDeviceProcAddr(m_device, "vkCmdPushDescriptorSetKHR"));
+        if (!m_vkCmdPushDescriptorSetKHR) {
+            qCWarning(KWIN_VULKAN) << "Failed to load vkCmdPushDescriptorSetKHR, disabling push descriptors";
+            m_supportsPushDescriptor = false;
         }
     }
 

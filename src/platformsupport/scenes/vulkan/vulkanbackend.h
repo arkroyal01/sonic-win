@@ -189,6 +189,26 @@ public:
     }
 
     /**
+     * @brief Whether VK_KHR_push_descriptor is enabled on the device.
+     *
+     * Lets per-draw descriptor state be encoded inline in the command buffer
+     * via vkCmdPushDescriptorSetKHR, removing the per-draw allocate→update→
+     * bind chain through the descriptor pool. Descriptor set layouts that
+     * want to use this path must be created with
+     * VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR.
+     */
+    bool supportsPushDescriptor() const
+    {
+        return m_supportsPushDescriptor;
+    }
+
+    /** @brief vkCmdPushDescriptorSetKHR (valid iff supportsPushDescriptor()). */
+    PFN_vkCmdPushDescriptorSetKHR cmdPushDescriptorSetKHR() const
+    {
+        return m_vkCmdPushDescriptorSetKHR;
+    }
+
+    /**
      * @brief The time-domain id put in VkPresentTimingInfoEXT — chosen by the
      * concrete backend from the swapchain's reported time domains.
      */
@@ -309,6 +329,12 @@ private:
     // the async present-timing monitor running on its own worker thread.
     bool m_supportsPresentWait2 = false;
     PFN_vkWaitForPresent2KHR m_vkWaitForPresent2KHR = nullptr;
+
+    // VK_KHR_push_descriptor — encode descriptor writes inline in the command
+    // buffer, skipping per-draw descriptor pool allocation + vkUpdateDescriptor
+    // Sets. Used by the item renderer and effects on the hot path.
+    bool m_supportsPushDescriptor = false;
+    PFN_vkCmdPushDescriptorSetKHR m_vkCmdPushDescriptorSetKHR = nullptr;
 
     // QVulkanInstance wrapping m_instance; created lazily for native Qt Quick.
     std::unique_ptr<QVulkanInstance> m_qVulkanInstance;
