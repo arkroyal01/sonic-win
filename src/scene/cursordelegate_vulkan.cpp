@@ -142,12 +142,6 @@ void CursorDelegateVulkan::paint(const RenderTarget &renderTarget, const QRegion
     renderLayer.delegate()->paint(offscreenRenderTarget, infiniteRegion());
     renderLayer.delegate()->postPaint();
 
-    // Drain the queue: ensures workspace rendering AND cursor scene rendering are complete
-    // before the overlay command buffer reads the cursor texture or writes to the swapchain image.
-    // After this call the cursor texture is in SHADER_READ_ONLY_OPTIMAL and the swapchain
-    // image is in PRESENT_SRC_KHR, both ready for the overlay render pass.
-    vkQueueWaitIdle(m_context->backend()->graphicsQueue());
-
     // Write quad vertices covering the cursor's local extent [0,w]×[0,h].
     // The MVP translates these into the correct screen position.
     const float w = static_cast<float>(bufferSize.width());
@@ -163,9 +157,40 @@ void CursorDelegateVulkan::paint(const RenderTarget &renderTarget, const QRegion
     m_vertexBuffer->upload(vertices, sizeof(vertices));
 
     // Record and submit the overlay command buffer.
-    // endSingleTimeCommands() calls vkQueueWaitIdle, guaranteeing the overlay is
-    // complete before present() is called by the caller.
+    // endSingleTimeCommands() now waits on this submission's own fence
+    // (Phase 0) — no queue drain. The caller can call present() afterwards
+    // knowing the overlay is complete.
     VkCommandBuffer cmd = m_context->beginSingleTimeCommands();
+
+    // Cross-submit visibility: the workspace and cursor-scene command
+    // buffers were submitted on this queue before us, and Vulkan submission
+    // ordering only guarantees execution order on a queue — memory
+    // visibility between submits has to be explicit. One global barrier
+    // covers both producers:
+    //   * workspace render pass wrote the swapchain image (COLOR_ATTACHMENT
+    //     _OUTPUT / COLOR_ATTACHMENT_WRITE), and the overlay render pass
+    //     loads from it (COLOR_ATTACHMENT_OUTPUT / COLOR_ATTACHMENT_READ
+    //     via loadOp=LOAD).
+    //   * cursor-scene render pass wrote the cursor texture (same producer
+    //     stage + access), and the overlay's fragment shader samples it
+    //     (FRAGMENT_SHADER / SHADER_READ).
+    // Replacing the prior vkQueueWaitIdle, this is a cheap GPU-side
+    // dependency that lets both producers run concurrently with whatever
+    // the queue picks up after them.
+    VkMemoryBarrier crossSubmitBarrier{};
+    crossSubmitBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    crossSubmitBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    crossSubmitBarrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT
+        | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+        | VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                             | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                         0,
+                         1, &crossSubmitBarrier,
+                         0, nullptr,
+                         0, nullptr);
 
     const QSize mainSize = mainFb->size();
     const VkRect2D renderArea{{0, 0}, {uint32_t(mainSize.width()), uint32_t(mainSize.height())}};
