@@ -248,14 +248,15 @@ OffscreenQuickView::OffscreenQuickView(ExportMode exportMode, bool alpha)
     // logging which graphics API Qt Quick actually ended up using and
     // whether the blit-via-QImage fallback was forced. Discoverable
     // diagnostic for the Vulkan-Qt-Quick rollout; doesn't ship anything at
-    // runtime cost beyond an env-var lookup.
+    // runtime cost beyond an env-var lookup. Logged at warning level so it
+    // appears without QT_LOGGING_RULES tweaks — the env var is the opt-in.
     static const bool debugQtRhi = qEnvironmentVariableIsSet("KWIN_DEBUG_QT_RHI");
     if (debugQtRhi) {
         const auto api = d->m_view->rendererInterface() ? d->m_view->rendererInterface()->graphicsApi()
                                                         : QSGRendererInterface::Unknown;
-        qCInfo(LIBKWINEFFECTS) << "OffscreenQuickView: Qt Quick graphicsApi=" << api
-                               << "useBlit=" << d->m_useBlit
-                               << "(compositor=" << (effects ? effects->compositingType() : -1) << ")";
+        qCWarning(LIBKWINEFFECTS) << "OffscreenQuickView: Qt Quick graphicsApi=" << api
+                                  << "useBlit=" << d->m_useBlit
+                                  << "(compositor=" << (effects ? effects->compositingType() : -1) << ")";
     }
 
     auto updateSize = [this]() {
