@@ -339,22 +339,12 @@ void X11Compositor::start()
             qCDebug(KWIN_CORE) << "Attempting to load the Vulkan scene";
             stop = attemptVulkanCompositing();
             if (stop) {
-                // Request Qt Quick on Vulkan so it can share kwin's VkDevice
-                // via QQuickGraphicsDevice::fromDeviceObjects() in
-                // OffscreenQuickView. The view's constructor already plumbs
-                // the device and falls back to its blit/QImage path if Qt's
-                // Vulkan RHI fails to initialize, so this is safe even on
-                // systems where Qt's Vulkan backend isn't usable.
-                //
-                // KWIN_FORCE_QT_GL_RHI=1 keeps the historical OpenGL Qt Quick
-                // setup as an escape hatch — useful for bisecting regressions
-                // or for drivers where Qt's Vulkan RHI is known-broken.
-                static const bool forceQtGl = qEnvironmentVariableIsSet("KWIN_FORCE_QT_GL_RHI");
-                if (forceQtGl) {
-                    QQuickWindow::setGraphicsApi(QSGRendererInterface::OpenGL);
-                } else {
-                    QQuickWindow::setGraphicsApi(QSGRendererInterface::Vulkan);
-                }
+                // Keep Qt Quick on OpenGL even with the Vulkan compositor.
+                // kwin's Vulkan compositing uses its own backend independently
+                // of Qt Quick. OffscreenQuickView renders QML to GL FBOs and
+                // blits to Vulkan textures via QImage — it does not need Qt
+                // Quick's scene graph backend to match the compositor.
+                QQuickWindow::setGraphicsApi(QSGRendererInterface::OpenGL);
             }
             break;
         case NoCompositing:
