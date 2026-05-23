@@ -459,12 +459,18 @@ void OffscreenQuickView::update()
         if (usingGl) {
             d->m_image = d->m_fbo->toImage();
             d->m_image.setDevicePixelRatio(d->m_view->effectiveDevicePixelRatio());
-        } else {
-            // grabWindow() works for any RHI backend Qt drives, including Vulkan,
-            // by triggering an internal readback. Costs a GPU→CPU sync; only paid
-            // when a caller explicitly asked for the image export path.
+        } else if (!usingVulkan) {
+            // Pre-Vulkan-RHI fallback (software / failed-init): grabWindow()
+            // readback is the only image path available, and the consumer
+            // either explicitly asked for an image (ExportMode::Image) or
+            // is sampling via bufferAsTexture which uploads from this image.
             d->m_image = d->m_view->grabWindow();
         }
+        // usingVulkan: skip the eager readback. The in-tree consumer on the
+        // Vulkan compositor (effecthandler.cpp's renderOffscreenQuickView
+        // Vulkan branch) reads vulkanTexture() directly, so m_image is
+        // computed and never used. bufferAsImage() lazily grabs the window
+        // if anything outside that path actually needs the QImage.
     }
 
     if (usingGl) {
@@ -681,6 +687,17 @@ GLTexture *OffscreenQuickView::bufferAsTexture()
 
 QImage OffscreenQuickView::bufferAsImage() const
 {
+#if HAVE_VULKAN
+    // On the Vulkan-Qt-RHI path update() deliberately skipped the eager
+    // grabWindow() readback because nothing on the Vulkan compositor's
+    // render path actually consumes m_image — vulkanTexture() is the
+    // direct consumer. The public API still has to honor a call, though,
+    // so populate lazily here. Pointer-PIMPL means d->m_image is mutable
+    // from a const method without needing the mutable keyword.
+    if (d->m_image.isNull() && d->m_vulkanBackend && d->m_view) {
+        d->m_image = d->m_view->grabWindow();
+    }
+#endif
     return d->m_image;
 }
 
