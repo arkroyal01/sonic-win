@@ -468,12 +468,7 @@ void X11StandaloneVulkanBackend::drainPresentTiming()
     }
 
     // Pick the newest completed present that carries an on-screen
-    // (FIRST_PIXEL_VISIBLE or FIRST_PIXEL_OUT) timestamp in a monotonic time
-    // domain. Compositors that don't model per-display latency report
-    // FIRST_PIXEL_OUT — Mesa's WSI included — so treat it as on-screen too.
-    constexpr VkPresentStageFlagsEXT kOnScreenStages =
-        VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_VISIBLE_BIT_EXT
-        | VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT;
+    // (FIRST_PIXEL_VISIBLE) timestamp in a monotonic time domain.
     uint64_t newestId = 0;
     std::chrono::nanoseconds newestTime{};
     for (uint32_t i = 0; i < props.presentationTimingCount; ++i) {
@@ -481,69 +476,21 @@ void X11StandaloneVulkanBackend::drainPresentTiming()
         if (t.presentId <= m_lastTimedPresentId || t.presentId <= newestId) {
             continue;
         }
-        const bool domainIsLocal = t.timeDomain == VK_TIME_DOMAIN_PRESENT_STAGE_LOCAL_EXT;
-        if (!domainIsLocal
-            && t.timeDomain != VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR
+        if (t.timeDomain != VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR
             && t.timeDomain != VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_KHR) {
             // A time domain we cannot relate to steady_clock — skip it.
             continue;
         }
-        if (domainIsLocal && m_presentTimingLocalDomain == LocalDomainStatus::NotUsable) {
-            continue;
-        }
         for (uint32_t s = 0; s < t.presentStageCount; ++s) {
-            if (!(t.pPresentStages[s].stage & kOnScreenStages)) {
-                continue;
+            if (t.pPresentStages[s].stage & VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_VISIBLE_BIT_EXT) {
+                newestId = t.presentId;
+                newestTime = std::chrono::nanoseconds(static_cast<int64_t>(t.pPresentStages[s].time));
             }
-            const uint64_t stageTime = t.pPresentStages[s].time;
-            if (domainIsLocal && m_presentTimingLocalDomain == LocalDomainStatus::Unknown) {
-                // PRESENT_STAGE_LOCAL_EXT is implementation-defined. On Mesa/X11
-                // its values are CLOCK_MONOTONIC nanoseconds (the ust from
-                // PresentCompleteNotify); verify before trusting. A different
-                // driver could expose e.g. a swapchain-local counter that would
-                // look wildly off "now".
-                const int64_t nowNs = monotonicNow().count();
-                const int64_t diffMs = (static_cast<int64_t>(stageTime) - nowNs) / 1'000'000;
-                constexpr int64_t kSaneWindowMs = 60'000;
-                if (diffMs < -kSaneWindowMs || diffMs > kSaneWindowMs) {
-                    m_presentTimingLocalDomain = LocalDomainStatus::NotUsable;
-                    qCWarning(KWIN_X11STANDALONE).nospace()
-                        << "VK_EXT_present_timing: PRESENT_STAGE_LOCAL_EXT does not look "
-                        << "like CLOCK_MONOTONIC (off by " << diffMs << " ms); rejecting "
-                        << "this domain for this swapchain. estimatePresentTime() will "
-                        << "fall back to monotonicNow().";
-                    break;
-                }
-                m_presentTimingLocalDomain = LocalDomainStatus::MonotonicNs;
-                qCDebug(KWIN_X11STANDALONE) << "VK_EXT_present_timing: PRESENT_STAGE_LOCAL_EXT "
-                                               "calibrated as CLOCK_MONOTONIC nanoseconds";
-            }
-            newestId = t.presentId;
-            newestTime = std::chrono::nanoseconds(static_cast<int64_t>(stageTime));
         }
     }
     if (newestId == 0) {
-        // The drain produced data but we kept none of it (wrong domain, wrong
-        // stage, NotUsable PRESENT_STAGE_LOCAL, etc.). Empty drains don't
-        // count — only ones with data we should have used.
-        if (props.presentationTimingCount > 0) {
-            constexpr uint32_t kStaleDrainLogThreshold = 60;
-            if (++m_presentTimingStaleDrains == kStaleDrainLogThreshold
-                && !m_loggedPresentTimingStale) {
-                m_loggedPresentTimingStale = true;
-                qCWarning(KWIN_X11STANDALONE).nospace()
-                    << "VK_EXT_present_timing: anchor not advanced after "
-                    << m_presentTimingStaleDrains << " drains with data; "
-                    << "every timing was rejected (domain/stage filter or "
-                    << "PRESENT_STAGE_LOCAL_EXT calibration). "
-                    << "estimatePresentTime() will use monotonicNow().";
-            }
-        }
         return;
     }
-    // Anchor advanced — reset the watchdog so a later breakage can re-log.
-    m_presentTimingStaleDrains = 0;
-    m_loggedPresentTimingStale = false;
 
     // Advance the anchor and update the running per-frame interval from the gap
     // to the previous anchor (exponentially smoothed to ride out jitter).
@@ -770,13 +717,9 @@ bool X11StandaloneVulkanBackend::present(Output *output, const std::shared_ptr<O
                 // Recreated images start blank — drop stale age tracking.
                 resetDamageTracking();
                 // The new swapchain restarts timing; drop the stale anchor and
-                // re-arm the timing queue on it. PRESENT_STAGE_LOCAL_EXT
-                // semantics are per-swapchain, so re-calibrate from scratch.
+                // re-arm the timing queue on it.
                 m_lastTimedPresentId = 0;
                 m_presentInterval = std::chrono::nanoseconds{};
-                m_presentTimingLocalDomain = LocalDomainStatus::Unknown;
-                m_presentTimingStaleDrains = 0;
-                m_loggedPresentTimingStale = false;
                 setupPresentTimingQueue();
             }
         }
