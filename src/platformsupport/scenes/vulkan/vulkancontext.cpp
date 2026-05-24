@@ -142,20 +142,22 @@ bool VulkanContext::createCommandPool()
 
 bool VulkanContext::createDescriptorPool()
 {
-    // Calculate pool size based on output count: outputs * 15000
-    // This provides adequate headroom for multi-monitor setups
+    // Pool is only used by legacy / out-of-tree callers of allocateDescriptorSet().
+    // In-tree consumers all use bindDescriptors() (push descriptors). A small budget
+    // per output is enough — the pool is reset each frame in doBeginFrame().
     uint32_t outputCount = 1; // Default to 1 if workspace not available yet
     if (workspace()) {
         outputCount = static_cast<uint32_t>(workspace()->outputs().count());
     }
     m_descriptorPoolMaxSets = outputCount * DESCRIPTOR_POOL_SETS_PER_OUTPUT;
 
-    // Create a descriptor pool with enough descriptors for typical usage
-    // Each render node needs 1 descriptor set with 2 bindings (texture + UBO)
+    // Per-binding budgets: up to 4 sampler descriptors per set (matches the shared
+    // item-renderer layout's binding 0 size), 1 UBO per set, modest storage-buffer
+    // headroom for the same hypothetical external user.
     std::array<VkDescriptorPoolSize, 3> poolSizes = {{
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, m_descriptorPoolMaxSets},
-        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, m_descriptorPoolMaxSets},
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, outputCount * 1000},
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, m_descriptorPoolMaxSets * 4},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, m_descriptorPoolMaxSets},
     }};
 
     VkDescriptorPoolCreateInfo poolInfo{};

@@ -382,10 +382,15 @@ private:
 
     // Track descriptor allocations for debugging
     // Pool size is calculated dynamically based on output count: outputs * 15000
-    // With pool resetting each frame, this provides headroom for multi-monitor setups
+    // Modest pool kept for legacy / out-of-tree callers of allocateDescriptorSet().
+    // All in-tree consumers (item renderer, cursor, effects, blur, contrast) route
+    // through VulkanContext::bindDescriptors(), which uses VK_KHR_push_descriptor and
+    // never touches the pool. The pool is reset each frame in doBeginFrame() so a
+    // small per-output budget is enough; raise these if a third-party effect ever
+    // saturates it.
     uint32_t m_descriptorAllocCount = 0;
     uint32_t m_descriptorPoolMaxSets = 0;
-    static constexpr uint32_t DESCRIPTOR_POOL_SETS_PER_OUTPUT = 15000;
+    static constexpr uint32_t DESCRIPTOR_POOL_SETS_PER_OUTPUT = 64;
 
     // Deferred sampler destruction queue (samplers in use by in-flight command buffers)
     QVector<std::pair<VkSampler, VkFence>> m_pendingSamplerDestructions;
