@@ -27,11 +27,14 @@ RenderLoopPrivate *RenderLoopPrivate::get(RenderLoop *loop)
 static const bool s_printDebugInfo = qEnvironmentVariableIntValue("KWIN_LOG_PERFORMANCE_DATA") != 0
     || qEnvironmentVariableIntValue("KWIN_VULKAN_LATENCY_TELEMETRY") != 0;
 
-// Phase 3 tight scheduling (KWIN_VULKAN_TIGHT_SCHED=1): swap RenderJournal's
-// EMA + 2*variance budget for a rolling percentile of observed render
-// durations, and tune setPresentationSafetyMargin() with a feedback loop
-// against the observed vblank-miss rate. Read once at process startup.
-static const bool s_tightSched = qEnvironmentVariableIntValue("KWIN_VULKAN_TIGHT_SCHED") != 0;
+// Phase 3 tight scheduling: swap RenderJournal's EMA + 2*variance budget for
+// a rolling percentile of observed render durations, and tune
+// setPresentationSafetyMargin() with a feedback loop against the observed
+// vblank-miss rate. Default ON; set KWIN_VULKAN_TIGHT_SCHED=0 to fall back
+// to the legacy upstream scheduler (same opt-out style as
+// KWIN_VULKAN_PRESENT_TIMING). Read once at process startup.
+static const bool s_tightSched = !(qEnvironmentVariableIsSet("KWIN_VULKAN_TIGHT_SCHED")
+                                   && qEnvironmentVariableIntValue("KWIN_VULKAN_TIGHT_SCHED") == 0);
 
 // Helper: read a double from an env var, fall back to @p fallback if unset
 // or unparseable. Used for the env-overridable controller knobs below.
@@ -108,11 +111,12 @@ RenderLoopPrivate::RenderLoopPrivate(RenderLoop *q, Output *output)
             s_loggedTightSched = true;
             qCWarning(KWIN_CORE).nospace()
                 << "RenderLoop: tight scheduler active "
-                << "(KWIN_VULKAN_TIGHT_SCHED=1: p99 render-journal + adaptive safety margin, "
+                << "(default; disable with KWIN_VULKAN_TIGHT_SCHED=0): "
+                << "p99 render-journal + adaptive safety margin, "
                 << "target miss-rate band ["
                 << s_targetMissRateLow * 100.0 << "%, " << s_targetMissRateHigh * 100.0 << "%], "
                 << "step=" << s_stepFraction * 100.0 << "% of vblank, "
-                << "window=" << s_windowSeconds << "s)";
+                << "window=" << s_windowSeconds << "s";
         }
     }
 }
