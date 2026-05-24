@@ -301,6 +301,18 @@ bool Edge::triggersFor(const QPoint &cursorPos) const
     if (!m_geometry.contains(cursorPos)) {
         return false;
     }
+    // Corner triggers (TopLeft/TopRight/BottomLeft/BottomRight): any cursor
+    // inside the small corner box (default 8x8) counts. The exact-pixel
+    // axis checks below are too brittle for corners — cursor acceleration
+    // and motion-event sampling can leave the cursor at e.g. (1,1) inside
+    // a (0,0)+8x8 TopLeft trigger box without ever sampling the literal
+    // corner pixel, even when the user drives it hard at the corner.
+    // Verified empirically with KWIN_SCREENEDGE_TRACE diagnostics in
+    // 2026-05: every approach touched points like (5,0), (0,2), (7,7)
+    // inside the box but never (0,0).
+    if (isCorner()) {
+        return true;
+    }
     if (isLeft() && cursorPos.x() != m_geometry.x()) {
         return false;
     }
