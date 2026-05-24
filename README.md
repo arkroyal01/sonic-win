@@ -16,7 +16,7 @@ There is also a [critical comparison of X11 and Wayland by probonopd](https://gi
 
 ## Vulkan compositing backend
 
-The `vulkan-backend` branch ships a Vulkan compositing backend for the X11 standalone session and **selects it by default** — see `options.cpp` (the default `compositingMode` is `VulkanCompositing`; KWin falls back to OpenGL if the device doesn't support Vulkan). Use `KWIN_COMPOSE=O` to force the OpenGL/GLX path, `KWIN_COMPOSE=V` to force Vulkan, or `KWIN_COMPOSE=N` to disable compositing entirely. The Vulkan backend is in active development and many features below are gated behind additional env vars.
+The `vulkan-backend` branch ships a Vulkan compositing backend for the X11 standalone session — initial implementation by Joseph Crowell (stub backend + first working device/swapchain bring-up, January 2026), with subsequent feature work and the present-timing/scheduler effort by Ark Royal — and **selects it by default** — see `options.cpp` (the default `compositingMode` is `VulkanCompositing`; KWin falls back to OpenGL if the device doesn't support Vulkan). Use `KWIN_COMPOSE=O` to force the OpenGL/GLX path, `KWIN_COMPOSE=V` to force Vulkan, or `KWIN_COMPOSE=N` to disable compositing entirely. The Vulkan backend is in active development and many features below are gated behind additional env vars.
 
 All variables announce themselves with a one-shot log line at startup so a missing env var is obvious in `kwin_x11`'s stderr — silence means the value wasn't propagated to the process.
 
