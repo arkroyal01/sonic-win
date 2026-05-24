@@ -33,6 +33,24 @@ All variables announce themselves with a one-shot log line at startup so a missi
 
 The following set was added incrementally to leverage `VK_EXT_present_timing` + `VK_KHR_present_id2` + `VK_KHR_present_wait2` (available on X11 via [Mesa MR !39551](https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/39551)).
 
+These extensions ship in Mesa **26.1+** for the Wayland WSI, but the X11 WSI implementation is still gated behind MR !39551 (unmerged as of 2026-05-24). Until that lands, you need a Mesa build with the MR patched in — this fork is developed against a locally-packaged Mesa 26.1.1 + !39551.
+
+To verify the extensions are advertised by your driver/ICD for the X11 surface, run:
+
+```sh
+vulkaninfo | grep -E 'VK_EXT_present_timing|VK_KHR_present_id2|VK_KHR_present_wait2'
+```
+
+All three should appear — `VK_KHR_present_id2` / `VK_KHR_present_wait2` under *Instance Extensions* and `VK_EXT_present_timing` under the per-GPU *Device Extensions*. Seeing the `_id2` / `_wait2` extensions alone on stock Mesa 26.1 is expected for Wayland; without the MR patch, the X11 WSI won't expose `VK_EXT_present_timing` and the present-timing path silently falls back.
+
+To confirm KWin actually picked it up at runtime, look for the per-surface capability dump in `kwin_x11`'s stderr — it's emitted at warning level from `x11_standalone_vulkan_backend.cpp` once the swapchain is created:
+
+```
+VK_EXT_present_timing surface check: result=0 presentTimingSupported=true presentId2Supported=true presentWait2Supported=true presentAtAbsoluteTimeSupported=true supportedStages=0x5
+```
+
+`result=0` is `VK_SUCCESS`; the three `*Supported=true` flags are what gate activation — if any of them is `false`, the monitor falls back to the SGI/OML/software vsync-monitor cascade. `supportedStages` is a bitmask of `VkPresentStageFlagBitsEXT`: `0x1` = `QUEUE_OPERATIONS_END`, `0x4` = `FIRST_PIXEL_OUT`, `0x8` = `FIRST_PIXEL_VISIBLE`; Mesa MR !39551 currently advertises `0x5` (queue-ops-end + first-pixel-out). If the line is absent entirely, present-timing wasn't even attempted (device-level extensions missing, or `KWIN_VULKAN_PRESENT_TIMING=0`).
+
 | Env var | Default | Effect |
 |---|---|---|
 | `KWIN_VULKAN_PRESENT_TIMING` | `1` (when device + surface support it) | Async present-timing monitor backed by `vkWaitForPresent2KHR`. Set to `0` to fall back to the SGI/OML/software vsync-monitor cascade. |
