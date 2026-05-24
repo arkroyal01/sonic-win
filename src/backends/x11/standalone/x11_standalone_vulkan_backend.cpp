@@ -131,6 +131,11 @@ std::optional<OutputLayerBeginFrameInfo> VulkanLayer::doBeginFrame()
     // Create a RenderTarget with the VulkanRenderTarget
     RenderTarget renderTarget(vulkanRenderTarget.release());
 
+    // Open a render-time measurement for this frame. Must be closed and
+    // attached to the OutputFrame in doEndFrame() — without it RenderJournal
+    // is fed zeros and the RenderLoop scheduler under-budgets every frame.
+    x11Backend->beginRenderTimeQuery();
+
     // Buffer-age repaint region: how stale this swapchain image's contents are
     // determines how much must be redrawn. infiniteRegion() => full repaint.
     return OutputLayerBeginFrameInfo{
@@ -142,11 +147,17 @@ std::optional<OutputLayerBeginFrameInfo> VulkanLayer::doBeginFrame()
 bool VulkanLayer::doEndFrame(const QRegion &renderedRegion, const QRegion &damagedRegion, OutputFrame *frame)
 {
     Q_UNUSED(renderedRegion);
-    Q_UNUSED(frame);
+
+    auto *x11Backend = static_cast<X11StandaloneVulkanBackend *>(m_backend);
+
+    // Close the render-time measurement opened in doBeginFrame() and hand it
+    // to the OutputFrame so RenderLoopPrivate::notifyFrameCompleted() can feed
+    // RenderJournal a real duration instead of zero.
+    x11Backend->endAndAttachRenderTimeQuery(frame);
 
     // Feed this frame's damage into the backend's manual buffer-age tracking so
     // subsequent frames can compute a correct partial-repaint region.
-    static_cast<X11StandaloneVulkanBackend *>(m_backend)->recordFrameDamage(damagedRegion);
+    x11Backend->recordFrameDamage(damagedRegion);
 
     // Rendering has been submitted by the ItemRendererVulkan
     // The actual presentation happens in X11StandaloneVulkanBackend::present()
@@ -772,6 +783,25 @@ void X11StandaloneVulkanBackend::recordFrameDamage(const QRegion &damage)
         }
     }
     ++m_frameCounter;
+}
+
+void X11StandaloneVulkanBackend::beginRenderTimeQuery()
+{
+    // CpuRenderTimeQuery starts the clock at construction; nothing else to do
+    // here. Overwriting any prior value is safe: doBeginFrame/doEndFrame pair
+    // 1:1 today, but if a previous frame somehow failed to attach its query
+    // (e.g. doEndFrame skipped), discarding it is correct — the unattached
+    // query has no observer and the new frame's measurement is what we want.
+    m_renderTimeQuery = std::make_unique<CpuRenderTimeQuery>();
+}
+
+void X11StandaloneVulkanBackend::endAndAttachRenderTimeQuery(OutputFrame *frame)
+{
+    if (!m_renderTimeQuery || !frame) {
+        return;
+    }
+    m_renderTimeQuery->end();
+    frame->addRenderTimeQuery(std::move(m_renderTimeQuery));
 }
 
 xcb_connection_t *X11StandaloneVulkanBackend::connection() const

@@ -9,6 +9,7 @@
 #pragma once
 
 #include "core/outputlayer.h"
+#include "core/renderbackend.h"
 #include "platformsupport/scenes/vulkan/vulkanbackend.h"
 #include "platformsupport/scenes/vulkan/vulkancontext.h"
 #include "platformsupport/scenes/vulkan/vulkansurfacetexture_x11.h"
@@ -110,6 +111,25 @@ public:
     void recordFrameDamage(const QRegion &damage);
 
     /**
+     * @brief Start a CPU-clock render-time measurement for the current frame.
+     *
+     * Called from VulkanLayer::doBeginFrame(). Mirrors the GLX/EGL pattern of
+     * holding the in-flight RenderTimeQuery on the backend and attaching it to
+     * the OutputFrame at end-of-frame. Without this, OutputFrame::queryRenderTime()
+     * returns an empty span, RenderJournal sees zero, and RenderLoop schedules
+     * paint ~1ms before each vblank with no real budget.
+     */
+    void beginRenderTimeQuery();
+
+    /**
+     * @brief Close the in-flight render-time measurement and hand it to @p frame.
+     *
+     * Called from VulkanLayer::doEndFrame(). No-op if beginRenderTimeQuery()
+     * was not called for this frame (defensive — should not normally happen).
+     */
+    void endAndAttachRenderTimeQuery(OutputFrame *frame);
+
+    /**
      * @brief If the swapchain is flagged as needing recreation (typically
      *        VK_SUBOPTIMAL_KHR / VK_ERROR_OUT_OF_DATE_KHR from acquire or
      *        present after a display reconfiguration), recreate it and
@@ -191,6 +211,12 @@ private:
     X11StandaloneBackend *m_backend;
     std::unique_ptr<VulkanLayer> m_layer;
     std::shared_ptr<OutputFrame> m_frame;
+
+    // In-flight render-time measurement. Constructed at doBeginFrame(), closed
+    // and moved to the OutputFrame at doEndFrame() so RenderJournal sees a real
+    // duration. CPU-clock today; QUEUE_OPERATIONS_END variant will swap in later
+    // behind an env var.
+    std::unique_ptr<CpuRenderTimeQuery> m_renderTimeQuery;
 
     // Region changed this frame, stashed by doEndFrame() for the next present()'s
     // VK_KHR_incremental_present hint. Independent of partial repaint.
