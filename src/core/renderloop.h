@@ -75,6 +75,36 @@ public:
     void setPresentationSafetyMargin(std::chrono::nanoseconds safetyMargin);
 
     /**
+     * @brief Per-frame compositor-dispatch boundary. Used by the main-thread
+     * frame-breakdown instrumentation (KWIN_FRAME_BREAKDOWN=1) to pinpoint
+     * where on the dispatch path a long stall is happening.
+     *
+     * Captured by recordFrameBoundary(); logged as per-frame deltas to the
+     * perf CSV. The boundaries are listed in dispatch order; differences
+     * between consecutive boundaries identify which sub-pass blocked.
+     */
+    enum class FrameBoundary {
+        DispatchStart, ///< RenderLoopPrivate::dispatch() entry.
+        CompositeStart, ///< X11Compositor::composite() entry.
+        PrepaintEnd, ///< after prePaintPass (effects' prePaintScreen).
+        BeginFrameEnd, ///< after primaryLayer->beginFrame().
+        PaintEnd, ///< after paintPass (scene + effect paint chain).
+        EndFrameEnd, ///< after primaryLayer->endFrame().
+        PostpaintEnd, ///< after postPaintPass (effects' postPaintScreen).
+        PresentEnd, ///< after backend()->present().
+    };
+
+    /**
+     * @brief Stamp the current steady_clock at the given boundary.
+     *
+     * No-op when KWIN_FRAME_BREAKDOWN=0 (the default). The breakdown is
+     * orthogonal to KWIN_VULKAN_LATENCY_TELEMETRY — that flag enables the
+     * CSV, this one fills the breakdown columns. Both are needed for the
+     * breakdown to land in a file.
+     */
+    void recordFrameBoundary(FrameBoundary which);
+
+    /**
      * Schedules a compositing cycle at the next available moment.
      */
     void scheduleRepaint(Item *item = nullptr, RenderLayer *layer = nullptr, OutputLayer *outputLayer = nullptr);

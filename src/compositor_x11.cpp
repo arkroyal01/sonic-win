@@ -12,6 +12,7 @@
 #include "core/overlaywindow.h"
 #include "core/renderbackend.h"
 #include "core/renderlayer.h"
+#include "core/renderloop.h"
 #include "effect/effecthandler.h"
 #include "ftrace.h"
 #include "opengl/glplatform.h"
@@ -521,6 +522,13 @@ void X11Compositor::composite(RenderLoop *renderLoop)
     OutputLayer *primaryLayer = m_backend->primaryLayer(nullptr);
     fTraceDuration("Paint");
 
+    // Phase 6 main-thread breakdown: stamp the boundaries through the
+    // composite pipeline so KWIN_FRAME_BREAKDOWN=1 sessions can see where
+    // a stall happens (event-loop, prepaint, paint, endframe, postpaint,
+    // present). recordFrameBoundary() is a no-op when the env var is off,
+    // so this costs nothing in the default path.
+    renderLoop->recordFrameBoundary(RenderLoop::FrameBoundary::CompositeStart);
+
     RenderLayer *superLayer = m_superlayers[renderLoop];
     superLayer->setOutputLayer(primaryLayer);
 
@@ -533,20 +541,27 @@ void X11Compositor::composite(RenderLoop *renderLoop)
         QRegion surfaceDamage = primaryLayer->repaints();
         primaryLayer->resetRepaints();
         prePaintPass(superLayer, &surfaceDamage);
+        renderLoop->recordFrameBoundary(RenderLoop::FrameBoundary::PrepaintEnd);
 
         if (auto beginInfo = primaryLayer->beginFrame()) {
             auto &[renderTarget, repaint] = beginInfo.value();
+            renderLoop->recordFrameBoundary(RenderLoop::FrameBoundary::BeginFrameEnd);
 
             const QRegion bufferDamage = surfaceDamage.united(repaint).intersected(superLayer->rect().toAlignedRect());
 
             paintPass(superLayer, renderTarget, bufferDamage);
+            renderLoop->recordFrameBoundary(RenderLoop::FrameBoundary::PaintEnd);
+
             primaryLayer->endFrame(bufferDamage, surfaceDamage, frame.get());
+            renderLoop->recordFrameBoundary(RenderLoop::FrameBoundary::EndFrameEnd);
         }
 
         postPaintPass(superLayer);
+        renderLoop->recordFrameBoundary(RenderLoop::FrameBoundary::PostpaintEnd);
     }
 
     m_backend->present(nullptr, frame);
+    renderLoop->recordFrameBoundary(RenderLoop::FrameBoundary::PresentEnd);
 
     framePass(superLayer, frame.get());
 

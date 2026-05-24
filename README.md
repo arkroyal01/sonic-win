@@ -44,6 +44,7 @@ The following set was added incrementally to leverage `VK_EXT_present_timing` + 
 | `KWIN_VULKAN_TIGHT_SCHED_TARGET_LOW` | `0.001` (0.1 %) | If recent miss-rate falls below this, the controller shrinks the safety margin and may exit triple-buffer. Conservative — set higher (e.g. `0.005`) for faster shrinking. |
 | `KWIN_VULKAN_TIGHT_SCHED_TARGET_HIGH` | `0.01` (1 %) | If recent miss-rate exceeds this, the controller grows the safety margin and enters triple-buffer. |
 | `KWIN_VULKAN_PRESENT_TARGET` | `0` | Fills `VkPresentTimingInfoEXT.targetTime` with the scheduler's chosen vblank, plus the `NEAREST_REFRESH_CYCLE` flag — driver schedules the present to land exactly at the requested vblank rather than "the next one ≥ target". Best combined with `KWIN_VULKAN_TIGHT_SCHED=1` (which picks vblank-aligned targets); observed: 90 % of frames within 2 µs of the chosen target at 165 Hz. |
+| `KWIN_FRAME_BREAKDOWN` | `0` | Per-frame main-thread sub-timings — adds 8 columns to the perf CSV (timer delay, dispatch→composite gap, prepaint, beginframe, paint, endframe, postpaint, present). Used to pinpoint *which* compositor sub-pass blocks during a stutter. Diagnostic only; does not change scheduling. Backend-agnostic (works under OpenGL too). |
 
 ### Known limitations
 

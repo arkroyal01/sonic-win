@@ -69,6 +69,13 @@ static const double s_stepFraction = envDouble("KWIN_VULKAN_TIGHT_SCHED_STEP_FRA
 // time window stays roughly constant.
 static const double s_windowSeconds = envDouble("KWIN_VULKAN_TIGHT_SCHED_WINDOW_SECONDS", 4.0);
 
+// Phase 6 main-thread frame breakdown (KWIN_FRAME_BREAKDOWN=1). When set,
+// RenderLoop::recordFrameBoundary() stamps steady_clock per boundary and
+// notifyFrameCompleted() emits the deltas as extra CSV columns. Off by
+// default — the calls become no-ops so the dispatch path pays no cost
+// outside investigation runs.
+static const bool s_frameBreakdown = qEnvironmentVariableIntValue("KWIN_FRAME_BREAKDOWN") != 0;
+
 RenderLoopPrivate::RenderLoopPrivate(RenderLoop *q, Output *output)
     : q(q)
     , output(output)
@@ -207,6 +214,13 @@ void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTargetTimes
 
     const std::chrono::nanoseconds nextRenderTimestamp = nextPresentationTimestamp - expectedCompositingTime;
     compositeTimer.start(std::max(0ms, std::chrono::duration_cast<std::chrono::milliseconds>(nextRenderTimestamp - currentTime)));
+
+    if (s_frameBreakdown) {
+        // Record the intended fire time so timer-delay (actual dispatch vs
+        // scheduled) is computable in notifyFrameCompleted().
+        const auto schedNs = std::max(currentTime, nextRenderTimestamp);
+        m_timerScheduledAt = std::chrono::steady_clock::time_point(schedNs);
+    }
 }
 
 void RenderLoopPrivate::delayScheduleRepaint()
@@ -243,7 +257,8 @@ void RenderLoopPrivate::notifyFrameCompleted(std::chrono::nanoseconds timestamp,
             << "RenderLoop: writing perf statistics to"
             << QString::fromStdString(ec ? path : absPath.string());
         *m_debugOutput << "target pageflip timestamp,pageflip timestamp,render start,render end,safety margin,refresh duration,vrr,tearing,predicted render time,"
-                       << "queue ops end,first pixel out,first pixel visible,end to end latency,vblank miss,gpu render duration\n";
+                       << "queue ops end,first pixel out,first pixel visible,end to end latency,vblank miss,gpu render duration,"
+                       << "timer delay,dispatch to composite,prepaint,beginframe,paint,endframe,postpaint,present\n";
     }
     if (m_debugOutput) {
         auto times = renderTime.value_or(RenderTimeSpan{});
@@ -275,9 +290,39 @@ void RenderLoopPrivate::notifyFrameCompleted(std::chrono::nanoseconds timestamp,
         // read time (e.g. aborted submit). Independent from the scheduler's
         // CPU-measured renderTime above.
         const auto gpuRd = frame->queryGpuRenderDuration().value_or(std::chrono::nanoseconds::zero());
+
+        // Phase 6 main-thread breakdown. All-zero when KWIN_FRAME_BREAKDOWN=0
+        // (recordFrameBoundary was a no-op so the slots stayed
+        // default-constructed). Each delta is consecutive-boundary ns;
+        // timer_delay is "actual dispatch time - timer scheduled fire time"
+        // (positive = event-loop made us late dispatching this frame).
+        using Boundary = RenderLoop::FrameBoundary;
+        auto stamp = [&](Boundary b) {
+            return m_frameBoundary[size_t(b)];
+        };
+        auto delta = [&](Boundary a, Boundary b) {
+            const auto sa = stamp(a), sb = stamp(b);
+            return (sa.time_since_epoch().count() == 0 || sb.time_since_epoch().count() == 0)
+                ? std::chrono::nanoseconds::zero()
+                : std::chrono::duration_cast<std::chrono::nanoseconds>(sb - sa);
+        };
+        const auto dispatchStart = stamp(Boundary::DispatchStart);
+        const std::chrono::nanoseconds timerDelay =
+            (dispatchStart.time_since_epoch().count() == 0 || m_timerScheduledAt.time_since_epoch().count() == 0)
+            ? std::chrono::nanoseconds::zero()
+            : std::chrono::duration_cast<std::chrono::nanoseconds>(dispatchStart - m_timerScheduledAt);
+        const auto dispToComposite = delta(Boundary::DispatchStart, Boundary::CompositeStart);
+        const auto prepaint = delta(Boundary::CompositeStart, Boundary::PrepaintEnd);
+        const auto beginframe = delta(Boundary::PrepaintEnd, Boundary::BeginFrameEnd);
+        const auto paint = delta(Boundary::BeginFrameEnd, Boundary::PaintEnd);
+        const auto endframe = delta(Boundary::PaintEnd, Boundary::EndFrameEnd);
+        const auto postpaint = delta(Boundary::EndFrameEnd, Boundary::PostpaintEnd);
+        const auto present = delta(Boundary::PostpaintEnd, Boundary::PresentEnd);
+
         *m_debugOutput << targetNs.count() << "," << timestamp.count() << "," << times.start.time_since_epoch().count() << "," << times.end.time_since_epoch().count()
                        << "," << safetyMargin.count() << "," << frame->refreshDuration().count() << "," << (vrr ? 1 : 0) << "," << (tearing ? 1 : 0) << "," << frame->predictedRenderTime().count()
-                       << "," << qEnd.count() << "," << fpOut.count() << "," << fpVisible.count() << "," << e2e.count() << "," << (miss ? 1 : 0) << "," << gpuRd.count() << "\n";
+                       << "," << qEnd.count() << "," << fpOut.count() << "," << fpVisible.count() << "," << e2e.count() << "," << (miss ? 1 : 0) << "," << gpuRd.count()
+                       << "," << timerDelay.count() << "," << dispToComposite.count() << "," << prepaint.count() << "," << beginframe.count() << "," << paint.count() << "," << endframe.count() << "," << postpaint.count() << "," << present.count() << "\n";
     }
 
     Q_ASSERT(pendingFrameCount > 0);
@@ -404,6 +449,15 @@ void RenderLoopPrivate::notifyVblank(std::chrono::nanoseconds timestamp)
 
 void RenderLoopPrivate::dispatch()
 {
+    if (s_frameBreakdown) {
+        // Reset the ring for this frame so unfilled slots read as zero in
+        // notifyFrameCompleted(). Then stamp DispatchStart immediately —
+        // this is "now the timer fired", and m_timerScheduledAt holds when
+        // it was *supposed* to. Their delta is the event-loop delay.
+        m_frameBoundary.fill(std::chrono::steady_clock::time_point{});
+        m_frameBoundary[size_t(RenderLoop::FrameBoundary::DispatchStart)] = std::chrono::steady_clock::now();
+    }
+
     // On X11, we want to ignore repaints that are scheduled by windows right before
     // the Compositor starts repainting.
     pendingRepaint = true;
@@ -465,6 +519,14 @@ void RenderLoop::setRefreshRate(int refreshRate)
     }
     d->refreshRate = refreshRate;
     Q_EMIT refreshRateChanged();
+}
+
+void RenderLoop::recordFrameBoundary(FrameBoundary which)
+{
+    if (!s_frameBreakdown) {
+        return;
+    }
+    d->m_frameBoundary[size_t(which)] = std::chrono::steady_clock::now();
 }
 
 void RenderLoop::setPresentationSafetyMargin(std::chrono::nanoseconds safetyMargin)

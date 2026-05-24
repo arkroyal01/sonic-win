@@ -81,6 +81,15 @@ public:
     // KWIN_VULKAN_TIGHT_SCHED=0.
     bool m_inTripleBuffer = false;
 
+    // Phase 6 frame-breakdown instrumentation (KWIN_FRAME_BREAKDOWN=1).
+    // recordFrameBoundary() writes into these per-frame slots; the
+    // dispatch-order layout matches RenderLoop::FrameBoundary. Cleared at
+    // each dispatch() so an unfilled slot reads as zero. Cost is one
+    // steady_clock::now() per boundary; the entire breakdown is skipped
+    // when the env var is off.
+    std::array<std::chrono::steady_clock::time_point, 8> m_frameBoundary{};
+    std::chrono::steady_clock::time_point m_timerScheduledAt{};
+
     PresentationMode presentationMode = PresentationMode::VSync;
     int maxPendingFrameCount = 1;
 
