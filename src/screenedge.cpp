@@ -349,7 +349,19 @@ bool Edge::check(const QPoint &cursorPos, const std::chrono::microseconds &trigg
         handle(cursorPos);
         return true;
     } else {
-        pushCursorBack(cursorPos);
+        // For corner triggers the pre-activation pushback is jarring now
+        // that triggersFor accepts any pixel in the (default 8x8) corner
+        // box: every cursor sample during the timeThreshold hover would
+        // warp the cursor a few pixels away, making the corner feel
+        // "repelling". Edges keep the original behavior — there the
+        // strict-axis check means pushback only fires when the cursor
+        // is already on the boundary line, which is the intended UX cue.
+        // The post-trigger pushback in handle() still runs after a
+        // successful activation, so corner cooldown / toggle-thrash
+        // protection is unchanged.
+        if (!isCorner()) {
+            pushCursorBack(cursorPos);
+        }
         m_triggeredPoint = cursorPos;
     }
     return false;
