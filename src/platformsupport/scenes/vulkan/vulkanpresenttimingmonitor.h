@@ -57,6 +57,22 @@ public Q_SLOTS:
 Q_SIGNALS:
     void errorOccurred();
     void vblankOccurred(std::chrono::nanoseconds timestamp);
+    /**
+     * @brief Fired (when the drain returns useful entries) before
+     * vblankOccurred() with the per-stage on-screen timestamps for the
+     * just-completed presentId.
+     *
+     * Each timestamp is std::chrono::nanoseconds::zero() if that stage was
+     * not reported. Slots are connected on the backend's QObject and Qt
+     * queued-connection FIFO ordering on the same target guarantees this
+     * signal is processed *before* vblankOccurred() — so the backend can
+     * stash the stages on the in-flight OutputFrame before
+     * OutputFrame::presented() runs.
+     */
+    void presentTimingsReady(uint64_t presentId,
+                             std::chrono::nanoseconds queueOperationsEnd,
+                             std::chrono::nanoseconds firstPixelOut,
+                             std::chrono::nanoseconds firstPixelVisible);
 
 private:
     VkDevice m_device;
@@ -102,6 +118,13 @@ public:
 
     /** @brief Queue an async wait on @p presentId on the helper thread. */
     void armWithPresentId(uint64_t presentId);
+
+Q_SIGNALS:
+    /** @brief Forwarded from VulkanPresentTimingMonitorHelper. */
+    void presentTimingsReady(uint64_t presentId,
+                             std::chrono::nanoseconds queueOperationsEnd,
+                             std::chrono::nanoseconds firstPixelOut,
+                             std::chrono::nanoseconds firstPixelVisible);
 
 private:
     explicit VulkanPresentTimingMonitor(VkDevice device,

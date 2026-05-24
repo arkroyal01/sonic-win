@@ -200,6 +200,20 @@ private:
      */
     void handlePresentTimingMonitorError();
 
+    /**
+     * @brief Handler for VulkanPresentTimingMonitor::presentTimingsReady.
+     *
+     * Stashes the per-stage timestamps on the in-flight OutputFrame so the
+     * subsequent vblank() — driven by the immediately-following
+     * vblankOccurred() emission, Qt-queued-FIFO-ordered after this one — can
+     * pass them through OutputFrame::presented() into RenderLoop's CSV (and
+     * later phases' adaptive logic).
+     */
+    void handlePresentTimingsReady(uint64_t presentId,
+                                   std::chrono::nanoseconds queueOperationsEnd,
+                                   std::chrono::nanoseconds firstPixelOut,
+                                   std::chrono::nanoseconds firstPixelVisible);
+
     std::unique_ptr<OverlayWindow> m_overlayWindow;
     xcb_window_t m_window = XCB_WINDOW_NONE;
     xcb_colormap_t m_colormap = XCB_COLORMAP_NONE;

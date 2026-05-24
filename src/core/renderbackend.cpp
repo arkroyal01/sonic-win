@@ -169,6 +169,36 @@ void OutputFrame::setArtificialHdrHeadroom(double edr)
     m_artificialHdrHeadroom = edr;
 }
 
+void OutputFrame::setQueueOperationsEndTimestamp(std::chrono::nanoseconds ts)
+{
+    m_queueOperationsEndTimestamp = ts;
+}
+
+void OutputFrame::setFirstPixelOutTimestamp(std::chrono::nanoseconds ts)
+{
+    m_firstPixelOutTimestamp = ts;
+}
+
+void OutputFrame::setFirstPixelVisibleTimestamp(std::chrono::nanoseconds ts)
+{
+    m_firstPixelVisibleTimestamp = ts;
+}
+
+std::optional<std::chrono::nanoseconds> OutputFrame::queueOperationsEndTimestamp() const
+{
+    return m_queueOperationsEndTimestamp;
+}
+
+std::optional<std::chrono::nanoseconds> OutputFrame::firstPixelOutTimestamp() const
+{
+    return m_firstPixelOutTimestamp;
+}
+
+std::optional<std::chrono::nanoseconds> OutputFrame::firstPixelVisibleTimestamp() const
+{
+    return m_firstPixelVisibleTimestamp;
+}
+
 OutputLayer *RenderBackend::cursorLayer(Output *output)
 {
     return nullptr;

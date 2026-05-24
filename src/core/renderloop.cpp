@@ -24,7 +24,8 @@ RenderLoopPrivate *RenderLoopPrivate::get(RenderLoop *loop)
     return loop->d.get();
 }
 
-static const bool s_printDebugInfo = qEnvironmentVariableIntValue("KWIN_LOG_PERFORMANCE_DATA") != 0;
+static const bool s_printDebugInfo = qEnvironmentVariableIntValue("KWIN_LOG_PERFORMANCE_DATA") != 0
+    || qEnvironmentVariableIntValue("KWIN_VULKAN_LATENCY_TELEMETRY") != 0;
 
 RenderLoopPrivate::RenderLoopPrivate(RenderLoop *q, Output *output)
     : q(q)
@@ -142,16 +143,52 @@ void RenderLoopPrivate::notifyFrameDropped()
 
 void RenderLoopPrivate::notifyFrameCompleted(std::chrono::nanoseconds timestamp, std::optional<RenderTimeSpan> renderTime, PresentationMode mode, OutputFrame *frame)
 {
-    if (output && s_printDebugInfo && !m_debugOutput) {
-        m_debugOutput = std::fstream(qPrintable("kwin perf statistics " + output->name() + ".csv"), std::ios::out);
-        *m_debugOutput << "target pageflip timestamp,pageflip timestamp,render start,render end,safety margin,refresh duration,vrr,tearing,predicted render time\n";
+    if (s_printDebugInfo && !m_debugOutput) {
+        // On X11 standalone the backend constructs a single shared
+        // RenderLoop(nullptr) (x11_standalone_backend.cpp:105) — there is no
+        // per-output loop, so output->name() is unavailable. Fall back to a
+        // fixed suffix in that case so the CSV actually opens.
+        const std::string suffix = output ? output->name().toStdString() : std::string("(default)");
+        const std::string path = "kwin perf statistics " + suffix + ".csv";
+        m_debugOutput = std::fstream(path, std::ios::out);
+        // One-shot confirmation so it's obvious from the terminal that the env
+        // var landed and which file to tail. Resolve to absolute so cwd is
+        // unambiguous.
+        std::error_code ec;
+        const auto absPath = std::filesystem::absolute(path, ec);
+        qCWarning(KWIN_CORE).noquote()
+            << "RenderLoop: writing perf statistics to"
+            << QString::fromStdString(ec ? path : absPath.string());
+        *m_debugOutput << "target pageflip timestamp,pageflip timestamp,render start,render end,safety margin,refresh duration,vrr,tearing,predicted render time,"
+                       << "queue ops end,first pixel out,first pixel visible,end to end latency,vblank miss\n";
     }
     if (m_debugOutput) {
         auto times = renderTime.value_or(RenderTimeSpan{});
         const bool vrr = mode == PresentationMode::AdaptiveSync || mode == PresentationMode::AdaptiveAsync;
         const bool tearing = mode == PresentationMode::Async || mode == PresentationMode::AdaptiveAsync;
-        *m_debugOutput << frame->targetPageflipTime().time_since_epoch().count() << "," << timestamp.count() << "," << times.start.time_since_epoch().count() << "," << times.end.time_since_epoch().count()
-                       << "," << safetyMargin.count() << "," << frame->refreshDuration().count() << "," << (vrr ? 1 : 0) << "," << (tearing ? 1 : 0) << "," << frame->predictedRenderTime().count() << "\n";
+        // VK_EXT_present_timing stage timestamps; 0 if the stage was not
+        // reported (or the timing path is inactive / GLX fallback in use).
+        const auto qEnd = frame->queueOperationsEndTimestamp().value_or(std::chrono::nanoseconds::zero());
+        const auto fpOut = frame->firstPixelOutTimestamp().value_or(std::chrono::nanoseconds::zero());
+        const auto fpVisible = frame->firstPixelVisibleTimestamp().value_or(std::chrono::nanoseconds::zero());
+        // End-to-end render-to-photons: render start → on-screen. Prefer
+        // FIRST_PIXEL_VISIBLE; fall back to FIRST_PIXEL_OUT (latest CLOCK_MONOTONIC
+        // stage Mesa MR !39551 reports today). QUEUE_OPS_END lives in a
+        // different clock and would produce garbage here, so it is not a
+        // fallback. 0 if no stage was reported or renderTime is unset.
+        const auto renderStartNs = times.start.time_since_epoch();
+        const auto e2eEnd = fpVisible.count() != 0 ? fpVisible : fpOut;
+        const std::chrono::nanoseconds e2e =
+            (e2eEnd.count() != 0 && renderStartNs.count() != 0)
+            ? (e2eEnd - renderStartNs)
+            : std::chrono::nanoseconds::zero();
+        // Vblank miss: presented past the target by more than half a refresh
+        // (conservative — a "just made it" frame is not a miss).
+        const std::chrono::nanoseconds targetNs = frame->targetPageflipTime().time_since_epoch();
+        const bool miss = timestamp > targetNs + frame->refreshDuration() / 2;
+        *m_debugOutput << targetNs.count() << "," << timestamp.count() << "," << times.start.time_since_epoch().count() << "," << times.end.time_since_epoch().count()
+                       << "," << safetyMargin.count() << "," << frame->refreshDuration().count() << "," << (vrr ? 1 : 0) << "," << (tearing ? 1 : 0) << "," << frame->predictedRenderTime().count()
+                       << "," << qEnd.count() << "," << fpOut.count() << "," << fpVisible.count() << "," << e2e.count() << "," << (miss ? 1 : 0) << "\n";
     }
 
     Q_ASSERT(pendingFrameCount > 0);

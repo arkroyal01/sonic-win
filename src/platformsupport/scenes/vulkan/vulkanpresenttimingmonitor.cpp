@@ -80,6 +80,14 @@ void VulkanPresentTimingMonitorHelper::waitForPresent(uint64_t presentId)
     // prefer that.
     std::chrono::nanoseconds timestamp = monotonicNow();
 
+    // Stages drained for this presentId. Zero == not reported by the driver.
+    // Forwarded as a separate signal (presentTimingsReady) so the backend can
+    // stash per-stage data on the in-flight OutputFrame before vblankOccurred()
+    // triggers OutputFrame::presented().
+    std::chrono::nanoseconds queueOperationsEnd = std::chrono::nanoseconds::zero();
+    std::chrono::nanoseconds firstPixelOut = std::chrono::nanoseconds::zero();
+    std::chrono::nanoseconds firstPixelVisible = std::chrono::nanoseconds::zero();
+
     if (m_vkGetPastPresentationTimingEXT) {
         std::array<std::array<VkPresentStageTimeEXT, kDrainBufferMaxStages>, kDrainBufferEntries> stageStorage{};
         std::array<VkPastPresentationTimingEXT, kDrainBufferEntries> timings{};
@@ -109,21 +117,56 @@ void VulkanPresentTimingMonitorHelper::waitForPresent(uint64_t presentId)
                 if (t.presentId != presentId) {
                     continue;
                 }
+                // Mesa MR !39551 emits stages in VK_TIME_DOMAIN_PRESENT_STAGE_LOCAL_EXT
+                // (1000208000) — the extension's own domain — not raw CLOCK_MONOTONIC.
+                // Per the present-stage clocks gotcha: stage 0x4 (FIRST_PIXEL_OUT)
+                // happens to be in CLOCK_MONOTONIC nanoseconds, while stage 0x1
+                // (QUEUE_OPERATIONS_END) is in a separate GPU-side clock. Same
+                // labeled domain, different underlying clocks. Consumers must
+                // therefore treat per-stage timestamps as comparable only against
+                // values from the same stage — not across stages, and not against
+                // arbitrary CPU steady_clock values without prior calibration.
                 if (t.timeDomain != VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR
-                    && t.timeDomain != VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_KHR) {
+                    && t.timeDomain != VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_KHR
+                    && t.timeDomain != VK_TIME_DOMAIN_PRESENT_STAGE_LOCAL_EXT) {
                     continue;
                 }
                 for (uint32_t s = 0; s < t.presentStageCount; ++s) {
-                    if (t.pPresentStages[s].stage & VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_VISIBLE_BIT_EXT) {
-                        timestamp = std::chrono::nanoseconds(static_cast<int64_t>(t.pPresentStages[s].time));
-                        break;
+                    const VkPresentStageTimeEXT &stage = t.pPresentStages[s];
+                    const auto stageTime = std::chrono::nanoseconds(static_cast<int64_t>(stage.time));
+                    if (stage.stage & VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_VISIBLE_BIT_EXT) {
+                        firstPixelVisible = stageTime;
+                    }
+                    if (stage.stage & VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT) {
+                        firstPixelOut = stageTime;
+                    }
+                    if (stage.stage & VK_PRESENT_STAGE_QUEUE_OPERATIONS_END_BIT_EXT) {
+                        queueOperationsEnd = stageTime;
                     }
                 }
                 break;
             }
+            // Prefer the latest CLOCK_MONOTONIC-correlated stage for the
+            // vblankOccurred timestamp (which feeds RenderLoop's
+            // lastPresentationTimestamp). FIRST_PIXEL_VISIBLE is ideal but Mesa
+            // doesn't yet emit it (its supportedStages mask is 0x5 =
+            // QUEUE_OPS_END | FIRST_PIXEL_OUT); FIRST_PIXEL_OUT is in
+            // CLOCK_MONOTONIC ns on Mesa, so falling back to it is much tighter
+            // than monotonicNow(). QUEUE_OPS_END is in a different clock and
+            // would corrupt RenderLoop's scheduling, so skip it as a fallback.
+            if (firstPixelVisible != std::chrono::nanoseconds::zero()) {
+                timestamp = firstPixelVisible;
+            } else if (firstPixelOut != std::chrono::nanoseconds::zero()) {
+                timestamp = firstPixelOut;
+            }
         }
     }
 
+    // Emit stage data first so backends connected on the same QObject see
+    // it before vblankOccurred() triggers OutputFrame::presented(). Both are
+    // delivered via Qt::QueuedConnection and processed in FIFO order on the
+    // target object — same-thread same-target ordering is guaranteed.
+    Q_EMIT presentTimingsReady(presentId, queueOperationsEnd, firstPixelOut, firstPixelVisible);
     Q_EMIT vblankOccurred(timestamp);
 }
 
@@ -163,6 +206,11 @@ VulkanPresentTimingMonitor::VulkanPresentTimingMonitor(VkDevice device,
             this, &VulkanPresentTimingMonitor::errorOccurred);
     connect(&m_helper, &VulkanPresentTimingMonitorHelper::vblankOccurred,
             this, &VulkanPresentTimingMonitor::vblankOccurred);
+    // Per-stage timing for backends that want to stash data on the in-flight
+    // OutputFrame before OutputFrame::presented() runs. Forwarded in the same
+    // emit order as the helper so FIFO ordering on the backend target holds.
+    connect(&m_helper, &VulkanPresentTimingMonitorHelper::presentTimingsReady,
+            this, &VulkanPresentTimingMonitor::presentTimingsReady);
 
     m_thread.setObjectName(QStringLiteral("vulkan present-timing monitor"));
     m_thread.start();

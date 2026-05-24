@@ -102,6 +102,24 @@ public:
     std::optional<double> artificialHdrHeadroom() const;
     void setArtificialHdrHeadroom(double edr);
 
+    /**
+     * @brief Per-stage timestamps from VK_EXT_present_timing for this frame.
+     *
+     * Set by the backend's present-timing slot before presented() runs;
+     * std::nullopt if the corresponding stage was not reported (or the timing
+     * path is inactive). The Vulkan X11 backend wires
+     * VulkanPresentTimingMonitor::presentTimingsReady() to setters that fill
+     * these in via Qt's FIFO ordering of queued signals on the same target,
+     * which guarantees they land before OutputFrame::presented() is invoked
+     * from the subsequent vblankOccurred() emission.
+     */
+    void setQueueOperationsEndTimestamp(std::chrono::nanoseconds ts);
+    void setFirstPixelOutTimestamp(std::chrono::nanoseconds ts);
+    void setFirstPixelVisibleTimestamp(std::chrono::nanoseconds ts);
+    std::optional<std::chrono::nanoseconds> queueOperationsEndTimestamp() const;
+    std::optional<std::chrono::nanoseconds> firstPixelOutTimestamp() const;
+    std::optional<std::chrono::nanoseconds> firstPixelVisibleTimestamp() const;
+
 private:
     std::optional<RenderTimeSpan> queryRenderTime() const;
 
@@ -117,6 +135,9 @@ private:
     bool m_presented = false;
     std::optional<double> m_brightness;
     std::optional<double> m_artificialHdrHeadroom;
+    std::optional<std::chrono::nanoseconds> m_queueOperationsEndTimestamp;
+    std::optional<std::chrono::nanoseconds> m_firstPixelOutTimestamp;
+    std::optional<std::chrono::nanoseconds> m_firstPixelVisibleTimestamp;
 };
 
 /**

@@ -456,6 +456,11 @@ void X11StandaloneVulkanBackend::setupPresentTimingQueue()
     // should not normally happen.
     m_presentTimingMonitor = VulkanPresentTimingMonitor::create(this, m_swapchain.get());
     if (m_presentTimingMonitor) {
+        // presentTimingsReady fires before vblankOccurred — Qt FIFO ordering of
+        // queued signals on the same target object — so the stage stash lands
+        // on m_frame before vblank() calls m_frame->presented().
+        connect(m_presentTimingMonitor.get(), &VulkanPresentTimingMonitor::presentTimingsReady,
+                this, &X11StandaloneVulkanBackend::handlePresentTimingsReady);
         connect(m_presentTimingMonitor.get(), &VsyncMonitor::vblankOccurred,
                 this, &X11StandaloneVulkanBackend::vblank);
         connect(m_presentTimingMonitor.get(), &VsyncMonitor::errorOccurred,
@@ -783,6 +788,25 @@ void X11StandaloneVulkanBackend::recordFrameDamage(const QRegion &damage)
         }
     }
     ++m_frameCounter;
+}
+
+void X11StandaloneVulkanBackend::handlePresentTimingsReady(uint64_t presentId,
+                                                           std::chrono::nanoseconds queueOperationsEnd,
+                                                           std::chrono::nanoseconds firstPixelOut,
+                                                           std::chrono::nanoseconds firstPixelVisible)
+{
+    if (!m_frame) {
+        return;
+    }
+    if (queueOperationsEnd != std::chrono::nanoseconds::zero()) {
+        m_frame->setQueueOperationsEndTimestamp(queueOperationsEnd);
+    }
+    if (firstPixelOut != std::chrono::nanoseconds::zero()) {
+        m_frame->setFirstPixelOutTimestamp(firstPixelOut);
+    }
+    if (firstPixelVisible != std::chrono::nanoseconds::zero()) {
+        m_frame->setFirstPixelVisibleTimestamp(firstPixelVisible);
+    }
 }
 
 void X11StandaloneVulkanBackend::beginRenderTimeQuery()
