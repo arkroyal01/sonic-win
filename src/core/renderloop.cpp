@@ -27,6 +27,48 @@ RenderLoopPrivate *RenderLoopPrivate::get(RenderLoop *loop)
 static const bool s_printDebugInfo = qEnvironmentVariableIntValue("KWIN_LOG_PERFORMANCE_DATA") != 0
     || qEnvironmentVariableIntValue("KWIN_VULKAN_LATENCY_TELEMETRY") != 0;
 
+// Phase 3 tight scheduling (KWIN_VULKAN_TIGHT_SCHED=1): swap RenderJournal's
+// EMA + 2*variance budget for a rolling percentile of observed render
+// durations, and tune setPresentationSafetyMargin() with a feedback loop
+// against the observed vblank-miss rate. Read once at process startup.
+static const bool s_tightSched = qEnvironmentVariableIntValue("KWIN_VULKAN_TIGHT_SCHED") != 0;
+
+// Helper: read a double from an env var, fall back to @p fallback if unset
+// or unparseable. Used for the env-overridable controller knobs below.
+static double envDouble(const char *name, double fallback)
+{
+    if (!qEnvironmentVariableIsSet(name)) {
+        return fallback;
+    }
+    bool ok = false;
+    const double v = qEnvironmentVariable(name).toDouble(&ok);
+    return ok ? v : fallback;
+}
+
+// Controller targets: shrink the safety margin while the recent miss-rate
+// stays below s_targetMissRateLow; grow it when above s_targetMissRateHigh.
+// Between the two edges the margin holds steady, avoiding oscillation.
+// 0.1% lower bound is roughly "one miss per ~3 s at 165 Hz".
+// 1% upper bound is the visible-jank threshold most users tolerate.
+static const double s_targetMissRateLow = envDouble("KWIN_VULKAN_TIGHT_SCHED_TARGET_LOW", 0.001);
+static const double s_targetMissRateHigh = envDouble("KWIN_VULKAN_TIGHT_SCHED_TARGET_HIGH", 0.01);
+
+// Step size for each adjustment, expressed as a fraction of the current
+// vblank interval so controller convergence is consistent across refresh
+// rates (60 / 120 / 165 / 240 Hz monitors all need ~60 steps to saturate
+// at 0.015). The actual ns value is computed per-call from the live
+// vblankInterval — the refresh rate may change at runtime (display
+// reconfiguration / VRR transitions).
+static const double s_stepFraction = envDouble("KWIN_VULKAN_TIGHT_SCHED_STEP_FRACTION", 0.015);
+
+// Miss-rate window in *seconds*, multiplied by the live refresh rate at
+// first use to size the ring buffer. Same wall-clock memory of ~4 s
+// regardless of refresh rate; long enough to smooth noise and short enough
+// to react to a sustained regression in a few seconds. The ring is
+// reallocated if the refresh rate later changes by more than ~15 % so the
+// time window stays roughly constant.
+static const double s_windowSeconds = envDouble("KWIN_VULKAN_TIGHT_SCHED_WINDOW_SECONDS", 4.0);
+
 RenderLoopPrivate::RenderLoopPrivate(RenderLoop *q, Output *output)
     : q(q)
     , output(output)
@@ -45,6 +87,27 @@ RenderLoopPrivate::RenderLoopPrivate(RenderLoop *q, Output *output)
     QObject::connect(&delayedVrrTimer, &QTimer::timeout, q, [q]() {
         q->scheduleRepaint(nullptr, nullptr);
     });
+
+    if (s_tightSched) {
+        // Materialise the percentile journal only when the env var is on —
+        // keeps the per-RenderLoop overhead at zero in the default path.
+        // The miss-rate ring is allocated lazily in notifyFrameCompleted()
+        // once the live refresh rate is known. Logged once per process so
+        // the env-var landing is observable from the terminal. Plain static
+        // bool: RenderLoops are constructed on the main thread.
+        renderJournalPercentile.emplace();
+        static bool s_loggedTightSched = false;
+        if (!s_loggedTightSched) {
+            s_loggedTightSched = true;
+            qCWarning(KWIN_CORE).nospace()
+                << "RenderLoop: tight scheduler active "
+                << "(KWIN_VULKAN_TIGHT_SCHED=1: p99 render-journal + adaptive safety margin, "
+                << "target miss-rate band ["
+                << s_targetMissRateLow * 100.0 << "%, " << s_targetMissRateHigh * 100.0 << "%], "
+                << "step=" << s_stepFraction * 100.0 << "% of vblank, "
+                << "window=" << s_windowSeconds << "s)";
+        }
+    }
 }
 
 void RenderLoopPrivate::scheduleNextRepaint()
@@ -62,8 +125,14 @@ void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTargetTimes
     const std::chrono::nanoseconds currentTime(std::chrono::steady_clock::now().time_since_epoch());
 
     // Estimate when it's a good time to perform the next compositing cycle.
-    // the 1ms on top of the safety margin is required for timer and scheduler inaccuracies
-    std::chrono::nanoseconds expectedCompositingTime = std::min(renderJournal.result() + safetyMargin + 1ms, 2 * vblankInterval);
+    // the 1ms on top of the safety margin is required for timer and scheduler inaccuracies.
+    // Tight-scheduler path (Phase 3, KWIN_VULKAN_TIGHT_SCHED=1) uses a rolling
+    // p99 of observed render durations instead of EMA + 2*variance; safetyMargin
+    // itself is tuned by the miss-rate feedback in notifyFrameCompleted().
+    const std::chrono::nanoseconds journalResult = renderJournalPercentile
+        ? renderJournalPercentile->result()
+        : renderJournal.result();
+    std::chrono::nanoseconds expectedCompositingTime = std::min(journalResult + safetyMargin + 1ms, 2 * vblankInterval);
 
     if (presentationMode == PresentationMode::VSync) {
         // normal presentation: pageflips only happen at vblank
@@ -203,7 +272,70 @@ void RenderLoopPrivate::notifyFrameCompleted(std::chrono::nanoseconds timestamp,
     notifyVblank(timestamp);
 
     if (renderTime) {
-        renderJournal.add(renderTime->end - renderTime->start, timestamp);
+        const auto rt = renderTime->end - renderTime->start;
+        renderJournal.add(rt, timestamp);
+        if (renderJournalPercentile) {
+            renderJournalPercentile->add(rt, timestamp);
+        }
+    }
+
+    // Phase 3 miss-rate feedback controller. Same miss criterion as the CSV's
+    // vblank_miss column (presented past target by more than half a vblank).
+    // Steps safetyMargin toward the [low, high] miss-rate band; outside the
+    // band the next frame's scheduleRepaint sees the new margin via
+    // expectedCompositingTime. Only runs when the tight scheduler is active.
+    if (renderJournalPercentile) {
+        // Live vblank interval and the time-anchored ring size. Reallocate
+        // if the refresh rate moved enough that the ring would cover a
+        // visibly wrong window (>15 % drift), so the controller's reaction
+        // speed stays consistent in wall-clock terms after display reconfig.
+        const std::chrono::nanoseconds vblankInterval(1'000'000'000'000ull / refreshRate);
+        const double refreshHz = double(refreshRate) / 1000.0;
+        const std::size_t targetWindow = std::max<std::size_t>(60, std::size_t(s_windowSeconds * refreshHz));
+        if (m_missRing.size() == 0
+            || (m_missRing.size() < targetWindow * 17 / 20)
+            || (m_missRing.size() > targetWindow * 23 / 20)) {
+            // Reset history on resize — preserving a stale window across a
+            // 60 → 165 Hz transition would feed the controller inconsistent
+            // samples for ~4 s afterwards. Cleaner to lose the history.
+            m_missRing.assign(targetWindow, false);
+            m_missRingCursor = 0;
+            m_missRingFilled = 0;
+            m_missCount = 0;
+        }
+
+        const std::chrono::nanoseconds targetNs = frame->targetPageflipTime().time_since_epoch();
+        const bool miss = timestamp > targetNs + frame->refreshDuration() / 2;
+        // Replace the oldest entry; keep a running m_missCount so we don't
+        // rescan the whole ring per frame.
+        const bool prior = m_missRing[m_missRingCursor];
+        if (m_missRingFilled == m_missRing.size()) {
+            m_missCount -= prior ? 1 : 0;
+        } else {
+            ++m_missRingFilled;
+        }
+        m_missRing[m_missRingCursor] = miss;
+        m_missCount += miss ? 1 : 0;
+        m_missRingCursor = (m_missRingCursor + 1) % m_missRing.size();
+
+        // Wait for at least a quarter window before reacting, so the controller
+        // doesn't yank the margin on the first handful of samples.
+        if (m_missRingFilled >= m_missRing.size() / 4) {
+            const double rate = double(m_missCount) / double(m_missRingFilled);
+            // Step size scales with vblank so saturation distance is
+            // refresh-rate-invariant. Floor at 1 µs to keep progress real
+            // even on hypothetical >1 kHz panels.
+            const std::chrono::nanoseconds marginStep = std::max<std::chrono::nanoseconds>(
+                std::chrono::nanoseconds(int64_t(double(vblankInterval.count()) * s_stepFraction)),
+                std::chrono::microseconds(1));
+            if (rate < s_targetMissRateLow && safetyMargin > 0ns) {
+                const auto next = std::max(safetyMargin - marginStep, 0ns);
+                q->setPresentationSafetyMargin(next);
+            } else if (rate > s_targetMissRateHigh && safetyMargin < vblankInterval) {
+                const auto next = std::min(safetyMargin + marginStep, vblankInterval);
+                q->setPresentationSafetyMargin(next);
+            }
+        }
     }
     if (compositeTimer.isActive()) {
         // reschedule to match the new timestamp and render time

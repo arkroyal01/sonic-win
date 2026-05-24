@@ -8,12 +8,14 @@
 
 #include "renderbackend.h"
 #include "renderjournal.h"
+#include "renderjournalpercentile.h"
 #include "renderloop.h"
 
 #include <QTimer>
 
 #include <fstream>
 #include <optional>
+#include <vector>
 
 namespace KWin
 {
@@ -46,12 +48,30 @@ public:
     int doubleBufferingCounter = 0;
     QTimer compositeTimer;
     RenderJournal renderJournal;
+    // Phase 3 tight-scheduling path (KWIN_VULKAN_TIGHT_SCHED=1). When the
+    // env var is set this percentile journal feeds scheduleRepaint() in
+    // place of `renderJournal`, and a miss-rate controller (m_missRing
+    // below) tunes `safetyMargin` to target a chosen vblank-miss rate
+    // window. When unset both fields stay default and the existing
+    // EMA + 2*variance budget is used. Optional so the unused path costs
+    // nothing.
+    std::optional<RenderJournalPercentile> renderJournalPercentile;
     int refreshRate = 60000;
     int pendingFrameCount = 0;
     int inhibitCount = 0;
     bool pendingReschedule = false;
     bool pendingRepaint = false;
     std::chrono::nanoseconds safetyMargin{0};
+
+    // Miss-rate feedback ring (only populated under KWIN_VULKAN_TIGHT_SCHED).
+    // Each notifyFrameCompleted() writes a 0/1 miss flag here; the controller
+    // shrinks safetyMargin when the recent miss-rate falls below the target
+    // band's low edge and grows it when above the high edge. Sized for ~5 s
+    // at 120 Hz; bool packing keeps memory cost trivial.
+    std::vector<bool> m_missRing;
+    std::size_t m_missRingCursor = 0;
+    std::size_t m_missRingFilled = 0;
+    std::size_t m_missCount = 0;
 
     PresentationMode presentationMode = PresentationMode::VSync;
     int maxPendingFrameCount = 1;

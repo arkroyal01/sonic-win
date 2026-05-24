@@ -70,6 +70,7 @@ target_sources(kwin PRIVATE
     core/overlaywindow.cpp
     core/renderbackend.cpp
     core/renderjournal.cpp
+    core/renderjournalpercentile.cpp
     core/renderlayer.cpp
     core/renderlayerdelegate.cpp
     core/renderloop.cpp
@@ -496,6 +497,7 @@ install(FILES
     core/pixelgrid.h
     core/renderbackend.h
     core/renderjournal.h
+    core/renderjournalpercentile.h
     core/renderlayer.h
     core/renderlayerdelegate.h
     core/renderloop.h
