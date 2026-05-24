@@ -11,6 +11,7 @@
 #include "utils/common.h"
 #include "vulkancontext.h"
 #include "vulkanframebuffer.h"
+#include "vulkangpurendertimequery.h"
 #include "vulkantexture.h"
 
 #include <QDebug>
@@ -275,7 +276,17 @@ bool VulkanBackend::selectPhysicalDevice()
             if (queueFamilies[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
                 m_physicalDevice = device;
                 m_graphicsQueueFamily = i;
+                // Cache timestamp capability: timestampPeriod is nanoseconds
+                // per tick (0 if device does not advertise timestamps), and
+                // timestampValidBits must be > 0 on the chosen graphics queue
+                // family for vkCmdWriteTimestamp to be legal there.
+                m_timestampPeriod = deviceProperties.limits.timestampPeriod;
+                m_supportsGpuTimestamps = m_timestampPeriod > 0.0f
+                    && queueFamilies[i].timestampValidBits > 0;
                 qCDebug(KWIN_VULKAN) << "Selected Vulkan device:" << deviceProperties.deviceName;
+                qCDebug(KWIN_VULKAN) << "GPU timestamp queries:" << (m_supportsGpuTimestamps ? "supported" : "unsupported")
+                                     << "period=" << m_timestampPeriod << "ns/tick"
+                                     << "validBits=" << queueFamilies[i].timestampValidBits;
                 return true;
             }
         }
@@ -505,6 +516,61 @@ QVulkanInstance *VulkanBackend::qVulkanInstance()
     return m_qVulkanInstance.get();
 }
 
+bool VulkanBackend::gpuRenderTimeRequested() const
+{
+    // Read the env var once at process startup; flipping it at runtime is not
+    // supported and would race with the query pool's lazy creation.
+    static const bool s_enabled = qEnvironmentVariableIntValue("KWIN_VULKAN_GPU_RENDER_TIME") != 0;
+    return s_enabled && m_supportsGpuTimestamps;
+}
+
+VkQueryPool VulkanBackend::gpuRenderTimePool()
+{
+    if (!gpuRenderTimeRequested() || m_device == VK_NULL_HANDLE) {
+        return VK_NULL_HANDLE;
+    }
+    if (m_gpuRenderTimePool != VK_NULL_HANDLE) {
+        return m_gpuRenderTimePool;
+    }
+
+    // Sized for the swapchain's frames-in-flight depth; matches
+    // VulkanSwapchain::MAX_FRAMES_IN_FLIGHT used by ItemRendererVulkan. Hard-
+    // coding 2 here keeps this header free of the cross-tree include; if
+    // MAX_FRAMES_IN_FLIGHT ever changes we will catch the mismatch via the
+    // static_assert in ItemRendererVulkan.
+    constexpr uint32_t kSlots = 2;
+    VkQueryPoolCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    info.queryCount = 2 * kSlots;
+
+    const VkResult r = vkCreateQueryPool(m_device, &info, nullptr, &m_gpuRenderTimePool);
+    if (r != VK_SUCCESS) {
+        qCWarning(KWIN_VULKAN) << "vkCreateQueryPool failed for GPU render-time queries:" << r;
+        m_gpuRenderTimePool = VK_NULL_HANDLE;
+        return VK_NULL_HANDLE;
+    }
+    qCWarning(KWIN_VULKAN).nospace()
+        << "GPU render-time queries active (KWIN_VULKAN_GPU_RENDER_TIME=1, "
+        << "timestampPeriod=" << m_timestampPeriod << "ns/tick)";
+    return m_gpuRenderTimePool;
+}
+
+void VulkanBackend::setPendingGpuRenderTimeQuery(std::unique_ptr<VulkanGpuRenderTimeQuery> q)
+{
+    m_pendingGpuRenderTimeQuery = std::move(q);
+}
+
+VulkanGpuRenderTimeQuery *VulkanBackend::pendingGpuRenderTimeQuery() const
+{
+    return m_pendingGpuRenderTimeQuery.get();
+}
+
+std::unique_ptr<VulkanGpuRenderTimeQuery> VulkanBackend::takePendingGpuRenderTimeQuery()
+{
+    return std::move(m_pendingGpuRenderTimeQuery);
+}
+
 void VulkanBackend::cleanup()
 {
     // Drop the Qt wrapper before the VkInstance it references. setVkInstance() means
@@ -513,6 +579,14 @@ void VulkanBackend::cleanup()
 
     if (m_device != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(m_device);
+        // Destroy the GPU render-time query pool before the device — the
+        // unique_ptr below also holds a pool reference indirectly but that
+        // object is queried, never freed, by the device path.
+        if (m_gpuRenderTimePool != VK_NULL_HANDLE) {
+            vkDestroyQueryPool(m_device, m_gpuRenderTimePool, nullptr);
+            m_gpuRenderTimePool = VK_NULL_HANDLE;
+        }
+        m_pendingGpuRenderTimeQuery.reset();
         vkDestroyDevice(m_device, nullptr);
         m_device = VK_NULL_HANDLE;
     }

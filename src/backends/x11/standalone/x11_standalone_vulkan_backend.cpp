@@ -12,6 +12,7 @@
 #include "core/outputbackend.h"
 #include "core/overlaywindow.h"
 #include "core/renderloop.h"
+#include "platformsupport/scenes/vulkan/vulkangpurendertimequery.h"
 #include "platformsupport/scenes/vulkan/vulkanpipelinemanager.h"
 #include "platformsupport/scenes/vulkan/vulkanpresenttimingmonitor.h"
 #include "platformsupport/scenes/vulkan/vulkanrenderpass.h"
@@ -811,21 +812,36 @@ void X11StandaloneVulkanBackend::handlePresentTimingsReady(uint64_t presentId,
 
 void X11StandaloneVulkanBackend::beginRenderTimeQuery()
 {
-    // CpuRenderTimeQuery starts the clock at construction; nothing else to do
-    // here. Overwriting any prior value is safe: doBeginFrame/doEndFrame pair
-    // 1:1 today, but if a previous frame somehow failed to attach its query
-    // (e.g. doEndFrame skipped), discarding it is correct — the unattached
-    // query has no observer and the new frame's measurement is what we want.
+    // CpuRenderTimeQuery is always installed: it feeds the scheduler's
+    // renderJournal and captures CPU-side dispatch/event-loop work the GPU
+    // timestamp path is blind to. The optional VulkanGpuRenderTimeQuery
+    // (KWIN_VULKAN_GPU_RENDER_TIME=1, registered by ItemRendererVulkan) is
+    // an *additional* observation logged in the CSV's gpu_render_duration
+    // column — it does not replace the CPU input. Overwriting any prior
+    // value is safe: doBeginFrame/doEndFrame pair 1:1 today, but if a
+    // previous frame somehow failed to attach its query, discarding it is
+    // correct — the unattached query has no observer and the new frame's
+    // measurement is what we want.
     m_renderTimeQuery = std::make_unique<CpuRenderTimeQuery>();
 }
 
 void X11StandaloneVulkanBackend::endAndAttachRenderTimeQuery(OutputFrame *frame)
 {
-    if (!m_renderTimeQuery || !frame) {
+    if (!frame) {
         return;
     }
-    m_renderTimeQuery->end();
-    frame->addRenderTimeQuery(std::move(m_renderTimeQuery));
+    // CPU query → renderJournal input (always).
+    if (m_renderTimeQuery) {
+        m_renderTimeQuery->end();
+        frame->addRenderTimeQuery(std::move(m_renderTimeQuery));
+    }
+    // GPU query → side channel for CSV-only logging. Held on the OutputFrame
+    // in a dedicated slot so it isn't merged into the CPU span via
+    // queryRenderTime()'s union operator (which would inflate the scheduler's
+    // measurement).
+    if (auto gpuQuery = takePendingGpuRenderTimeQuery()) {
+        frame->setGpuRenderTimeQuery(std::move(gpuQuery));
+    }
 }
 
 xcb_connection_t *X11StandaloneVulkanBackend::connection() const

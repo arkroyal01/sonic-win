@@ -199,6 +199,23 @@ std::optional<std::chrono::nanoseconds> OutputFrame::firstPixelVisibleTimestamp(
     return m_firstPixelVisibleTimestamp;
 }
 
+void OutputFrame::setGpuRenderTimeQuery(std::unique_ptr<RenderTimeQuery> &&query)
+{
+    m_gpuRenderTimeQuery = std::move(query);
+}
+
+std::optional<std::chrono::nanoseconds> OutputFrame::queryGpuRenderDuration()
+{
+    if (!m_gpuRenderTimeQuery) {
+        return std::nullopt;
+    }
+    const auto span = m_gpuRenderTimeQuery->query();
+    if (!span) {
+        return std::nullopt;
+    }
+    return span->end - span->start;
+}
+
 OutputLayer *RenderBackend::cursorLayer(Output *output)
 {
     return nullptr;

@@ -120,6 +120,18 @@ public:
     std::optional<std::chrono::nanoseconds> firstPixelOutTimestamp() const;
     std::optional<std::chrono::nanoseconds> firstPixelVisibleTimestamp() const;
 
+    /**
+     * @brief Side-channel GPU-measured render-time query (Phase 2,
+     * KWIN_VULKAN_GPU_RENDER_TIME=1). Kept separate from the main
+     * RenderTimeQuery list so it doesn't merge into the CPU span fed to
+     * renderJournal — the scheduler must keep seeing the CPU measurement
+     * because it captures dispatch/event-loop work the GPU timestamps are
+     * blind to. The query result is read out in RenderLoopPrivate::
+     * notifyFrameCompleted() purely for the CSV's gpu_render_duration column.
+     */
+    void setGpuRenderTimeQuery(std::unique_ptr<RenderTimeQuery> &&query);
+    std::optional<std::chrono::nanoseconds> queryGpuRenderDuration();
+
 private:
     std::optional<RenderTimeSpan> queryRenderTime() const;
 
@@ -138,6 +150,7 @@ private:
     std::optional<std::chrono::nanoseconds> m_queueOperationsEndTimestamp;
     std::optional<std::chrono::nanoseconds> m_firstPixelOutTimestamp;
     std::optional<std::chrono::nanoseconds> m_firstPixelVisibleTimestamp;
+    std::unique_ptr<RenderTimeQuery> m_gpuRenderTimeQuery;
 };
 
 /**

@@ -160,7 +160,7 @@ void RenderLoopPrivate::notifyFrameCompleted(std::chrono::nanoseconds timestamp,
             << "RenderLoop: writing perf statistics to"
             << QString::fromStdString(ec ? path : absPath.string());
         *m_debugOutput << "target pageflip timestamp,pageflip timestamp,render start,render end,safety margin,refresh duration,vrr,tearing,predicted render time,"
-                       << "queue ops end,first pixel out,first pixel visible,end to end latency,vblank miss\n";
+                       << "queue ops end,first pixel out,first pixel visible,end to end latency,vblank miss,gpu render duration\n";
     }
     if (m_debugOutput) {
         auto times = renderTime.value_or(RenderTimeSpan{});
@@ -186,9 +186,15 @@ void RenderLoopPrivate::notifyFrameCompleted(std::chrono::nanoseconds timestamp,
         // (conservative — a "just made it" frame is not a miss).
         const std::chrono::nanoseconds targetNs = frame->targetPageflipTime().time_since_epoch();
         const bool miss = timestamp > targetNs + frame->refreshDuration() / 2;
+        // GPU-measured render duration (Phase 2 side channel). 0 when
+        // KWIN_VULKAN_GPU_RENDER_TIME is off, when the device does not
+        // support timestamps, or when the query was not yet available at
+        // read time (e.g. aborted submit). Independent from the scheduler's
+        // CPU-measured renderTime above.
+        const auto gpuRd = frame->queryGpuRenderDuration().value_or(std::chrono::nanoseconds::zero());
         *m_debugOutput << targetNs.count() << "," << timestamp.count() << "," << times.start.time_since_epoch().count() << "," << times.end.time_since_epoch().count()
                        << "," << safetyMargin.count() << "," << frame->refreshDuration().count() << "," << (vrr ? 1 : 0) << "," << (tearing ? 1 : 0) << "," << frame->predictedRenderTime().count()
-                       << "," << qEnd.count() << "," << fpOut.count() << "," << fpVisible.count() << "," << e2e.count() << "," << (miss ? 1 : 0) << "\n";
+                       << "," << qEnd.count() << "," << fpOut.count() << "," << fpVisible.count() << "," << e2e.count() << "," << (miss ? 1 : 0) << "," << gpuRd.count() << "\n";
     }
 
     Q_ASSERT(pendingFrameCount > 0);

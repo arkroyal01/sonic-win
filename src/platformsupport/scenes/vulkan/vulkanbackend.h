@@ -246,6 +246,61 @@ public:
     }
 
     /**
+     * @brief Nanoseconds per GPU timestamp tick (from VkPhysicalDeviceLimits).
+     *
+     * Multiply a `vkCmdWriteTimestamp` delta by this to get nanoseconds. Zero
+     * if the device does not advertise timestamps.
+     */
+    float timestampPeriod() const
+    {
+        return m_timestampPeriod;
+    }
+
+    /**
+     * @brief Whether the graphics queue supports GPU timestamp queries.
+     *
+     * True iff timestampPeriod() > 0 and the graphics queue family's
+     * timestampValidBits > 0. Used to gate the GPU render-time path; the CPU
+     * RenderTimeQuery fallback runs when this is false.
+     */
+    bool supportsGpuTimestamps() const
+    {
+        return m_supportsGpuTimestamps;
+    }
+
+    /**
+     * @brief Whether the GPU render-time path should be used this run.
+     *
+     * True iff KWIN_VULKAN_GPU_RENDER_TIME=1 is set in the environment AND
+     * supportsGpuTimestamps() is true. The renderer checks this in beginFrame
+     * to decide whether to write vkCmdWriteTimestamp brackets and register a
+     * VulkanGpuRenderTimeQuery with the backend. When false, the backend's
+     * concrete subclass installs a CpuRenderTimeQuery as the Phase 0 baseline.
+     */
+    bool gpuRenderTimeRequested() const;
+
+    /**
+     * @brief Lazily-created VkQueryPool with 2 * MAX_FRAMES_IN_FLIGHT timestamp
+     * slots. Returns VK_NULL_HANDLE on creation failure or when the GPU
+     * timing path is disabled.
+     */
+    VkQueryPool gpuRenderTimePool();
+
+    /**
+     * @brief Stash the in-flight VulkanGpuRenderTimeQuery the renderer
+     * constructed in beginFrame, to be picked up by the backend's
+     * endAndAttachRenderTimeQuery() after the renderer's endFrame finishes
+     * recording the END timestamp.
+     */
+    void setPendingGpuRenderTimeQuery(std::unique_ptr<class VulkanGpuRenderTimeQuery> q);
+
+    /** @brief Non-owning peek (used by the renderer in endFrame). */
+    class VulkanGpuRenderTimeQuery *pendingGpuRenderTimeQuery() const;
+
+    /** @brief Move-out the in-flight query (used by the backend at end-of-frame). */
+    std::unique_ptr<class VulkanGpuRenderTimeQuery> takePendingGpuRenderTimeQuery();
+
+    /**
      * @brief Get the vkGetFenceFdKHR function pointer (only valid if supportsExternalFenceFd() returns true)
      */
     PFN_vkGetFenceFdKHR vkGetFenceFdKHR() const
@@ -312,6 +367,24 @@ private:
     // External fence fd support
     bool m_supportsExternalFenceFd = false;
     PFN_vkGetFenceFdKHR m_vkGetFenceFdKHR = nullptr;
+
+    // GPU timestamp query support (VkCmdWriteTimestamp).
+    // Cached at physical-device selection so VulkanGpuRenderTimeQuery can
+    // convert ticks to nanoseconds without re-querying limits per frame.
+    float m_timestampPeriod = 0.0f;
+    bool m_supportsGpuTimestamps = false;
+
+    // Lazy-allocated query pool with 2 * MAX_FRAMES_IN_FLIGHT slots
+    // (KWIN_VULKAN_GPU_RENDER_TIME=1). Slots 2*i and 2*i+1 are used for the
+    // begin/end timestamps of the in-flight frame at slot i.
+    VkQueryPool m_gpuRenderTimePool = VK_NULL_HANDLE;
+
+    // In-flight query handed off between the renderer (which records the
+    // GPU timestamps into the scene command buffer) and the concrete backend
+    // (which attaches it to the OutputFrame at end-of-frame). Serialized:
+    // doBeginFrame → renderer.beginFrame (set) → renderer.endFrame (record
+    // end) → doEndFrame (take) → next frame.
+    std::unique_ptr<class VulkanGpuRenderTimeQuery> m_pendingGpuRenderTimeQuery;
 
     // VK_KHR_incremental_present support (changed-region hints in vkQueuePresentKHR)
     bool m_supportsIncrementalPresent = false;

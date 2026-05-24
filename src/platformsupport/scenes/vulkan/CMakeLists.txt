@@ -96,6 +96,10 @@ target_sources(kwin PRIVATE
 
     # Async present-timing monitor (VK_KHR_present_wait2 + VK_EXT_present_timing)
     vulkanpresenttimingmonitor.cpp
+
+    # GPU-side render-time query (vkCmdWriteTimestamp). Enabled by
+    # KWIN_VULKAN_GPU_RENDER_TIME=1.
+    vulkangpurendertimequery.cpp
 )
 
 target_link_libraries(kwin PRIVATE

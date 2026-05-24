@@ -17,6 +17,7 @@
 #include "platformsupport/scenes/vulkan/vulkanbuffer.h"
 #include "platformsupport/scenes/vulkan/vulkancontext.h"
 #include "platformsupport/scenes/vulkan/vulkanframebuffer.h"
+#include "platformsupport/scenes/vulkan/vulkangpurendertimequery.h"
 #include "platformsupport/scenes/vulkan/vulkanpipeline.h"
 #include "platformsupport/scenes/vulkan/vulkanpipelinemanager.h"
 #include "platformsupport/scenes/vulkan/vulkanrenderpass.h"
@@ -270,6 +271,23 @@ void ItemRendererVulkan::beginFrame(const RenderTarget &renderTarget, const Rend
             // Offscreen / non-swapchain target: use the dedicated slot so it
             // never aliases a swapchain frame's in-flight buffers.
             m_currentFrameIndex = kOffscreenSlot;
+        }
+    }
+
+    // Phase 2: bracket GPU work with vkCmdWriteTimestamp when
+    // KWIN_VULKAN_GPU_RENDER_TIME=1 — but only for actual swapchain frames.
+    // Offscreen renders don't feed RenderLoop's renderJournal, so timing them
+    // adds no scheduler signal and costs query-pool slots. The endFrame hook
+    // matches on m_backend->pendingGpuRenderTimeQuery() so this conditional
+    // doesn't need to be repeated there.
+    if (vulkanRenderTarget && vulkanRenderTarget->hasSyncInfo() && m_backend->gpuRenderTimeRequested()) {
+        if (VkQueryPool pool = m_backend->gpuRenderTimePool(); pool != VK_NULL_HANDLE) {
+            const uint32_t slot = m_currentSyncInfo.frameIndex % kFramesInFlight;
+            auto query = std::make_unique<VulkanGpuRenderTimeQuery>(
+                m_backend->device(), pool,
+                2 * slot, 2 * slot + 1, m_backend->timestampPeriod());
+            query->recordBegin(m_currentCommandBuffer);
+            m_backend->setPendingGpuRenderTimeQuery(std::move(query));
         }
     }
 
@@ -760,6 +778,14 @@ void ItemRendererVulkan::endFrame()
                                  VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                                  0, 0, nullptr, 0, nullptr, 1, &toRestore);
         }
+    }
+
+    // Phase 2 GPU render-time: close the timestamp bracket opened in
+    // beginFrame. The peeked query stays on the backend so the concrete
+    // backend's endAndAttachRenderTimeQuery() can move it onto the OutputFrame
+    // once the layer's doEndFrame runs.
+    if (auto *gpuQuery = m_backend->pendingGpuRenderTimeQuery()) {
+        gpuQuery->recordEnd(m_currentCommandBuffer);
     }
 
     // End command buffer recording
