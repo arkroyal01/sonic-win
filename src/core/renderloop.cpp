@@ -145,25 +145,39 @@ void RenderLoopPrivate::scheduleRepaint(std::chrono::nanoseconds lastTargetTimes
         const uint64_t pageflipsSinceLastToTarget = std::max<int64_t>(std::round((lastTargetTimestamp - lastPresentationTimestamp).count() / double(vblankInterval.count())), 0);
         uint64_t pageflipsInAdvance = std::min<int64_t>(expectedCompositingTime / vblankInterval + 1, maxPendingFrameCount);
 
-        // switching from double to triple buffering causes a frame drop
-        // -> apply some amount of hysteresis to avoid switching back and forth constantly
-        if (pageflipsInAdvance > 1) {
-            // immediately switch to triple buffering when needed
-            wasTripleBuffering = true;
-            doubleBufferingCounter = 0;
-        } else if (wasTripleBuffering) {
-            // but wait a bit before switching back to double buffering
-            if (doubleBufferingCounter >= 10) {
-                wasTripleBuffering = false;
-            } else if (expectedCompositingTime >= vblankInterval * 0.95) {
-                // also don't switch back if render times are just barely enough for double buffering
-                pageflipsInAdvance = 2;
+        if (s_tightSched && renderJournalPercentile) {
+            // Phase 4: replace the legacy hysteresis with a direct miss-rate
+            // signal. m_inTripleBuffer is flipped in notifyFrameCompleted()
+            // based on the observed miss rate (Phase 3 ring): true when the
+            // recent rate crosses target_high, false again only after a full
+            // window stays below target_low. The compositing-time-derived
+            // minimum still applies — if expectedCompositingTime physically
+            // exceeds a vblank (e.g. Phase 3 has grown the safety margin to
+            // its cap), we *must* render >= 2 vblanks ahead or schedule a
+            // start in the past; take the max so both signals are honored.
+            const uint64_t pageflipsByMissRate = std::min<uint64_t>(m_inTripleBuffer ? 2 : 1, uint64_t(maxPendingFrameCount));
+            pageflipsInAdvance = std::max(pageflipsInAdvance, pageflipsByMissRate);
+        } else {
+            // switching from double to triple buffering causes a frame drop
+            // -> apply some amount of hysteresis to avoid switching back and forth constantly
+            if (pageflipsInAdvance > 1) {
+                // immediately switch to triple buffering when needed
+                wasTripleBuffering = true;
                 doubleBufferingCounter = 0;
-                expectedCompositingTime = vblankInterval;
-            } else {
-                doubleBufferingCounter++;
-                pageflipsInAdvance = 2;
-                expectedCompositingTime = vblankInterval;
+            } else if (wasTripleBuffering) {
+                // but wait a bit before switching back to double buffering
+                if (doubleBufferingCounter >= 10) {
+                    wasTripleBuffering = false;
+                } else if (expectedCompositingTime >= vblankInterval * 0.95) {
+                    // also don't switch back if render times are just barely enough for double buffering
+                    pageflipsInAdvance = 2;
+                    doubleBufferingCounter = 0;
+                    expectedCompositingTime = vblankInterval;
+                } else {
+                    doubleBufferingCounter++;
+                    pageflipsInAdvance = 2;
+                    expectedCompositingTime = vblankInterval;
+                }
             }
         }
 
@@ -334,6 +348,33 @@ void RenderLoopPrivate::notifyFrameCompleted(std::chrono::nanoseconds timestamp,
             } else if (rate > s_targetMissRateHigh && safetyMargin < vblankInterval) {
                 const auto next = std::min(safetyMargin + marginStep, vblankInterval);
                 q->setPresentationSafetyMargin(next);
+            }
+
+            // Phase 4 buffering hysteresis. Triple-buffering adds ~1 vblank
+            // of presentation latency, so the controller is conservative
+            // about staying out of double-buffer mode: it enters triple as
+            // soon as the recent rate crosses the high target (Phase 3's
+            // safety margin alone hasn't absorbed the spike), and only
+            // leaves triple after an entire window has stayed below the low
+            // target. Same target band as the margin controller — both react
+            // to the same signal but on different latencies (margin: per
+            // frame; buffer depth: per spike).
+            const bool wasInTriple = m_inTripleBuffer;
+            if (m_inTripleBuffer) {
+                if (rate < s_targetMissRateLow && m_missRingFilled == m_missRing.size()) {
+                    m_inTripleBuffer = false;
+                }
+            } else {
+                if (rate > s_targetMissRateHigh) {
+                    m_inTripleBuffer = true;
+                }
+            }
+            if (wasInTriple != m_inTripleBuffer) {
+                qCWarning(KWIN_CORE).nospace()
+                    << "RenderLoop: buffering "
+                    << (m_inTripleBuffer ? "double->triple" : "triple->double")
+                    << " (miss rate " << (rate * 100.0) << "% over "
+                    << m_missRingFilled << " frames)";
             }
         }
     }

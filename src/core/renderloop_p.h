@@ -73,6 +73,14 @@ public:
     std::size_t m_missRingFilled = 0;
     std::size_t m_missCount = 0;
 
+    // Phase 4 buffering hysteresis (tight scheduler only). Flipped to true
+    // when the observed miss rate exceeds the high target, back to false
+    // only after a full window has stayed below the low target. Replaces
+    // the legacy wasTripleBuffering / doubleBufferingCounter heuristic for
+    // the tight-scheduler path; the upstream heuristic still runs when
+    // KWIN_VULKAN_TIGHT_SCHED=0.
+    bool m_inTripleBuffer = false;
+
     PresentationMode presentationMode = PresentationMode::VSync;
     int maxPendingFrameCount = 1;
 
