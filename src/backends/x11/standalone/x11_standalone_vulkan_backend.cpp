@@ -387,6 +387,7 @@ void X11StandaloneVulkanBackend::detectPresentTimingSupport()
         << " presentTimingSupported=" << bool(timingCaps.presentTimingSupported)
         << " presentId2Supported=" << bool(id2Caps.presentId2Supported)
         << " presentWait2Supported=" << bool(wait2Caps.presentWait2Supported)
+        << " presentAtAbsoluteTimeSupported=" << bool(timingCaps.presentAtAbsoluteTimeSupported)
         << " supportedStages=0x" << QString::number(timingCaps.presentStageQueries, 16);
 
     if (r != VK_SUCCESS || !timingCaps.presentTimingSupported || !id2Caps.presentId2Supported
@@ -406,6 +407,24 @@ void X11StandaloneVulkanBackend::detectPresentTimingSupport()
     setPresentTimingStages(stages);
     setPresentTimingEnabled(true);
     m_presentTimingActive = true;
+
+    // Phase 5: cache surface support for the targetTime hint and pick the
+    // latest stage the surface advertises as the targetTime reference.
+    // Prefers FIRST_PIXEL_VISIBLE (truest "on screen") → FIRST_PIXEL_OUT →
+    // QUEUE_OPS_END (always available). Mesa MR !39551 currently exposes
+    // only QUEUE_OPS_END + FIRST_PIXEL_OUT, so this picks FIRST_PIXEL_OUT
+    // there. presentAtAbsoluteTimeRequested() additionally checks
+    // KWIN_VULKAN_PRESENT_TARGET=1.
+    setSurfaceSupportsAbsolutePresentTime(bool(timingCaps.presentAtAbsoluteTimeSupported));
+    VkPresentStageFlagsEXT targetStage = 0;
+    if (stages & VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_VISIBLE_BIT_EXT) {
+        targetStage = VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_VISIBLE_BIT_EXT;
+    } else if (stages & VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT) {
+        targetStage = VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT;
+    } else {
+        targetStage = VK_PRESENT_STAGE_QUEUE_OPERATIONS_END_BIT_EXT;
+    }
+    setTargetTimeDomainPresentStage(targetStage);
 }
 
 void X11StandaloneVulkanBackend::setupPresentTimingQueue()
@@ -623,11 +642,20 @@ bool X11StandaloneVulkanBackend::present(Output *output, const std::shared_ptr<O
         presentId = m_nextPresentId++;
     }
 
+    // Phase 5 target presentation time. Only filled when the env var is set
+    // and the surface advertises support; the scheduler's chosen target
+    // pageflip time is in CLOCK_MONOTONIC nanoseconds, which matches the
+    // time domain we picked in setupPresentTimingQueue().
+    std::chrono::nanoseconds targetTime = std::chrono::nanoseconds::zero();
+    if (presentAtAbsoluteTimeRequested() && frame) {
+        targetTime = frame->targetPageflipTime().time_since_epoch();
+    }
+
     // Present the rendered frame to the swapchain, hinting the changed region
     // (VK_KHR_incremental_present). m_presentDamage is cleared afterwards so a
     // present not preceded by a doEndFrame() (e.g. a failed beginFrame) falls
     // back to a regionless full present.
-    bool presentSuccess = m_swapchain->present(m_presentDamage, presentId);
+    bool presentSuccess = m_swapchain->present(m_presentDamage, presentId, targetTime);
     m_presentDamage = QRegion();
 
     if (presentSuccess) {

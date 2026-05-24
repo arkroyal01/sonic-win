@@ -465,7 +465,8 @@ uint32_t VulkanSwapchain::acquireNextImage(uint64_t timeout)
     return m_currentImageIndex;
 }
 
-bool VulkanSwapchain::present(const QRegion &damage, uint64_t presentId)
+bool VulkanSwapchain::present(const QRegion &damage, uint64_t presentId,
+                              std::chrono::nanoseconds targetTime)
 {
     VkSemaphore signalSemaphores[] = {m_renderFinishedSemaphores[m_currentFrame]};
 
@@ -528,6 +529,24 @@ bool VulkanSwapchain::present(const QRegion &damage, uint64_t presentId)
         timingInfo.sType = VK_STRUCTURE_TYPE_PRESENT_TIMING_INFO_EXT;
         timingInfo.timeDomainId = m_context->backend()->presentTimeDomainId();
         timingInfo.presentStageQueries = m_context->backend()->presentTimingStages();
+        // Phase 5 target-time hint. Asks the driver to schedule the present
+        // so the chosen stage (targetTimeDomainPresentStage) lands at
+        // targetTime. We always set NEAREST_REFRESH_CYCLE: without it the
+        // spec says "present at the next refresh cycle ≥ targetTime", and
+        // since our targetPageflipTime is *itself* a vblank moment, the
+        // driver picks the vblank *after* ours every time (off-by-one
+        // observed empirically: 100 % miss rate when combined with tight
+        // sched, because tight + Phase 4 triple-buffers and the target is
+        // already 2 vblanks ahead). NEAREST tells the driver "round to the
+        // closest refresh cycle to targetTime" — since our target IS a
+        // vblank, that's the exact one we want. timeDomainId is the
+        // CLOCK_MONOTONIC id picked at setupPresentTimingQueue().
+        if (targetTime != std::chrono::nanoseconds::zero()
+            && m_context->backend()->presentAtAbsoluteTimeRequested()) {
+            timingInfo.flags |= VK_PRESENT_TIMING_INFO_PRESENT_AT_NEAREST_REFRESH_CYCLE_BIT_EXT;
+            timingInfo.targetTime = static_cast<uint64_t>(targetTime.count());
+            timingInfo.targetTimeDomainPresentStage = m_context->backend()->targetTimeDomainPresentStage();
+        }
         timingsInfo.sType = VK_STRUCTURE_TYPE_PRESENT_TIMINGS_INFO_EXT;
         timingsInfo.swapchainCount = 1;
         timingsInfo.pTimingInfos = &timingInfo;

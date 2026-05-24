@@ -12,6 +12,7 @@
 
 #include <QRegion>
 #include <QSize>
+#include <chrono>
 #include <memory>
 #include <vector>
 #include <vulkan/vulkan.h>
@@ -149,9 +150,17 @@ public:
      * @param presentId Non-zero tags the present for VK_EXT_present_timing so its
      * real on-screen time can later be retrieved via vkGetPastPresentationTimingEXT.
      * Ignored if 0 or the extension is unsupported.
+     * @param targetTime Phase 5 target presentation timestamp (absolute, in
+     * the chosen time domain — CLOCK_MONOTONIC ns since epoch on the X11
+     * standalone backend). When non-zero AND
+     * VulkanBackend::presentAtAbsoluteTimeRequested() is true, included as
+     * VkPresentTimingInfoEXT.targetTime so the driver can schedule the
+     * present to land at that vblank rather than as soon as possible.
+     * Ignored if zero or the surface does not support absolute target times.
      * @return True if presentation succeeded.
      */
-    bool present(const QRegion &damage = QRegion(), uint64_t presentId = 0);
+    bool present(const QRegion &damage = QRegion(), uint64_t presentId = 0,
+                 std::chrono::nanoseconds targetTime = std::chrono::nanoseconds::zero());
 
     /**
      * @brief Recreate the swapchain (e.g., after resize).

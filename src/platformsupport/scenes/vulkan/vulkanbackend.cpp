@@ -524,6 +524,15 @@ bool VulkanBackend::gpuRenderTimeRequested() const
     return s_enabled && m_supportsGpuTimestamps;
 }
 
+bool VulkanBackend::presentAtAbsoluteTimeRequested() const
+{
+    // Phase 5 target-time hint. Off by default; flipping at runtime is not
+    // supported (the surface-caps result is cached at swapchain init).
+    static const bool s_enabled = qEnvironmentVariableIntValue("KWIN_VULKAN_PRESENT_TARGET") != 0;
+    return s_enabled && m_surfaceSupportsAbsolutePresentTime
+        && presentTimingEnabled() && m_targetTimeDomainPresentStage != 0;
+}
+
 VkQueryPool VulkanBackend::gpuRenderTimePool()
 {
     if (!gpuRenderTimeRequested() || m_device == VK_NULL_HANDLE) {

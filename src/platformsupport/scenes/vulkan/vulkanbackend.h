@@ -246,6 +246,46 @@ public:
     }
 
     /**
+     * @brief Whether the surface advertises support for absolute target
+     * presentation times (VkPresentTimingSurfaceCapabilitiesEXT::
+     * presentAtAbsoluteTimeSupported). Used together with the env gate to
+     * decide whether to fill VkPresentTimingInfoEXT.targetTime in
+     * VulkanSwapchain::present().
+     */
+    bool surfaceSupportsAbsolutePresentTime() const
+    {
+        return m_surfaceSupportsAbsolutePresentTime;
+    }
+    void setSurfaceSupportsAbsolutePresentTime(bool supported)
+    {
+        m_surfaceSupportsAbsolutePresentTime = supported;
+    }
+
+    /**
+     * @brief The stage the targetTime hint refers to
+     * (VkPresentTimingInfoEXT::targetTimeDomainPresentStage). Picked once
+     * at surface-caps detection as the latest stage the surface supports
+     * (visible > out > queue end). Zero when no target stage is available.
+     */
+    VkPresentStageFlagsEXT targetTimeDomainPresentStage() const
+    {
+        return m_targetTimeDomainPresentStage;
+    }
+    void setTargetTimeDomainPresentStage(VkPresentStageFlagsEXT stage)
+    {
+        m_targetTimeDomainPresentStage = stage;
+    }
+
+    /**
+     * @brief Whether the Phase 5 targetTime hint should be filled this run.
+     *
+     * True iff KWIN_VULKAN_PRESENT_TARGET=1 is set AND the surface and
+     * timing path support it. Read by VulkanSwapchain::present() to gate
+     * the VkPresentTimingInfoEXT.targetTime field.
+     */
+    bool presentAtAbsoluteTimeRequested() const;
+
+    /**
      * @brief Nanoseconds per GPU timestamp tick (from VkPhysicalDeviceLimits).
      *
      * Multiply a `vkCmdWriteTimestamp` delta by this to get nanoseconds. Zero
@@ -373,6 +413,13 @@ private:
     // convert ticks to nanoseconds without re-querying limits per frame.
     float m_timestampPeriod = 0.0f;
     bool m_supportsGpuTimestamps = false;
+
+    // Phase 5 absolute-target-time hint support
+    // (VkPresentTimingSurfaceCapabilitiesEXT::presentAtAbsoluteTimeSupported).
+    // Set by the concrete backend's surface-caps detection. The target stage
+    // is the latest stage we'll ask the driver to land at targetTime.
+    bool m_surfaceSupportsAbsolutePresentTime = false;
+    VkPresentStageFlagsEXT m_targetTimeDomainPresentStage = 0;
 
     // Lazy-allocated query pool with 2 * MAX_FRAMES_IN_FLIGHT slots
     // (KWIN_VULKAN_GPU_RENDER_TIME=1). Slots 2*i and 2*i+1 are used for the
