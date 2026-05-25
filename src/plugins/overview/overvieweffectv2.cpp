@@ -486,6 +486,20 @@ void OverviewEffectV2::releaseAllSlots()
     m_fallbackFramebuffers.clear();
     m_atlasFramebuffer.reset();
     m_atlasRenderPass.reset();
+    // Drop the per-context atlas singleton too. V2 is currently the
+    // only consumer, so keeping it across activations would hold
+    // ~85 MB of VRAM (4096² SRGB + 5 mip levels) idle until the
+    // next overview gesture. Reallocating on the next activate costs
+    // a few ms — acceptable for an explicit user action and the
+    // whole point of the C++ rewrite is to hand memory back when
+    // it isn't needed. If a future consumer (switchers, window-
+    // view) starts sharing this atlas, this drop becomes a ref-
+    // counting concern. The atlas destructor queues its image and
+    // views for destruction; VulkanContext drains the queue on the
+    // next frame.
+    if (m_vulkanCtx) {
+        VulkanThumbnailAtlas::dropForContext(m_vulkanCtx);
+    }
     m_atlas = nullptr;
 }
 
