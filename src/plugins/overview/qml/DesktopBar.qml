@@ -112,27 +112,31 @@ Item {
                             id: thumbnailHover
                         }
 
-                        DesktopView {
-                            id: thumbnail
+                        // Rounded corners via a parent Item with clip: true
+                        // (rectangular clip) plus the existing selection-border
+                        // Rectangle below drawing the rounded outline on top.
+                        // Dropping layer.enabled + OpacityMask removes the
+                        // per-tile FBO that was re-rendered every time any
+                        // background window damaged (Konsola's cursor blink
+                        // alone drove 54 FBO re-renders/sec at 22-44 ms each
+                        // — the dominant stutter source during overview).
+                        // Visible compromise: ~corner-radius pixels of un-
+                        // clipped content peek behind the rounded outline,
+                        // mostly covered by the border draw.
+                        Item {
+                            id: thumbnailClip
+                            anchors.fill: parent
+                            clip: true
 
-                            width: targetScreen.geometry.width
-                            height: targetScreen.geometry.height
-                            windowModel: bar.windowModel
-                            desktop: delegate.desktop
-                            scale: bar.desktopHeight / targetScreen.geometry.height
-                            transformOrigin: Item.TopLeft
+                            DesktopView {
+                                id: thumbnail
 
-
-                            layer.textureSize: Qt.size(bar.desktopWidth, bar.desktopHeight)
-                            layer.enabled: true
-                            layer.effect: OpacityMask {
-                                maskSource: Rectangle {
-                                    anchors.centerIn: parent
-                                    width: thumbnail.width
-                                    height: thumbnail.height
-                                    // Using 5% of width since that's constant even under scaling:
-                                    radius: width / 20
-                                }
+                                width: targetScreen.geometry.width
+                                height: targetScreen.geometry.height
+                                windowModel: bar.windowModel
+                                desktop: delegate.desktop
+                                scale: bar.desktopHeight / targetScreen.geometry.height
+                                transformOrigin: Item.TopLeft
                             }
                         }
 
