@@ -15,6 +15,7 @@
 #include "platformsupport/scenes/vulkan/vulkancontext.h"
 #include "platformsupport/scenes/vulkan/vulkanframebuffer.h"
 #include "platformsupport/scenes/vulkan/vulkanrenderpass.h"
+#include "platformsupport/scenes/vulkan/vulkantexture.h"
 #include "platformsupport/scenes/vulkan/vulkanthumbnailatlas.h"
 #include "scene/itemrenderer_vulkan.h"
 #include "scene/workspacescene.h"
@@ -613,6 +614,77 @@ void OverviewEffectV2::renderWindowsToAtlas()
     m_lastAtlasSubmit = m_vulkanCtx->submitSingleTimeCommandsAsync(cmd);
 }
 
+void OverviewEffectV2::drawSceneCaptureBackground(VkCommandBuffer cmd, VulkanTexture *sceneCapture,
+                                                  const QSize &fbSize, VkFormat colorFormat)
+{
+    if (!sceneCapture || !m_vulkanCtx || fbSize.isEmpty()) {
+        return;
+    }
+    // We borrow the atlas's sampler for sceneCapture sampling; if the
+    // atlas isn't initialised (reserveSlots bailed) skip the background
+    // pass — the tile pass will skip too and the user will see whatever
+    // garbage LOAD_OP_DONT_CARE left, but that's better than a crash.
+    if (!m_atlas) {
+        return;
+    }
+    if (!ensureVulkanPipeline(m_vulkanCtx, colorFormat)) {
+        return;
+    }
+
+    auto *backend = m_vulkanCtx->backend();
+    auto pushDescriptor = backend->cmdPushDescriptorSetKHR();
+    if (!pushDescriptor) {
+        return;
+    }
+
+    // Reuse the tile pipeline: same fragment shader does `texture(s, uv) *
+    // opacity`; sampler doesn't care that the bound image has only one
+    // mip level. The scene capture texture is in
+    // SHADER_READ_ONLY_OPTIMAL coming into this pass (the renderer
+    // transitions it before invoking the callback), so a GENERAL
+    // descriptor layout assertion would be wrong here — use the
+    // texture's currentLayout instead.
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_vkPipeline);
+
+    VkDescriptorImageInfo imgInfo{};
+    imgInfo.sampler = m_atlas ? m_atlas->sampler() : VK_NULL_HANDLE;
+    imgInfo.imageView = sceneCapture->imageView();
+    imgInfo.imageLayout = sceneCapture->currentLayout();
+    if (imgInfo.sampler == VK_NULL_HANDLE || imgInfo.imageView == VK_NULL_HANDLE) {
+        return;
+    }
+    VkWriteDescriptorSet write{};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstBinding = 0;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.pImageInfo = &imgInfo;
+    pushDescriptor(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_vkPipelineLayout, 0, 1, &write);
+
+    VkViewport vp{0.0f, 0.0f, float(fbSize.width()), float(fbSize.height()), 0.0f, 1.0f};
+    vkCmdSetViewport(cmd, 0, 1, &vp);
+    VkRect2D scissor{{0, 0}, {uint32_t(fbSize.width()), uint32_t(fbSize.height())}};
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+    // Fullscreen NDC quad, full-texture UVs, fully opaque. The tile
+    // draws on top of this with their own opacity-driven blend; during
+    // slide-in (m_activationFactor → 1) the user sees the scene
+    // gradually obscured by tiles fading in.
+    OverviewQuadPushConstants pc{};
+    pc.quadRectNdc[0] = -1.0f;
+    pc.quadRectNdc[1] = -1.0f;
+    pc.quadRectNdc[2] = 2.0f;
+    pc.quadRectNdc[3] = 2.0f;
+    pc.atlasSlotUv[0] = 0.0f;
+    pc.atlasSlotUv[1] = 0.0f;
+    pc.atlasSlotUv[2] = 1.0f;
+    pc.atlasSlotUv[3] = 1.0f;
+    pc.opacity = 1.0f;
+    vkCmdPushConstants(cmd, m_vkPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
+                       0, sizeof(pc), &pc);
+    vkCmdDraw(cmd, 4, 1, 0, 0);
+}
+
 void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbSize, VkFormat colorFormat)
 {
     if (!m_atlas || m_windowSlots.empty() || !m_vulkanCtx) {
@@ -735,7 +807,7 @@ void OverviewEffectV2::activate()
         // animation-finished handler).
         if (auto *vkRenderer = dynamic_cast<ItemRendererVulkan *>(scene->renderer())) {
             m_postPassId = vkRenderer->registerFullscreenPostPass(
-                [this](VkCommandBuffer cmd, VulkanTexture * /*sceneCapture*/,
+                [this](VkCommandBuffer cmd, VulkanTexture *sceneCapture,
                        const RenderTarget &target, const RenderViewport & /*viewport*/) {
                 auto *vkTarget = target.vulkanTarget();
                 if (!vkTarget) {
@@ -750,6 +822,12 @@ void OverviewEffectV2::activate()
                 VkFormat fmt = m_vulkanCtx
                     ? m_vulkanCtx->backend()->colorFormat()
                     : VK_FORMAT_UNDEFINED;
+                // Background pass first: the post-FX render pass uses
+                // LOAD_OP_DONT_CARE so every pixel outside a tile rect
+                // would be undefined garbage. Sample the scene capture
+                // fullscreen via the same pipeline (texture changes,
+                // shader doesn't).
+                drawSceneCaptureBackground(cmd, sceneCapture, fbSize, fmt);
                 renderTilesPostPass(cmd, fbSize, fmt);
             });
         }

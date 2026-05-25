@@ -32,6 +32,7 @@ class Window;
 class VulkanContext;
 class VulkanFramebuffer;
 class VulkanRenderPass;
+class VulkanTexture;
 #endif
 
 /**
@@ -142,6 +143,15 @@ private:
     /// proper layout (window-from-its-real-position interpolated into
     /// grid by `m_activationFactor`) is a later phase.
     void renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbSize, VkFormat colorFormat);
+
+    /// Background pass: paint the pre-effect scene contents into the
+    /// swapchain as a fullscreen quad. Needed because the post-FX
+    /// render pass uses LOAD_OP_DONT_CARE — without this, every pixel
+    /// outside a tile would be undefined garbage. Reuses the V2 quad
+    /// pipeline; only the bound texture (scene capture vs atlas) and
+    /// push constants differ.
+    void drawSceneCaptureBackground(VkCommandBuffer cmd, VulkanTexture *sceneCapture,
+                                    const QSize &fbSize, VkFormat colorFormat);
 
     VulkanContext *m_vulkanCtx = nullptr;
     VkFormat m_pipelineColorFormat = VK_FORMAT_UNDEFINED;
