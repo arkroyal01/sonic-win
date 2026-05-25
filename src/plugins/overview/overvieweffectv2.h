@@ -188,6 +188,26 @@ private:
     /// the overview), and reset to empty when V2 is torn down.
     QString m_searchText;
 
+#if HAVE_VULKAN
+    /// Cached texture for the on-screen search bar. Re-rendered via
+    /// QPainter → QImage → VulkanTexture::upload only when
+    /// m_searchText changes (compared against m_searchRenderedText).
+    /// Lifetime: created on first non-empty search, destroyed in
+    /// releaseAllSlots so each overview activation starts with a
+    /// fresh allocation. ~96 KB for the 800×40 cache image; the
+    /// per-keystroke QPainter pass is the cheap part. The plan called
+    /// out text rendering as the biggest risk (Qt's font cache might
+    /// leak across activations); confine that risk to this one
+    /// texture rather than letting QPainter run inside the hot loop.
+    std::unique_ptr<VulkanTexture> m_searchTexture;
+    QString m_searchRenderedText;
+    QSize m_searchTextureSize;
+
+    /// (Re)build m_searchTexture from m_searchText. Idempotent: skips
+    /// the QPainter+upload if m_searchRenderedText already matches.
+    void updateSearchTexture();
+#endif
+
     Window *m_dragCandidate = nullptr;
     QPoint m_dragPressGlobal;
     QPoint m_dragCurrentGlobal;

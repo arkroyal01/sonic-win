@@ -29,9 +29,13 @@
 
 #include <QAction>
 #include <QEasingCurve>
+#include <QFont>
+#include <QFontMetrics>
+#include <QImage>
 #include <QKeyEvent>
 #include <QKeySequence>
 #include <QLoggingCategory>
+#include <QPainter>
 
 namespace KWin
 {
@@ -615,6 +619,9 @@ void OverviewEffectV2::releaseAllSlots()
     m_dragActive = false;
     m_dragLastDamage = QRect();
     m_searchText.clear();
+    m_searchRenderedText.clear();
+    m_searchTexture.reset();
+    m_searchTextureSize = QSize();
     m_fallbackFramebuffers.clear();
     m_atlasFramebuffer.reset();
     m_atlasRenderPass.reset();
@@ -924,6 +931,86 @@ void OverviewEffectV2::renderDesktopBar(VkCommandBuffer cmd, const QSize &fbSize
             vkCmdDraw(cmd, 4, 1, 0, 0);
         }
     }
+}
+
+void OverviewEffectV2::updateSearchTexture()
+{
+    if (m_searchText.isEmpty()) {
+        // Empty filter ⇒ no bar to draw. Drop the texture so a fresh
+        // activation doesn't carry stale pixels and so the per-session
+        // VRAM footprint stays at zero when search isn't used.
+        m_searchTexture.reset();
+        m_searchRenderedText.clear();
+        m_searchTextureSize = QSize();
+        return;
+    }
+    if (m_searchText == m_searchRenderedText && m_searchTexture) {
+        return; // cache hit — no re-render needed
+    }
+    if (!m_vulkanCtx) {
+        return;
+    }
+
+    // Fixed-size bar so the texture is allocated once per overview and
+    // reused for every keystroke (the 4096-byte alignment + dedicated-
+    // allocation work makes per-keystroke vmaCreateImage cheap, but a
+    // stable size means VulkanTexture::upload can reuse the existing
+    // image when the dimensions match). 800×40 fits ~30 chars at the
+    // chosen font size; overflowing strings get truncated at draw
+    // time, intentional MVP behaviour.
+    constexpr int kWidth = 800;
+    constexpr int kHeight = 40;
+    const QSize size(kWidth, kHeight);
+
+    QImage img(size, QImage::Format_RGBA8888_Premultiplied);
+    img.fill(Qt::transparent);
+
+    QPainter p(&img);
+    p.setRenderHint(QPainter::Antialiasing);
+    p.setRenderHint(QPainter::TextAntialiasing);
+    // Rounded translucent background, similar contrast to the bar
+    // tiles' solid colour scheme. Premultiplied output so the
+    // existing post-pass blend math (premul ONE / ONE_MINUS_SRC_ALPHA)
+    // composites it correctly on top of the dimmed scene capture.
+    QColor bg(0, 0, 0, 180);
+    p.setBrush(bg);
+    p.setPen(Qt::NoPen);
+    p.drawRoundedRect(img.rect().adjusted(2, 2, -2, -2), 8, 8);
+
+    QFont font = QFont();
+    font.setPointSizeF(14);
+    p.setFont(font);
+    p.setPen(QColor(255, 255, 255, 240));
+
+    const QFontMetrics fm(font);
+    const int textBaseline = (kHeight + fm.ascent() - fm.descent()) / 2;
+    const int textX = 16;
+    // Elide so an overflowing search string still draws inside the bar
+    // without overflowing into the dimmed area outside.
+    const QString display = fm.elidedText(m_searchText, Qt::ElideLeft, kWidth - 2 * textX - 10);
+    p.drawText(textX, textBaseline, display);
+
+    // Caret: thin vertical line at the right edge of the rendered text.
+    const int caretX = textX + fm.horizontalAdvance(display) + 2;
+    if (caretX < kWidth - textX) {
+        p.fillRect(QRect(caretX, 6, 2, kHeight - 12), QColor(255, 255, 255, 220));
+    }
+    p.end();
+
+    // QPainter writes BGRA on little-endian QImage_Format_RGBA8888; the
+    // upload path uploads as RGBA8 SRGB regardless, so call this only
+    // when the user changes the search text — Qt's glyph cache is
+    // shared across the process and the per-keystroke cost is just
+    // QPainter's draw + a memcpy.
+    auto next = VulkanTexture::upload(m_vulkanCtx, img);
+    if (!next) {
+        qCWarning(KWIN_OVERVIEW_V2_LOG)
+            << "OverviewEffectV2: search-bar texture upload failed";
+        return;
+    }
+    m_searchTexture = std::move(next);
+    m_searchRenderedText = m_searchText;
+    m_searchTextureSize = size;
 }
 
 void OverviewEffectV2::renderWindowsToAtlas()
@@ -1477,10 +1564,45 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
         }
     }
 
+    // Search bar — only drawn while a filter is active. Lazily build /
+    // update the texture, then bind its dedicated SRGB view and draw a
+    // single quad centred between the desktop bar and the grid.
+    updateSearchTexture();
+    if (m_searchTexture && m_searchTexture->isValid()) {
+        pushView(m_searchTexture->imageView());
+        // NDC bar geometry. The bar sits in the gap between
+        // kBarTop+kBarHeight (≈ -0.80) and kGridTop (-0.78) — wait,
+        // that gap is tiny. Place the bar a bit further down so it
+        // doesn't overlap the top grid row when the grid has many
+        // tiles. Width = 800/screenW (matches the texture's pixel
+        // size so we sample 1:1 and the text stays crisp).
+        const float texPxW = float(m_searchTextureSize.width());
+        const float texPxH = float(m_searchTextureSize.height());
+        const float ndcW = 2.0f * texPxW / std::max(1.0f, float(fbSize.width()));
+        const float ndcH = 2.0f * texPxH / std::max(1.0f, float(fbSize.height()));
+        const float ndcX = -ndcW * 0.5f;
+        const float ndcY = -0.74f; // just below the bar's bottom edge
+        OverviewQuadPushConstants pc{};
+        pc.quadRectNdc[0] = ndcX;
+        pc.quadRectNdc[1] = ndcY;
+        pc.quadRectNdc[2] = ndcW;
+        pc.quadRectNdc[3] = ndcH;
+        pc.atlasSlotUv[0] = 0.0f;
+        pc.atlasSlotUv[1] = 0.0f;
+        pc.atlasSlotUv[2] = 1.0f;
+        pc.atlasSlotUv[3] = 1.0f;
+        // tintRgba.a = 0 → pure texture sample, no tint mix.
+        pc.opacity = factor;
+        vkCmdPushConstants(cmd, m_vkPipelineLayout,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                           0, sizeof(pc), &pc);
+        vkCmdDraw(cmd, 4, 1, 0, 0);
+    }
+
     // The dragged grid tile, drawn last so it floats above every
-    // other grid tile and the desktop bar — the user always sees what
-    // they're holding, even when the cursor crosses into the bar
-    // zone to drop on a different desktop's tile.
+    // other grid tile, the desktop bar, and the search bar — the user
+    // always sees what they're holding, even when the cursor crosses
+    // into the bar zone to drop on a different desktop's tile.
     if (m_dragActive) {
         for (const TileLayout &t : m_tileLayout) {
             if (t.handle != m_dragCandidate) {
