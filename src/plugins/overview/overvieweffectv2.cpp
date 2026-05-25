@@ -614,6 +614,7 @@ void OverviewEffectV2::releaseAllSlots()
     m_dragCandidate = nullptr;
     m_dragActive = false;
     m_dragLastDamage = QRect();
+    m_searchText.clear();
     m_fallbackFramebuffers.clear();
     m_atlasFramebuffer.reset();
     m_atlasRenderPass.reset();
@@ -659,6 +660,14 @@ void OverviewEffectV2::rebuildTileLayout(const QSize &fbSize)
             continue;
         }
         if (!it->second.hasContent) {
+            continue;
+        }
+        // Search filter: drop windows whose caption doesn't contain
+        // the typed string. Case-insensitive substring match, same
+        // semantics V1's WindowFilterModel uses for its caption
+        // check. Empty m_searchText short-circuits to "match all".
+        if (!m_searchText.isEmpty()
+            && !handle->caption().contains(m_searchText, Qt::CaseInsensitive)) {
             continue;
         }
         drawable.push_back({handle, it->second, 0, 0, 0, 0, 0, 0, 0, 0});
@@ -1502,6 +1511,7 @@ void OverviewEffectV2::activate()
     m_visible = true;
     m_focusZone = FocusZone::None; // first arrow/Tab picks tile 0 in grid
     m_focusedIndex = -1;
+    m_searchText.clear();
     // Mouse interception (bar clicks, tile clicks, click-away
     // dismiss) and keyboard grab (Esc, Tab, arrows, Enter). The
     // earlier conditional-on-empty grab was a workaround for the
@@ -1677,8 +1687,38 @@ void OverviewEffectV2::grabbedKeyboardEvent(QKeyEvent *event)
         return;
     }
     if (event->key() == Qt::Key_Escape) {
+        // Escape with a non-empty search clears the filter rather
+        // than dismissing — matches the convention from most search-
+        // box UIs. A second Escape (now with empty m_searchText)
+        // falls through to deactivate as usual.
+        if (!m_searchText.isEmpty()) {
+            m_searchText.clear();
+            effects->addRepaintFull();
+            return;
+        }
         deactivate();
         return;
+    }
+    // Backspace edits the search filter when one is active. Sits
+    // before the nav handling so the same key doesn't double as
+    // anything else.
+    if (event->key() == Qt::Key_Backspace && !m_searchText.isEmpty()) {
+        m_searchText.chop(1);
+        effects->addRepaintFull();
+        return;
+    }
+    // Printable text (including space) goes into the search filter.
+    // QString::at(0).isPrint() returns false for Tab/Return/control
+    // chars, so navigation keys still fall through. Ctrl-prefixed
+    // input is excluded so e.g. Ctrl+W doesn't get typed.
+    {
+        const QString text = event->text();
+        if (!text.isEmpty() && text.at(0).isPrint()
+            && !(event->modifiers() & (Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier))) {
+            m_searchText.append(text);
+            effects->addRepaintFull();
+            return;
+        }
     }
 #if HAVE_VULKAN
     // Navigation across the grid + bar (V1's "leak" pattern from

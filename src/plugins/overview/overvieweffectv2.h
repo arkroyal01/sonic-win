@@ -180,6 +180,14 @@ private:
     /// follows the cursor instead of sitting in its grid cell, and
     /// a bar-tile hit at MouseButtonRelease commits the move via
     /// effects->windowToDesktops.
+    /// Search-filter text, accumulated from grabbedKeyboardEvent's
+    /// printable-key path. While non-empty, rebuildTileLayout drops
+    /// any window whose caption doesn't contain it (case-insensitive
+    /// substring). Cleared on activate/deactivate, on Escape with a
+    /// non-empty value (Escape with an empty value still dismisses
+    /// the overview), and reset to empty when V2 is torn down.
+    QString m_searchText;
+
     Window *m_dragCandidate = nullptr;
     QPoint m_dragPressGlobal;
     QPoint m_dragCurrentGlobal;
