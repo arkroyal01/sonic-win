@@ -9,6 +9,7 @@ endif()
 set(overview_SOURCES
     main.cpp
     overvieweffect.cpp
+    overvieweffectv2.cpp
 )
 
 kconfig_add_kcfg_files(overview_SOURCES
