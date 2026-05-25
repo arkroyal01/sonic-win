@@ -1102,7 +1102,7 @@ protected:
     EffectsIterator m_currentPaintScreenIterator;
 
 public:
-    // Phase 7 frame-breakdown detail (KWIN_FRAME_BREAKDOWN_DETAIL=1).
+    // Frame-breakdown detail (KWIN_FRAME_BREAKDOWN_DETAIL=1).
     // Filled by the per-effect wrappers in prePaintScreen / paintScreen /
     // postPaintScreen; consumed by WorkspaceScene which forwards to
     // RenderLoop::recordFrameDetail. Order is iterator order

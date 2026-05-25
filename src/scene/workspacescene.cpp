@@ -275,7 +275,7 @@ QRegion WorkspaceScene::prePaint(SceneDelegate *delegate)
     effects->makeOpenGLContextCurrent();
     Q_EMIT preFrameRender();
 
-    // Phase 7 breakdown detail. Bracket the effects chain so the sidecar
+    // Breakdown-detail capture. Bracket the effects chain so the sidecar
     // CSV can split scene-side time (this function's own work plus the
     // post-effects window loop in preparePaint*) from effects-side time
     // (the prePaintScreen chain). The effecthandler clears its prepaint
@@ -417,7 +417,7 @@ void WorkspaceScene::paint(const RenderTarget &renderTarget, const QRegion &regi
     Output *output = kwinApp()->operationMode() == Application::OperationMode::OperationModeX11 ? nullptr : painted_screen;
     RenderViewport viewport(output ? output->geometryF() : workspace()->geometry(), output ? output->scale() : 1, renderTarget);
 
-    // Phase 7 paint-phase detail. Same pattern as prePaint: bracket the
+    // Paint-phase breakdown detail. Same pattern as prePaint: bracket the
     // effects chain, lump everything else (beginFrame, overlay, post-passes,
     // endFrame) into the scene side. paintScreen recurses through finalPaint
     // which actually walks WindowItems, so its inclusive cost includes the

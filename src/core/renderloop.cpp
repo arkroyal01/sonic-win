@@ -80,7 +80,7 @@ static const double s_windowSeconds = envDouble("KWIN_VULKAN_TIGHT_SCHED_WINDOW_
 // outside investigation runs.
 static const bool s_frameBreakdown = qEnvironmentVariableIntValue("KWIN_FRAME_BREAKDOWN") != 0;
 
-// Phase 7 per-effect prepaint/paint breakdown (KWIN_FRAME_BREAKDOWN_DETAIL=1).
+// Per-effect prepaint/paint breakdown (KWIN_FRAME_BREAKDOWN_DETAIL=1).
 // When set, EffectsHandler captures per-effect inclusive timings during the
 // prePaintScreen / paintScreen / postPaintScreen iterator chain;
 // WorkspaceScene calls recordFrameDetail() with the trace + scene-side
@@ -349,7 +349,7 @@ void RenderLoopPrivate::notifyFrameCompleted(std::chrono::nanoseconds timestamp,
                        << "," << timerDelay.count() << "," << dispToComposite.count() << "," << prepaint.count() << "," << beginframe.count() << "," << paint.count() << "," << endframe.count() << "," << postpaint.count() << "," << present.count() << "\n";
     }
 
-    // Phase 7 sidecar: write per-phase detail rows when WorkspaceScene
+    // Breakdown-detail sidecar: write per-phase detail rows when WorkspaceScene
     // recorded a trace this frame and the total crosses the threshold.
     // Each phase has its own file; header is written lazily on the first
     // emitted row. Trace order is *innermost-first* (the wrapper appends

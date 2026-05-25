@@ -90,7 +90,7 @@ public:
     std::array<std::chrono::steady_clock::time_point, 8> m_frameBoundary{};
     std::chrono::steady_clock::time_point m_timerScheduledAt{};
 
-    // Phase 7 per-effect detail (KWIN_FRAME_BREAKDOWN_DETAIL=1). Filled by
+    // Per-effect breakdown detail (KWIN_FRAME_BREAKDOWN_DETAIL=1). Filled by
     // recordFrameDetail() during the corresponding phase; consumed and
     // cleared by notifyFrameCompleted() at sidecar-CSV write time. Sidecar
     // streams are opened lazily on the first row that crosses the
