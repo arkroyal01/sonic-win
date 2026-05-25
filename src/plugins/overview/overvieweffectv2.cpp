@@ -392,6 +392,26 @@ void OverviewEffectV2::reserveSlotsForCurrentDesktop()
             continue;
         }
         m_windowSlots.emplace(handle, std::move(slot));
+        // Drop the slot the moment the window dies so renderWindowsToAtlas
+        // doesn't dereference a stale pointer in handle->visibleGeometry()
+        // / handle->windowItem(). The atlas->release call has to wait on
+        // any in-flight submit; do that lazily on the next render or at
+        // releaseAllSlots time rather than synchronously in the destroyed
+        // signal handler (which can fire mid-frame).
+        connect(handle, &QObject::destroyed, this, [this, handle]() {
+            auto it = m_windowSlots.find(handle);
+            if (it == m_windowSlots.end()) {
+                return;
+            }
+            if (m_vulkanCtx && m_lastAtlasSubmit.isValid()) {
+                m_vulkanCtx->waitForSubmit(m_lastAtlasSubmit);
+                m_lastAtlasSubmit = VulkanSubmitHandle{};
+            }
+            if (m_atlas) {
+                m_atlas->release(it->second);
+            }
+            m_windowSlots.erase(it);
+        });
     }
 }
 
