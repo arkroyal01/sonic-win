@@ -1041,6 +1041,23 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
     if (m_tileLayout.empty() && m_barTiles.empty()) {
         return;
     }
+    // When activating on an empty desktop, seed focus on the bar so
+    // the user can immediately see what arrow keys will navigate.
+    // With grid tiles available, leave focus unset and let the first
+    // Tab/arrow pick — avoids a visible highlight the moment overview
+    // opens. Auto-pick the current desktop's bar tile so Enter is a
+    // no-op on first activation (rather than switching elsewhere).
+    if (m_focusZone == FocusZone::None && m_tileLayout.empty()
+        && !m_barTiles.empty()) {
+        m_focusZone = FocusZone::Bar;
+        m_focusedIndex = 0;
+        for (size_t i = 0; i < m_barTiles.size(); ++i) {
+            if (m_barTiles[i].isCurrent) {
+                m_focusedIndex = int(i);
+                break;
+            }
+        }
+    }
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_vkPipeline);
     VkViewport vp{0.0f, 0.0f, float(fbSize.width()), float(fbSize.height()), 0.0f, 1.0f};
@@ -1199,29 +1216,16 @@ void OverviewEffectV2::activate()
     m_visible = true;
     m_focusZone = FocusZone::None; // first arrow/Tab picks tile 0 in grid
     m_focusedIndex = -1;
-    // Mouse interception is always on (bar clicks, tile clicks,
-    // click-away dismiss). Keyboard grab is conditional — see below.
+    // Mouse interception (bar clicks, tile clicks, click-away
+    // dismiss) and keyboard grab (Esc, Tab, arrows, Enter). The
+    // earlier conditional-on-empty grab was a workaround for the
+    // bar-click shortcut break — that root cause is now handled by
+    // teardownImmediate(), and skipping the grab here broke the
+    // arrow-leak nav into the bar on empty desktops. Grab always.
     effects->startMouseInterception(this, Qt::ArrowCursor);
+    m_grabbedKeyboard = effects->grabKeyboard(this);
 #if HAVE_VULKAN
     reserveSlotsForCurrentDesktop();
-#endif
-    // Skip the keyboard grab on empty desktops. EffectsHandler::
-    // ungrabKeyboard runs input()->keyboard()->update(), which on an
-    // empty desktop has nowhere to return focus to and silently
-    // breaks KGlobalAccel's Super+W routing for the rest of the
-    // session (until some other path — e.g. the VD plasmoid —
-    // re-arms the focus chain). On empty desktops the user can still
-    // click bar tiles via the mouse intercept, and Super+W keeps
-    // working as a global toggle because we never grab it away.
-    m_grabbedKeyboard = false;
-#if HAVE_VULKAN
-    if (!m_windowSlots.empty()) {
-        m_grabbedKeyboard = effects->grabKeyboard(this);
-    }
-#else
-    m_grabbedKeyboard = effects->grabKeyboard(this);
-#endif
-#if HAVE_VULKAN
     // Subscribe to preFrameRender so the atlas re-renders per frame
     // (per-window dirty tracking is a later optimisation). Bail out
     // gracefully if scene access fails — Phase 2c will gate behaviour
