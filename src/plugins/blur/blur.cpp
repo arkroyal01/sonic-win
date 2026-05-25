@@ -1782,20 +1782,34 @@ void BlurEffect::blurVulkan(const RenderTarget &renderTarget, const RenderViewpo
                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT);
     }
 
-    // Composite blurred tex[0] onto the swapchain through constant-alpha blending,
-    // so the blur fades smoothly with the window during slidingpopups/fadingpopups
-    // animations instead of snapping in/out at full intensity.
+    // Open a single LOAD_OP_LOAD render pass on the full swapchain. The blur
+    // composite draws into it, this window's content draws on top via
+    // effects->drawWindow(), and the next windows in stacking order continue
+    // into the same pass. Keeping everything in one pass guarantees the
+    // composite cannot reorder with subsequent draws — the previous split
+    // (separate composite + resume passes) let the GPU race composite color
+    // writes against later window draws, which made the blur visibly land on
+    // top of overlapping windows. (backgroundcontrast uses the same single-
+    // pass pattern.)
     {
-        const float alpha = static_cast<float>(opacity * opacity);
-
         VkRenderPassBeginInfo rpBegin{};
         rpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-        rpBegin.renderPass = m_vulkanCompositePass;
+        rpBegin.renderPass = m_vulkanResumePass;
         rpBegin.framebuffer = fb->framebuffer();
-        rpBegin.renderArea.offset = {deviceRect.x(), deviceRect.y()};
-        rpBegin.renderArea.extent = {static_cast<uint32_t>(deviceRect.width()),
-                                     static_cast<uint32_t>(deviceRect.height())};
+        rpBegin.renderArea.offset = {0, 0};
+        rpBegin.renderArea.extent = {static_cast<uint32_t>(fb->width()),
+                                     static_cast<uint32_t>(fb->height())};
         vkCmdBeginRenderPass(cmd, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
+    }
+
+    // Composite blurred tex[0] through constant-alpha blending so the blur
+    // fades smoothly with the window during slidingpopups/fadingpopups
+    // animations instead of snapping in/out at full intensity. The composite
+    // pipeline was created against m_vulkanCompositePass, which is render-pass
+    // compatible with m_vulkanResumePass (same attachment format and sample
+    // count), so it is valid to bind here per Vulkan §8.2.
+    {
+        const float alpha = static_cast<float>(opacity * opacity);
 
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_vulkanCompositePipeline);
         bindSrc(vkData.textures[0].get());
@@ -1821,13 +1835,13 @@ void BlurEffect::blurVulkan(const RenderTarget &renderTarget, const RenderViewpo
         vkCmdSetBlendConstants(cmd, blendConstants);
 
         vkCmdDraw(cmd, 3, 1, 0, 0);
-
-        vkCmdEndRenderPass(cmd);
     }
 
-    // Restore full-screen viewport/scissor — our Kawase passes set these to the intermediate
-    // texture sizes and dynamic state persists across render passes in the command buffer.
-    // The main renderer set the viewport in beginFrame() and expects it to remain unchanged.
+    // Restore full-screen viewport/scissor — the Kawase passes set these to
+    // the intermediate texture sizes, and the composite scoped them to
+    // deviceRect. Dynamic state persists in the command buffer, and the main
+    // renderer expects full-FB viewport/scissor for the window draws that
+    // follow inside this same render pass.
     {
         VkViewport fullVp{};
         fullVp.x = 0.0f;
@@ -1841,15 +1855,6 @@ void BlurEffect::blurVulkan(const RenderTarget &renderTarget, const RenderViewpo
         vkCmdSetViewport(cmd, 0, 1, &fullVp);
         vkCmdSetScissor(cmd, 0, 1, &fullSc);
     }
-
-    // Resume rendering with LOAD_OP_LOAD so subsequent drawWindow() renders on top of the blur
-    VkRenderPassBeginInfo rpBegin{};
-    rpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    rpBegin.renderPass = m_vulkanResumePass;
-    rpBegin.framebuffer = fb->framebuffer();
-    rpBegin.renderArea.offset = {0, 0};
-    rpBegin.renderArea.extent = {static_cast<uint32_t>(fb->width()), static_cast<uint32_t>(fb->height())};
-    vkCmdBeginRenderPass(cmd, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
 }
 
 #endif // HAVE_VULKAN
