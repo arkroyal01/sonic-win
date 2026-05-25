@@ -1842,6 +1842,47 @@ void OverviewEffectV2::grabbedKeyboardEvent(QKeyEvent *event)
             return;
         }
     }
+    // Default Plasma desktop-switch shortcuts. KGlobalAccel can't fire
+    // its registered actions while we hold the keyboard grab, so we
+    // recognise the well-known bindings locally and call
+    // setCurrentDesktop through the bar-click teardown path (it
+    // synchronises with the slide-out + VD OSD the same way). Only
+    // the defaults are matched — Ctrl+F1..F12 for absolute desktop
+    // selection, Ctrl+Alt+Left/Right for relative. Custom user
+    // bindings aren't covered; that would need a per-frame walk of
+    // KGlobalAccel's registry, which the public API doesn't expose.
+    if (effects) {
+        const Qt::KeyboardModifiers mods = event->modifiers();
+        const auto desktops = effects->desktops();
+        VirtualDesktop *target = nullptr;
+        if (mods == Qt::ControlModifier
+            && event->key() >= Qt::Key_F1 && event->key() <= Qt::Key_F12) {
+            const int idx = event->key() - Qt::Key_F1;
+            if (idx >= 0 && idx < desktops.size()) {
+                target = desktops.at(idx);
+            }
+        } else if (mods == (Qt::ControlModifier | Qt::AltModifier)
+                   && desktops.size() > 1) {
+            VirtualDesktop *current = effects->currentDesktop();
+            const int currentIdx = current ? desktops.indexOf(current) : -1;
+            if (currentIdx >= 0) {
+                const int n = desktops.size();
+                if (event->key() == Qt::Key_Left) {
+                    target = desktops.at((currentIdx - 1 + n) % n);
+                } else if (event->key() == Qt::Key_Right) {
+                    target = desktops.at((currentIdx + 1) % n);
+                }
+            }
+        }
+        if (target) {
+            VirtualDesktop *current = effects->currentDesktop();
+            teardownImmediate();
+            if (target != current) {
+                effects->setCurrentDesktop(target);
+            }
+            return;
+        }
+    }
 #if HAVE_VULKAN
     // Navigation across the grid + bar (V1's "leak" pattern from
     // qml/main.qml:201-240). Up at the top grid row jumps focus into
