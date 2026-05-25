@@ -1101,8 +1101,31 @@ void OverviewEffectV2::postPaintScreen()
 
 void OverviewEffectV2::grabbedKeyboardEvent(QKeyEvent *event)
 {
-    if (event->type() == QEvent::KeyPress && event->key() == Qt::Key_Escape) {
+    if (event->type() != QEvent::KeyPress) {
+        return;
+    }
+    if (event->key() == Qt::Key_Escape) {
         deactivate();
+        return;
+    }
+    // The compositor's keyboard grab swallows key presses before
+    // KGlobalAccel can match them, so the user's configured toggle
+    // (default Super+W) would otherwise never fire while the overview
+    // is up. Match it here and dismiss explicitly. Modifier-only
+    // presses (Super alone, etc.) carry the modifier in key() too —
+    // skip them so we only react on the full combination.
+    if (!m_toggleAction || event->key() == Qt::Key_Meta
+        || event->key() == Qt::Key_Control || event->key() == Qt::Key_Alt
+        || event->key() == Qt::Key_Shift) {
+        return;
+    }
+    const QKeySequence pressed(event->modifiers() | event->key());
+    const auto shortcuts = KGlobalAccel::self()->shortcut(m_toggleAction);
+    for (const QKeySequence &s : shortcuts) {
+        if (s == pressed) {
+            deactivate();
+            return;
+        }
     }
 }
 
