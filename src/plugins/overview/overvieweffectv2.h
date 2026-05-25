@@ -16,6 +16,7 @@
 #include <unordered_map>
 
 #if HAVE_VULKAN
+#include "platformsupport/scenes/vulkan/vulkancontext.h" // for VulkanSubmitHandle
 #include "platformsupport/scenes/vulkan/vulkanthumbnailatlas.h"
 #include <vulkan/vulkan.h>
 #endif
@@ -153,6 +154,12 @@ private:
     /// the Vulkan resources on deactivation.
     std::unique_ptr<VulkanRenderPass> m_atlasRenderPass;
     std::unique_ptr<VulkanFramebuffer> m_atlasFramebuffer;
+
+    /// Tracks the previous per-frame atlas submit. Waited on before
+    /// recording the next frame so the shared streaming vertex buffer's
+    /// reused region is GPU-finished, matching the WindowThumbnailSource
+    /// pattern. Invalidated after the wait.
+    VulkanSubmitHandle m_lastAtlasSubmit;
 
     /// Connection to `WorkspaceScene::preFrameRender`. Active only
     /// while the effect is animating in or fully shown; disconnected at

@@ -397,6 +397,14 @@ void OverviewEffectV2::reserveSlotsForCurrentDesktop()
 
 void OverviewEffectV2::releaseAllSlots()
 {
+    // Wait on any in-flight atlas submit so the GPU is done reading
+    // from the slot's vertex-buffer region and writing into its image
+    // before we hand the slot back to the atlas's free list (which
+    // might immediately give the rect to a fresh consumer).
+    if (m_vulkanCtx && m_lastAtlasSubmit.isValid()) {
+        m_vulkanCtx->waitForSubmit(m_lastAtlasSubmit);
+        m_lastAtlasSubmit = VulkanSubmitHandle{};
+    }
     if (m_atlas) {
         for (auto &[handle, slot] : m_windowSlots) {
             m_atlas->release(slot);
@@ -410,13 +418,159 @@ void OverviewEffectV2::releaseAllSlots()
 
 void OverviewEffectV2::renderWindowsToAtlas()
 {
-    // Phase 2b stub: the framework is in place — `m_windowSlots`
-    // holds a slot per active window, the atlas singleton is bound,
-    // and this slot is connected to WorkspaceScene::preFrameRender
-    // for every frame while the effect is animating or shown. The
-    // actual ItemRendererVulkan::renderItem call + mip-cascade
-    // submission lands in phase 2c, after the slot lifecycle is
-    // shaken out under real activations.
+    if (m_windowSlots.empty() || !m_atlas || !m_vulkanCtx) {
+        return;
+    }
+
+    auto *scene = Compositor::self()->scene();
+    if (!scene) {
+        return;
+    }
+    auto *vkRenderer = dynamic_cast<ItemRendererVulkan *>(scene->renderer());
+    if (!vkRenderer) {
+        return;
+    }
+
+    // Lazy-build the shared atlas render pass + framebuffer. Both wrap
+    // the atlas's mip-0 view at the full 4096² extent; per-slot
+    // viewport + scissor restricts each renderItem call to the slot's
+    // sub-rect. The atlas image is the same singleton across activations,
+    // so these survive across the slot release/reserve cycle as long as
+    // the VulkanContext doesn't change. Atlas overflow → per-source
+    // dedicated image (fallback) is deferred to phase 2d.
+    constexpr VkFormat kAtlasFormat = VK_FORMAT_R8G8B8A8_SRGB;
+    if (!m_atlasRenderPass) {
+        m_atlasRenderPass = VulkanRenderPass::createForAtlasWrite(m_vulkanCtx, kAtlasFormat);
+        if (!m_atlasRenderPass) {
+            qCWarning(KWIN_VULKAN) << "OverviewEffectV2: createForAtlasWrite failed";
+            return;
+        }
+    }
+
+    // Find one atlas-resident slot to learn the shared image+view (any
+    // such slot points at the same atlas resources). Fallback-only
+    // captures are skipped this commit.
+    VkImage atlasImage = VK_NULL_HANDLE;
+    VkImageView atlasMipZero = VK_NULL_HANDLE;
+    for (const auto &[_handle, slot] : m_windowSlots) {
+        if (!slot.isFallback) {
+            atlasImage = slot.image;
+            atlasMipZero = slot.mipZeroView;
+            break;
+        }
+    }
+    if (atlasImage == VK_NULL_HANDLE) {
+        return; // only fallback slots — phase 2d
+    }
+    if (!m_atlasFramebuffer) {
+        m_atlasFramebuffer = VulkanFramebuffer::create(m_vulkanCtx, m_atlasRenderPass.get(),
+                                                       atlasMipZero,
+                                                       QSize(VulkanThumbnailAtlas::kAtlasSize,
+                                                             VulkanThumbnailAtlas::kAtlasSize));
+        if (!m_atlasFramebuffer) {
+            qCWarning(KWIN_VULKAN) << "OverviewEffectV2: framebuffer wrap failed";
+            return;
+        }
+        m_atlasFramebuffer->setColorImage(atlasImage);
+    }
+
+    // Wait on the previous frame's atlas submit before recording the
+    // next one — same reason as WindowThumbnailSource::updateVulkan:
+    // renderItem advances the renderer's shared streaming vertex
+    // buffer; the save/restore around the call reuses the same region,
+    // so the GPU must be done with our previous use of it. In steady
+    // state the fence is already signalled and waitForSubmit is a
+    // no-op.
+    if (m_lastAtlasSubmit.isValid()) {
+        m_vulkanCtx->waitForSubmit(m_lastAtlasSubmit);
+        m_lastAtlasSubmit = VulkanSubmitHandle{};
+    }
+
+    VkCommandBuffer cmd = m_vulkanCtx->beginSingleTimeCommands();
+    if (cmd == VK_NULL_HANDLE) {
+        return;
+    }
+
+    // Phase 1: pre-pass access barriers (one per slot, all on mip 0).
+    // Atlas stays in GENERAL throughout (see createForAtlasWrite); these
+    // are memory barriers, not layout transitions.
+    for (auto &[_handle, slot] : m_windowSlots) {
+        if (slot.isFallback) {
+            continue;
+        }
+        m_atlas->prepareForRenderTo(cmd, slot);
+    }
+
+    // Phase 2: single render pass covering all atlas slot writes. Each
+    // slot's renderItem call sets a fresh viewport + scissor, so the
+    // GPU only touches that slot's sub-rect.
+    VkClearValue clearVal{};
+    const VkRect2D fullArea{
+        {0, 0},
+        {uint32_t(VulkanThumbnailAtlas::kAtlasSize), uint32_t(VulkanThumbnailAtlas::kAtlasSize)},
+    };
+    m_atlasRenderPass->begin(cmd, m_atlasFramebuffer->framebuffer(), fullArea, &clearVal, 1);
+
+    auto vkRT = std::make_unique<VulkanRenderTarget>(m_atlasFramebuffer.get());
+    vkRT->setCommandBuffer(cmd);
+    RenderTarget atlasTarget(vkRT.get());
+
+    for (auto &[handle, slot] : m_windowSlots) {
+        if (slot.isFallback || !handle) {
+            continue;
+        }
+        const QRectF windowGeom = handle->visibleGeometry();
+        if (windowGeom.isEmpty()) {
+            continue;
+        }
+
+        // Y-flipped viewport matches the main render path (and
+        // WindowThumbnailSource's existing GL path) so the resulting
+        // mip-0 layout reads top-down.
+        VkViewport vp{};
+        vp.x = float(slot.rect.x());
+        vp.y = float(slot.rect.y() + slot.rect.height());
+        vp.width = float(slot.rect.width());
+        vp.height = -float(slot.rect.height());
+        vp.minDepth = 0.0f;
+        vp.maxDepth = 1.0f;
+        vkCmdSetViewport(cmd, 0, 1, &vp);
+
+        VkRect2D scissor{
+            {int32_t(slot.rect.x()), int32_t(slot.rect.y())},
+            {uint32_t(slot.rect.width()), uint32_t(slot.rect.height())},
+        };
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+        RenderViewport viewport(windowGeom, 1.0, atlasTarget);
+        const size_t savedOffset = vkRenderer->vertexBufferOffset();
+        vkRenderer->renderItem(atlasTarget, viewport, handle->windowItem(),
+                               Scene::PAINT_WINDOW_TRANSFORMED, infiniteRegion(),
+                               WindowPaintData{});
+        vkRenderer->setVertexBufferOffset(savedOffset);
+
+        slot.hasContent = true;
+    }
+
+    m_atlasRenderPass->end(cmd);
+
+    // Phase 3: mip cascade per slot + the publishing barrier that lets
+    // Qt's later submit sample these slots through the fragment shader.
+    for (auto &[_handle, slot] : m_windowSlots) {
+        if (slot.isFallback) {
+            continue;
+        }
+        m_atlas->generateMipsAndPublish(cmd, slot);
+    }
+
+    // Async submit: a fence-scoped wait at the point of need is the
+    // existing pattern. We don't waitForSubmit here — the next render
+    // frame's prologue will wait via `m_lastAtlasSubmit`, and the main
+    // compositor's submit on the same queue picks up the atlas writes
+    // via the publishing barrier's same-queue ordering. Hot-path TODO
+    // for a later commit: batch into the main compositor cmd buffer to
+    // avoid this extra submit per frame.
+    m_lastAtlasSubmit = m_vulkanCtx->submitSingleTimeCommandsAsync(cmd);
 }
 #endif // HAVE_VULKAN
 
