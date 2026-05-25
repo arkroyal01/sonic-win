@@ -1405,22 +1405,34 @@ void OverviewEffectV2::grabbedKeyboardEvent(QKeyEvent *event)
     const int gridCols = gridN > 0 ? std::max(1, int(std::ceil(std::sqrt(double(gridN))))) : 1;
     const int key = event->key();
     if (gridN > 0 || barN > 0) {
+        auto repaint = [&]() {
+            effects->addRepaintFull();
+        };
         // Pick a sensible default zone on the first navigation press —
-        // grid if there's anything there, otherwise the bar.
-        auto seedFocus = [&]() {
+        // grid if there's anything there, otherwise the bar. Returns
+        // true if seedFocus actually moved focus from None to a real
+        // zone, so callers can short-circuit: the first nav press
+        // should land on the seeded tile (visible highlight) and stop
+        // — a *second* press is what actually navigates. Without this,
+        // a single-tile grid would absorb both presses silently before
+        // the user saw any feedback.
+        auto seedFocus = [&]() -> bool {
             if (m_focusZone != FocusZone::None) {
-                return;
+                return false;
             }
             if (gridN > 0) {
                 m_focusZone = FocusZone::Grid;
                 m_focusedIndex = 0;
-            } else if (barN > 0) {
+                repaint();
+                return true;
+            }
+            if (barN > 0) {
                 m_focusZone = FocusZone::Bar;
                 m_focusedIndex = 0;
+                repaint();
+                return true;
             }
-        };
-        auto repaint = [&]() {
-            effects->addRepaintFull();
+            return false;
         };
 
         if (key == Qt::Key_Return || key == Qt::Key_Enter) {
@@ -1454,7 +1466,9 @@ void OverviewEffectV2::grabbedKeyboardEvent(QKeyEvent *event)
         const bool shiftTab = (key == Qt::Key_Backtab)
             || (key == Qt::Key_Tab && (event->modifiers() & Qt::ShiftModifier));
         if (key == Qt::Key_Tab && !shiftTab) {
-            seedFocus();
+            if (seedFocus()) {
+                return;
+            }
             const int n = (m_focusZone == FocusZone::Bar) ? barN : gridN;
             if (n > 0) {
                 m_focusedIndex = (m_focusedIndex + 1) % n;
@@ -1463,7 +1477,9 @@ void OverviewEffectV2::grabbedKeyboardEvent(QKeyEvent *event)
             return;
         }
         if (shiftTab) {
-            seedFocus();
+            if (seedFocus()) {
+                return;
+            }
             const int n = (m_focusZone == FocusZone::Bar) ? barN : gridN;
             if (n > 0) {
                 m_focusedIndex = (m_focusedIndex <= 0) ? (n - 1) : (m_focusedIndex - 1);
@@ -1473,7 +1489,9 @@ void OverviewEffectV2::grabbedKeyboardEvent(QKeyEvent *event)
         }
 
         if (key == Qt::Key_Right) {
-            seedFocus();
+            if (seedFocus()) {
+                return;
+            }
             const int n = (m_focusZone == FocusZone::Bar) ? barN : gridN;
             if (n > 0 && m_focusedIndex + 1 < n) {
                 m_focusedIndex++;
@@ -1482,7 +1500,9 @@ void OverviewEffectV2::grabbedKeyboardEvent(QKeyEvent *event)
             return;
         }
         if (key == Qt::Key_Left) {
-            seedFocus();
+            if (seedFocus()) {
+                return;
+            }
             if (m_focusedIndex > 0) {
                 m_focusedIndex--;
                 repaint();
@@ -1504,7 +1524,9 @@ void OverviewEffectV2::grabbedKeyboardEvent(QKeyEvent *event)
                 }
                 return;
             }
-            seedFocus();
+            if (seedFocus()) {
+                return;
+            }
             if (m_focusZone == FocusZone::Grid && gridN > 0) {
                 const int candidate = m_focusedIndex + gridCols;
                 if (candidate < gridN) {
@@ -1527,7 +1549,9 @@ void OverviewEffectV2::grabbedKeyboardEvent(QKeyEvent *event)
                 }
                 return;
             }
-            seedFocus();
+            if (seedFocus()) {
+                return;
+            }
             if (m_focusZone == FocusZone::Grid && m_focusedIndex >= gridCols) {
                 m_focusedIndex -= gridCols;
                 repaint();
