@@ -484,6 +484,14 @@ void OverviewEffectV2::reserveSlotsForCurrentDesktop()
                 m_atlas->release(it->second);
             }
             m_fallbackFramebuffers.erase(handle);
+            // Clear the drag candidate if it was this window —
+            // m_dragCandidate is a bare Window* and would dangle
+            // through the next mouse release if the dragged window
+            // dies mid-drag.
+            if (m_dragCandidate == handle) {
+                m_dragCandidate = nullptr;
+                m_dragActive = false;
+            }
             // No unrefOffscreenRendering here — the window is being
             // destroyed; KWin tears down its own ref tracking.
             m_windowSlots.erase(it);
@@ -563,6 +571,12 @@ void OverviewEffectV2::reserveBarSnapshots()
                 m_atlas->release(it->second);
             }
             m_fallbackFramebuffers.erase(handle);
+            // Same dangling-pointer fix as in reserveSlotsForCurrentDesktop
+            // — clear the drag candidate if the dragged window dies.
+            if (m_dragCandidate == handle) {
+                m_dragCandidate = nullptr;
+                m_dragActive = false;
+            }
             m_barSnapshotSlots.erase(it);
         });
     }
@@ -1836,11 +1850,16 @@ void OverviewEffectV2::windowInputMouseEvent(QEvent *event)
     if (!mouseEvent) {
         return;
     }
-    // Hold off interaction until the slide-in animation has
+    // Hold off press/move until the slide-in animation has
     // substantially settled — otherwise hit-tests miss against tiles
     // still animating from their real positions. 0.95 is a comfortable
     // threshold; the user can't perceive the last 5% of the OutCubic.
-    if (m_activationFactor < 0.95) {
+    //
+    // Release is always processed: if V2 starts deactivating mid-drag
+    // (some external trigger forces it), we still need to clean up
+    // m_dragCandidate / m_dragActive so the next activation doesn't
+    // inherit stale state.
+    if (event->type() != QEvent::MouseButtonRelease && m_activationFactor < 0.95) {
         return;
     }
 
