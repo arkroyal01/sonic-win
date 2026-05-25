@@ -130,6 +130,18 @@ private:
     /// tracker (MouseMove) and the release path (creates a new
     /// virtual desktop and switches to it).
     bool hitTestAddTile(const QPoint &globalPos) const;
+
+    /// Hit-test against the per-bar-tile "×" delete affordance.
+    /// Returns the index into m_barTiles of the tile whose delete
+    /// button is under the cursor, or -1 if none. Returns -1 when
+    /// there's only one desktop (can't delete the last one).
+    int hitTestDeleteAffordance(const QPoint &globalPos) const;
+
+    /// NDC rect of the delete affordance for a bar tile whose
+    /// own NDC rect is (ndcX, ndcY, ndcW, ndcH). Shared by the
+    /// hit-test and the render path so the visual "×" and the
+    /// click target stay in lock-step.
+    QRectF deleteAffordanceNdc(float ndcX, float ndcY, float ndcW, float ndcH) const;
 #endif
 
     /// Screen rect of the dragged tile for a given cursor position.

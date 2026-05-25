@@ -1057,6 +1057,33 @@ void OverviewEffectV2::ensureBarIconTextures()
                 << "OverviewEffectV2: add-icon upload failed";
         }
     }
+    if (!m_deleteIconTexture) {
+        const int sidePx = 64;
+        QImage img(sidePx, sidePx, QImage::Format_RGBA8888_Premultiplied);
+        img.fill(Qt::transparent);
+        QPainter p(&img);
+        p.setRenderHint(QPainter::Antialiasing);
+        // Translucent dark disc with a white "×". Disc draws first,
+        // strokes on top — gives the affordance an obvious target on
+        // any bar-tile colour underneath.
+        p.setPen(Qt::NoPen);
+        p.setBrush(QColor(0, 0, 0, 180));
+        p.drawEllipse(QRectF(0, 0, sidePx, sidePx));
+        QPen pen(QColor(255, 255, 255, 240));
+        pen.setWidthF(sidePx * 0.10f);
+        pen.setCapStyle(Qt::RoundCap);
+        p.setPen(pen);
+        const float half = sidePx * 0.5f;
+        const float arm = sidePx * 0.22f;
+        p.drawLine(QPointF(half - arm, half - arm), QPointF(half + arm, half + arm));
+        p.drawLine(QPointF(half - arm, half + arm), QPointF(half + arm, half - arm));
+        p.end();
+        m_deleteIconTexture = VulkanTexture::upload(m_vulkanCtx, img);
+        if (!m_deleteIconTexture) {
+            qCWarning(KWIN_OVERVIEW_V2_LOG)
+                << "OverviewEffectV2: delete-icon upload failed";
+        }
+    }
 }
 
 void OverviewEffectV2::updateSearchTexture()
@@ -1706,6 +1733,35 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
                     }
                 }
             }
+        }
+    }
+
+    // Per-tile "×" delete affordance overlay. Only drawn for the
+    // bar tile (or affordance) currently hovered, and only when
+    // there's more than one desktop (the last one can't be removed).
+    // Uses its own image view; the icon texture is shared with the
+    // Add-VD pass via ensureBarIconTextures (called below).
+    if (m_deleteAffordanceHover >= 0 && m_deleteAffordanceHover < int(m_barTiles.size())
+        && m_barTiles.size() > 1) {
+        ensureBarIconTextures();
+        if (m_deleteIconTexture && m_deleteIconTexture->isValid()) {
+            const BarTile &b = m_barTiles[m_deleteAffordanceHover];
+            const QRectF aff = deleteAffordanceNdc(b.ndcX, b.ndcY, b.ndcW, b.ndcH);
+            pushView(m_deleteIconTexture->imageView());
+            OverviewQuadPushConstants pc{};
+            pc.quadRectNdc[0] = float(aff.x());
+            pc.quadRectNdc[1] = float(aff.y());
+            pc.quadRectNdc[2] = float(aff.width());
+            pc.quadRectNdc[3] = float(aff.height());
+            pc.atlasSlotUv[0] = 0.0f;
+            pc.atlasSlotUv[1] = 0.0f;
+            pc.atlasSlotUv[2] = 1.0f;
+            pc.atlasSlotUv[3] = 1.0f;
+            pc.opacity = factor;
+            vkCmdPushConstants(cmd, m_vkPipelineLayout,
+                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                               0, sizeof(pc), &pc);
+            vkCmdDraw(cmd, 4, 1, 0, 0);
         }
     }
 
@@ -2373,12 +2429,33 @@ void OverviewEffectV2::windowInputMouseEvent(QEvent *event)
         m_dragCurrentGlobal = pos;
         m_mouseGlobal = pos;
 #if HAVE_VULKAN
-        // Hover state for the Add-VD tile. Only repaint when the
-        // hover bit actually changes — most pointer movement doesn't
-        // cross the tile boundary, so the strip stays quiet.
+        // Hover state for the bar's hover-revealed affordances:
+        // (a) Add-VD "+" tile brightens on hover.
+        // (b) Each bar tile's "×" delete affordance is revealed
+        //     when the cursor is anywhere inside that tile (so the
+        //     small target doesn't require pixel-precise targeting
+        //     to discover) or directly on the affordance.
+        // Only repaint when at least one bit actually changes — most
+        // pointer movement doesn't cross any of these boundaries.
         const bool addHoverNow = hitTestAddTile(pos);
-        if (addHoverNow != m_addTileHover) {
+        VirtualDesktop *barUnder = hitTestBar(pos);
+        int deleteHoverNow = -1;
+        if (m_barTiles.size() > 1) {
+            // Prefer direct affordance hit first; otherwise reveal
+            // on whichever bar tile the cursor sits in.
+            deleteHoverNow = hitTestDeleteAffordance(pos);
+            if (deleteHoverNow < 0 && barUnder) {
+                for (size_t i = 0; i < m_barTiles.size(); ++i) {
+                    if (m_barTiles[i].desktop == barUnder) {
+                        deleteHoverNow = int(i);
+                        break;
+                    }
+                }
+            }
+        }
+        if (addHoverNow != m_addTileHover || deleteHoverNow != m_deleteAffordanceHover) {
             m_addTileHover = addHoverNow;
+            m_deleteAffordanceHover = deleteHoverNow;
             if (effects) {
                 const QRect screen = effects->virtualScreenGeometry();
                 if (!screen.isEmpty()) {
@@ -2441,8 +2518,9 @@ void OverviewEffectV2::windowInputMouseEvent(QEvent *event)
         // Match the bar hit-test that the existing release path uses
         // and treat the bar press as a no-op so the release switches
         // the desktop. Same for the Add-VD tile — release creates the
-        // new desktop; press is a no-op.
-        if (hitTestBar(pos) || hitTestAddTile(pos)) {
+        // new desktop; press is a no-op. Same again for the per-tile
+        // "×" affordance — release removes the desktop.
+        if (hitTestBar(pos) || hitTestAddTile(pos) || hitTestDeleteAffordance(pos) >= 0) {
             return;
         }
 #endif
@@ -2505,6 +2583,30 @@ void OverviewEffectV2::windowInputMouseEvent(QEvent *event)
         // Not a drag — fall through to the click logic. Bar hit-test
         // first (smaller targets sit over the top of the screen).
 #if HAVE_VULKAN
+        if (const int deleteIdx = hitTestDeleteAffordance(pos); deleteIdx >= 0) {
+            // Remove the desktop, keep V2 open so the user can see the
+            // bar shrink. VirtualDesktopManager handles re-homing
+            // windows that were on the removed desktop. Repaint the
+            // bar strip so the layout change is visible immediately.
+            auto *vdm = VirtualDesktopManager::self();
+            if (vdm && deleteIdx < int(m_barTiles.size())) {
+                VirtualDesktop *target = m_barTiles[deleteIdx].desktop;
+                if (target) {
+                    vdm->removeVirtualDesktop(target);
+                    // Layout depends on desktop count; force a rebuild
+                    // before the next post-pass so the bar reflows.
+                    m_deleteAffordanceHover = -1;
+                    if (effects) {
+                        const QRect screen = effects->virtualScreenGeometry();
+                        if (!screen.isEmpty()) {
+                            rebuildBarLayout(screen.size());
+                            effects->addRepaint(screen);
+                        }
+                    }
+                }
+            }
+            return;
+        }
         if (hitTestAddTile(pos)) {
             // Create a new desktop and switch to it. Position past the
             // last existing desktop so it appears at the end of the
@@ -2547,6 +2649,48 @@ void OverviewEffectV2::windowInputMouseEvent(QEvent *event)
 }
 
 #if HAVE_VULKAN
+QRectF OverviewEffectV2::deleteAffordanceNdc(float ndcX, float ndcY, float ndcW, float ndcH) const
+{
+    // Top-right corner of the bar tile, scaled to kDeleteAffordanceFrac
+    // of the tile's height. The "×" texture is square so width == height
+    // even though NDC X and Y have different pixel scales — the texture
+    // itself is rendered to look correct on either basis, and the
+    // affordance only needs to be roughly tile-corner-sized rather than
+    // pixel-perfect.
+    const float side = ndcH * kDeleteAffordanceFrac;
+    const float pad = ndcH * 0.06f; // small inset from corner
+    return QRectF(ndcX + ndcW - side - pad, ndcY + pad, side, side);
+}
+
+int OverviewEffectV2::hitTestDeleteAffordance(const QPoint &globalPos) const
+{
+    if (m_barTiles.empty() || !effects) {
+        return -1;
+    }
+    // No delete affordance when there's only one desktop — can't
+    // remove the last one. Matches V1's behaviour.
+    if (m_barTiles.size() <= 1) {
+        return -1;
+    }
+    const QRect screen = effects->virtualScreenGeometry();
+    if (screen.isEmpty() || !screen.contains(globalPos)) {
+        return -1;
+    }
+    const float screenW = std::max(1.0f, float(screen.width()));
+    const float screenH = std::max(1.0f, float(screen.height()));
+    const float mxNdc = (float(globalPos.x() - screen.x()) / screenW) * 2.0f - 1.0f;
+    const float myNdc = (float(globalPos.y() - screen.y()) / screenH) * 2.0f - 1.0f;
+    for (size_t i = 0; i < m_barTiles.size(); ++i) {
+        const BarTile &b = m_barTiles[i];
+        const QRectF aff = deleteAffordanceNdc(b.ndcX, b.ndcY, b.ndcW, b.ndcH);
+        if (mxNdc >= aff.x() && mxNdc <= aff.x() + aff.width()
+            && myNdc >= aff.y() && myNdc <= aff.y() + aff.height()) {
+            return int(i);
+        }
+    }
+    return -1;
+}
+
 bool OverviewEffectV2::hitTestAddTile(const QPoint &globalPos) const
 {
     if (m_addTileNdc.isEmpty() || !effects) {
