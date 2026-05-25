@@ -837,10 +837,17 @@ void OverviewEffectV2::drawSceneCaptureBackground(VkCommandBuffer cmd, VulkanTex
     VkRect2D scissor{{0, 0}, {uint32_t(fbSize.width()), uint32_t(fbSize.height())}};
     vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-    // Fullscreen NDC quad, full-texture UVs, fully opaque. The tile
-    // draws on top of this with their own opacity-driven blend; during
-    // slide-in (m_activationFactor → 1) the user sees the scene
-    // gradually obscured by tiles fading in.
+    // Fullscreen NDC quad, full-texture UVs. The captured scene is
+    // dimmed as the activation animation progresses so tiles stand
+    // out against a darkened backdrop — full brightness at factor=0
+    // (matches the moment of activation) and ~30% at factor=1 (the
+    // settled overview state). The letterbox gap around aspect-
+    // preserving tiles reads as a darker background rather than the
+    // live scene bleeding through. Premultiplied output means
+    // multiplying opacity scales rgb and a together.
+    constexpr float kSettledDim = 0.3f;
+    const float factor = float(std::clamp(m_activationFactor, 0.0, 1.0));
+    const float bgOpacity = 1.0f - factor * (1.0f - kSettledDim);
     OverviewQuadPushConstants pc{};
     pc.quadRectNdc[0] = -1.0f;
     pc.quadRectNdc[1] = -1.0f;
@@ -850,7 +857,7 @@ void OverviewEffectV2::drawSceneCaptureBackground(VkCommandBuffer cmd, VulkanTex
     pc.atlasSlotUv[1] = 0.0f;
     pc.atlasSlotUv[2] = 1.0f;
     pc.atlasSlotUv[3] = 1.0f;
-    pc.opacity = 1.0f;
+    pc.opacity = bgOpacity;
     vkCmdPushConstants(cmd, m_vkPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
                        0, sizeof(pc), &pc);
     vkCmdDraw(cmd, 4, 1, 0, 0);
