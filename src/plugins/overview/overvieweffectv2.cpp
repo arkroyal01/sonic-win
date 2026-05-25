@@ -31,6 +31,16 @@
 #include <QEasingCurve>
 #include <QKeyEvent>
 #include <QKeySequence>
+#include <QLoggingCategory>
+
+namespace KWin
+{
+// Local logging category — the kwin lib's KWIN_VULKAN doesn't resolve
+// across the LTO boundary when this static plugin is linked into
+// kwin_x11 (undefined-reference at link time). Define our own; it
+// shows up in QT_LOGGING_RULES as `kwin_overview_v2`.
+Q_LOGGING_CATEGORY(KWIN_OVERVIEW_V2_LOG, "kwin_overview_v2", QtWarningMsg)
+} // namespace KWin
 
 #if HAVE_VULKAN
 
@@ -191,7 +201,7 @@ bool OverviewEffectV2::ensureVulkanPipeline(VulkanContext *ctx, VkFormat colorFo
         if (fragMod) {
             vkDestroyShaderModule(device, fragMod, nullptr);
         }
-        qCWarning(KWIN_VULKAN) << "OverviewEffectV2: shader-module creation failed";
+        qCWarning(KWIN_OVERVIEW_V2_LOG) << "OverviewEffectV2: shader-module creation failed";
         return false;
     }
 
@@ -214,7 +224,7 @@ bool OverviewEffectV2::ensureVulkanPipeline(VulkanContext *ctx, VkFormat colorFo
     if (vkCreateDescriptorSetLayout(device, &dsLayoutInfo, nullptr, &m_vkDescriptorSetLayout) != VK_SUCCESS) {
         vkDestroyShaderModule(device, vertMod, nullptr);
         vkDestroyShaderModule(device, fragMod, nullptr);
-        qCWarning(KWIN_VULKAN) << "OverviewEffectV2: vkCreateDescriptorSetLayout failed";
+        qCWarning(KWIN_OVERVIEW_V2_LOG) << "OverviewEffectV2: vkCreateDescriptorSetLayout failed";
         return false;
     }
 
@@ -237,7 +247,7 @@ bool OverviewEffectV2::ensureVulkanPipeline(VulkanContext *ctx, VkFormat colorFo
         vkDestroyShaderModule(device, fragMod, nullptr);
         vkDestroyDescriptorSetLayout(device, m_vkDescriptorSetLayout, nullptr);
         m_vkDescriptorSetLayout = VK_NULL_HANDLE;
-        qCWarning(KWIN_VULKAN) << "OverviewEffectV2: vkCreatePipelineLayout failed";
+        qCWarning(KWIN_OVERVIEW_V2_LOG) << "OverviewEffectV2: vkCreatePipelineLayout failed";
         return false;
     }
 
@@ -252,7 +262,7 @@ bool OverviewEffectV2::ensureVulkanPipeline(VulkanContext *ctx, VkFormat colorFo
         vkDestroyShaderModule(device, vertMod, nullptr);
         vkDestroyShaderModule(device, fragMod, nullptr);
         destroyVulkanPipeline();
-        qCWarning(KWIN_VULKAN) << "OverviewEffectV2: failed to construct compat render pass";
+        qCWarning(KWIN_OVERVIEW_V2_LOG) << "OverviewEffectV2: failed to construct compat render pass";
         return false;
     }
 
@@ -338,7 +348,7 @@ bool OverviewEffectV2::ensureVulkanPipeline(VulkanContext *ctx, VkFormat colorFo
     vkDestroyShaderModule(device, fragMod, nullptr);
 
     if (!ok) {
-        qCWarning(KWIN_VULKAN) << "OverviewEffectV2: vkCreateGraphicsPipelines failed";
+        qCWarning(KWIN_OVERVIEW_V2_LOG) << "OverviewEffectV2: vkCreateGraphicsPipelines failed";
         destroyVulkanPipeline();
         return false;
     }
@@ -408,8 +418,8 @@ void OverviewEffectV2::reserveSlotsForCurrentDesktop()
         }
         auto slot = m_atlas->reserve(size);
         if (!slot.isValid()) {
-            qCWarning(KWIN_VULKAN) << "OverviewEffectV2: atlas reserve failed for"
-                                   << handle->caption().left(40) << size;
+            qCWarning(KWIN_OVERVIEW_V2_LOG) << "OverviewEffectV2: atlas reserve failed for"
+                                            << handle->caption().left(40) << size;
             continue;
         }
         m_windowSlots.emplace(handle, std::move(slot));
@@ -483,7 +493,7 @@ void OverviewEffectV2::renderWindowsToAtlas()
     if (!m_atlasRenderPass) {
         m_atlasRenderPass = VulkanRenderPass::createForAtlasWrite(m_vulkanCtx, kAtlasFormat);
         if (!m_atlasRenderPass) {
-            qCWarning(KWIN_VULKAN) << "OverviewEffectV2: createForAtlasWrite failed";
+            qCWarning(KWIN_OVERVIEW_V2_LOG) << "OverviewEffectV2: createForAtlasWrite failed";
             return;
         }
     }
@@ -509,7 +519,7 @@ void OverviewEffectV2::renderWindowsToAtlas()
                                                        QSize(VulkanThumbnailAtlas::kAtlasSize,
                                                              VulkanThumbnailAtlas::kAtlasSize));
         if (!m_atlasFramebuffer) {
-            qCWarning(KWIN_VULKAN) << "OverviewEffectV2: framebuffer wrap failed";
+            qCWarning(KWIN_OVERVIEW_V2_LOG) << "OverviewEffectV2: framebuffer wrap failed";
             return;
         }
         m_atlasFramebuffer->setColorImage(atlasImage);
