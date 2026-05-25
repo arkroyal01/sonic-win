@@ -1302,10 +1302,20 @@ void OverviewEffectV2::windowInputMouseEvent(QEvent *event)
             for (const BarTile &b : m_barTiles) {
                 if (mxNdc >= b.ndcX && mxNdc <= b.ndcX + b.ndcW
                     && myNdc >= b.ndcY && myNdc <= b.ndcY + b.ndcH) {
-                    if (b.desktop && b.desktop != effects->currentDesktop()) {
-                        effects->setCurrentDesktop(b.desktop);
-                    }
+                    // Release the keyboard grab *before* switching
+                    // desktops. setCurrentDesktop on an active grab
+                    // leaves KGlobalAccel's Super+W registration in a
+                    // dead state on the new desktop — the next
+                    // activate/deactivate cycle silently breaks the
+                    // shortcut. Ungrabbing first keeps both desktops'
+                    // shortcut state coherent.
+                    VirtualDesktop *target = (b.desktop && b.desktop != effects->currentDesktop())
+                        ? b.desktop
+                        : nullptr;
                     deactivate();
+                    if (target) {
+                        effects->setCurrentDesktop(target);
+                    }
                     return;
                 }
             }
