@@ -536,12 +536,15 @@ void OverviewEffectV2::rebuildTileLayout(const QSize &fbSize)
     if (n == 0) {
         return;
     }
+    const int cols = std::max(1, int(std::ceil(std::sqrt(double(n)))));
+    const int rows = (n + cols - 1) / cols;
+    const float cellNdcW = 1.6f / cols;
+    const float cellNdcH = 1.6f / rows;
+    constexpr float kTilePad = 0.9f;
+    const float maxNdcW = cellNdcW * kTilePad;
+    const float maxNdcH = cellNdcH * kTilePad;
     const float screenW = std::max(1.0f, float(fbSize.width()));
     const float screenH = std::max(1.0f, float(fbSize.height()));
-
-    // Pre-fill per-tile realNdc and pixel-aspect from current window
-    // geometry. The aspect drives the justified-row layout below.
-    std::vector<float> aspect(n);
     for (int i = 0; i < n; ++i) {
         TileLayout &t = drawable[i];
         const QRectF realGeom = t.handle->visibleGeometry();
@@ -549,94 +552,25 @@ void OverviewEffectV2::rebuildTileLayout(const QSize &fbSize)
         t.realNdcY = (float(realGeom.y()) / screenH) * 2.0f - 1.0f;
         t.realNdcW = (float(realGeom.width()) / screenW) * 2.0f;
         t.realNdcH = (float(realGeom.height()) / screenH) * 2.0f;
-        aspect[i] = float(realGeom.width()) / float(std::max(1.0, realGeom.height()));
-    }
-
-    // Justified-row layout (cf. macOS Mission Control / Google Photos
-    // gallery): each row has a uniform height; tile widths inside the
-    // row vary with each window's pixel aspect; the row's height is
-    // chosen so its tiles' summed widths fill the available grid
-    // width. Result: every tile has roughly the same visible padding
-    // regardless of its source aspect — square windows like glxgears
-    // no longer get pillarboxed inside an oversized cell.
-    //
-    // The uniform-cell grid we had before always gave non-cell-aspect
-    // windows large letterbox gaps; this layout has *no* per-tile
-    // letterbox, just inter-tile gutters.
-    constexpr float kGridFracOfScreen = 0.8f; // matches the prior layout
-    constexpr float kGutterPx = 12.0f; // pixel gap between tiles
-    const float gridPxW = kGridFracOfScreen * screenW;
-    const float gridPxH = kGridFracOfScreen * screenH;
-    const float screenAspect = screenW / screenH;
-
-    // Pick a row count that keeps each row's aspect close to the
-    // screen's. round(sqrt(n / screenAspect)) is the standard heuristic
-    // — it falls back to 1 row for very few tiles and grows roughly
-    // as sqrt(n) for many.
-    const int rowsTarget = std::max(1,
-                                    int(std::round(std::sqrt(double(n) / double(screenAspect)))));
-    const int R = std::min(n, rowsTarget);
-
-    // Distribute tiles across R rows in stacking order. The first
-    // (n % R) rows get an extra tile so the row sizes differ by at
-    // most one — keeps the visual rhythm even when n isn't a multiple
-    // of R.
-    const int basePerRow = n / R;
-    const int extra = n % R;
-    std::vector<int> rowStart(R + 1);
-    for (int r = 0, idx = 0; r < R; ++r) {
-        rowStart[r] = idx;
-        idx += basePerRow + (r < extra ? 1 : 0);
-        rowStart[r + 1] = idx;
-    }
-
-    // Per-row natural height: rowH such that
-    //   sum(aspect[i] * rowH) + (count+1) * gutter == gridPxW.
-    std::vector<float> rowHeightPx(R);
-    float totalH = 0.0f;
-    for (int r = 0; r < R; ++r) {
-        float sumAspect = 0.0f;
-        const int count = rowStart[r + 1] - rowStart[r];
-        for (int i = rowStart[r]; i < rowStart[r + 1]; ++i) {
-            sumAspect += aspect[i];
-        }
-        const float availW = std::max(1.0f, gridPxW - (count + 1) * kGutterPx);
-        rowHeightPx[r] = availW / std::max(0.01f, sumAspect);
-        totalH += rowHeightPx[r];
-    }
-    totalH += (R + 1) * kGutterPx;
-
-    // If the natural total exceeds the grid's vertical budget, shrink
-    // every row uniformly. This is what limits the visible tile size
-    // when the screen is more landscape than the row-pack assumed.
-    const float vScale = std::min(1.0f, gridPxH / std::max(1.0f, totalH));
-    for (float &h : rowHeightPx) {
-        h *= vScale;
-    }
-    const float gutterPx = kGutterPx * vScale;
-    const float scaledTotalH = totalH * vScale;
-
-    // Centre the grid vertically inside its 80% band, then walk rows
-    // top-down placing tiles left-to-right with equal gutters.
-    float cursorY_px = (screenH - scaledTotalH) * 0.5f + gutterPx;
-    for (int r = 0; r < R; ++r) {
-        const int count = rowStart[r + 1] - rowStart[r];
-        const float rowH = rowHeightPx[r];
-        float rowNaturalW = (count + 1) * gutterPx;
-        for (int i = rowStart[r]; i < rowStart[r + 1]; ++i) {
-            rowNaturalW += aspect[i] * rowH;
-        }
-        float cursorX_px = (screenW - rowNaturalW) * 0.5f + gutterPx;
-        for (int i = rowStart[r]; i < rowStart[r + 1]; ++i) {
-            TileLayout &t = drawable[i];
-            const float tileW_px = aspect[i] * rowH;
-            t.gridNdcX = 2.0f * cursorX_px / screenW - 1.0f;
-            t.gridNdcY = 2.0f * cursorY_px / screenH - 1.0f;
-            t.gridNdcW = 2.0f * tileW_px / screenW;
-            t.gridNdcH = 2.0f * rowH / screenH;
-            cursorX_px += tileW_px + gutterPx;
-        }
-        cursorY_px += rowH + gutterPx;
+        // Aspect-preserving fit: realNdcW/realNdcH already encodes the
+        // window's pixel aspect (the X/Y NDC mapping has different
+        // scales — /screenW vs /screenH — so the ratio carries it).
+        // Pick the largest uniform scale that fits the cell, then
+        // centre the tile inside its cell so smaller windows don't
+        // stretch to fill.
+        const float scaleX = maxNdcW / std::max(1e-6f, t.realNdcW);
+        const float scaleY = maxNdcH / std::max(1e-6f, t.realNdcH);
+        const float scale = std::min(scaleX, scaleY);
+        const float tileNdcW = t.realNdcW * scale;
+        const float tileNdcH = t.realNdcH * scale;
+        const int col = i % cols;
+        const int row = i / cols;
+        const float cellOriginX = -0.8f + col * cellNdcW;
+        const float cellOriginY = -0.8f + row * cellNdcH;
+        t.gridNdcX = cellOriginX + (cellNdcW - tileNdcW) * 0.5f;
+        t.gridNdcY = cellOriginY + (cellNdcH - tileNdcH) * 0.5f;
+        t.gridNdcW = tileNdcW;
+        t.gridNdcH = tileNdcH;
     }
     m_tileLayout = std::move(drawable);
 }
