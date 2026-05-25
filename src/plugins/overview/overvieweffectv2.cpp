@@ -598,22 +598,24 @@ void OverviewEffectV2::rebuildBarLayout(const QSize &fbSize)
     VirtualDesktop *current = effects->currentDesktop();
 
     // Bar bounds in NDC. Positive viewport Y in the post-pass → -1 is
-    // the top of the screen. Bar gets a thin band at the top with
-    // small side margins. Keep the y-extent in sync with kGridTop in
+    // the top of the screen. Bar gets a thin band at the top; tile
+    // width is chosen so each tile matches the screen's pixel aspect
+    // (NDC X and Y have different pixel scales, so a screen-aspect
+    // rect has equal NDC width and height). The strip is centred
+    // horizontally. Keep kBarTop+kBarHeight in sync with kGridTop in
     // rebuildTileLayout so grid tiles and bar tiles don't overlap.
     constexpr float kBarTop = -0.96f;
     constexpr float kBarHeight = 0.16f;
-    constexpr float kBarLeft = -0.96f;
-    constexpr float kBarRight = 0.96f;
     constexpr float kGutter = 0.012f;
-    const float totalW = kBarRight - kBarLeft;
-    const float tileW = (totalW - (n - 1) * kGutter) / float(n);
+    const float tileW = kBarHeight; // → screen aspect in pixel space
+    const float stripW = n * tileW + (n - 1) * kGutter;
+    const float stripLeft = -stripW * 0.5f;
 
     m_barTiles.reserve(n);
     for (int i = 0; i < n; ++i) {
         m_barTiles.push_back({
             desktops[i],
-            kBarLeft + i * (tileW + kGutter),
+            stripLeft + i * (tileW + kGutter),
             kBarTop,
             tileW,
             kBarHeight,
