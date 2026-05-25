@@ -82,6 +82,20 @@ public:
     static std::unique_ptr<VulkanRenderPass> createForSwapchainLoad(VulkanContext *context, VkFormat colorFormat);
 
     /**
+     * @brief Render pass for writes into the shared `VulkanThumbnailAtlas`.
+     *
+     * `loadOp = LOAD` preserves the contents of other slots in the same
+     * mip 0 — we only overwrite the active slot's sub-rect via viewport +
+     * scissor. Layouts stay `VK_IMAGE_LAYOUT_GENERAL` throughout: the atlas
+     * holds many concurrent slot states across submits, and Vulkan layout
+     * transitions apply to whole mip levels (not 2D sub-rects), so per-slot
+     * optimal layouts would clobber neighbours. See
+     * `VulkanThumbnailAtlas::prepareForRenderTo` for the matching access
+     * barriers.
+     */
+    static std::unique_ptr<VulkanRenderPass> createForAtlasWrite(VulkanContext *context, VkFormat colorFormat);
+
+    /**
      * @brief Create a render pass with custom configuration.
      */
     static std::unique_ptr<VulkanRenderPass> create(VulkanContext *context, const Config &config);

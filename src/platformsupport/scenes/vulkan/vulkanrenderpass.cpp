@@ -115,6 +115,26 @@ std::unique_ptr<VulkanRenderPass> VulkanRenderPass::createForSwapchainLoad(Vulka
     return create(context, config);
 }
 
+std::unique_ptr<VulkanRenderPass> VulkanRenderPass::createForAtlasWrite(VulkanContext *context, VkFormat colorFormat)
+{
+    Config config;
+    config.colorFormat = colorFormat;
+    // Preserve other slots' contents in the same mip 0 — we only write
+    // into the active slot's sub-rect via viewport + scissor.
+    config.colorLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    config.colorStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
+    // GENERAL throughout: the atlas image hosts many concurrent slots
+    // across submits, and Vulkan layout transitions apply to whole mip
+    // levels, not 2D sub-rects. Per-slot optimal layouts would clobber
+    // neighbours; GENERAL keeps the atlas usable for both read and write
+    // at any time.
+    config.initialLayout = VK_IMAGE_LAYOUT_GENERAL;
+    config.finalLayout = VK_IMAGE_LAYOUT_GENERAL;
+    config.hasDepth = false;
+
+    return create(context, config);
+}
+
 std::unique_ptr<VulkanRenderPass> VulkanRenderPass::create(VulkanContext *context, const Config &config)
 {
     auto renderPass = std::unique_ptr<VulkanRenderPass>(new VulkanRenderPass(context, config));
