@@ -617,13 +617,10 @@ void OverviewEffectV2::renderWindowsToAtlas()
         m_atlasFramebuffer->setColorImage(atlasImage);
     }
 
-    // Wait on the previous frame's atlas submit before recording the
-    // next one — same reason as WindowThumbnailSource::updateVulkan:
-    // renderItem advances the renderer's shared streaming vertex
-    // buffer; the save/restore around the call reuses the same region,
-    // so the GPU must be done with our previous use of it. In steady
-    // state the fence is already signalled and waitForSubmit is a
-    // no-op.
+    // Wait on the previous overview-frame's atlas submit so the
+    // offscreen streaming buffer region we're about to reuse is
+    // GPU-finished. In steady state this is already signalled and the
+    // call is a no-op.
     if (m_lastAtlasSubmit.isValid()) {
         m_vulkanCtx->waitForSubmit(m_lastAtlasSubmit);
         m_lastAtlasSubmit = VulkanSubmitHandle{};
@@ -634,9 +631,17 @@ void OverviewEffectV2::renderWindowsToAtlas()
         return;
     }
 
-    // Phase 1: pre-pass access barriers (one per slot, all on mip 0).
-    // Atlas stays in GENERAL throughout (see createForAtlasWrite); these
-    // are memory barriers, not layout transitions.
+    // Route renderItem's vertex/uniform writes to the renderer's
+    // offscreen-slot buffers so they don't collide with the in-flight
+    // swapchain frame's streaming buffer (preFrameRender fires before
+    // the swapchain fence is waited on, so the main-frame buffer may
+    // still be in use by the GPU). pop restores the swapchain cursors
+    // when we're done.
+    vkRenderer->pushOffscreenSlot();
+
+    // Pre-pass barriers (one per slot, all on mip 0). The atlas image
+    // stays in GENERAL throughout (see createForAtlasWrite); these are
+    // memory barriers, not layout transitions.
     for (auto &[_handle, slot] : m_windowSlots) {
         if (slot.isFallback) {
             continue;
@@ -644,9 +649,9 @@ void OverviewEffectV2::renderWindowsToAtlas()
         m_atlas->prepareForRenderTo(cmd, slot);
     }
 
-    // Phase 2: single render pass covering all atlas slot writes. Each
-    // slot's renderItem call sets a fresh viewport + scissor, so the
-    // GPU only touches that slot's sub-rect.
+    // Single render pass covering all atlas-slot writes. Each slot's
+    // renderItem sets its own viewport + scissor so the GPU only
+    // touches that slot's sub-rect.
     VkClearValue clearVal{};
     const VkRect2D fullArea{
         {0, 0},
@@ -685,20 +690,23 @@ void OverviewEffectV2::renderWindowsToAtlas()
         };
         vkCmdSetScissor(cmd, 0, 1, &scissor);
 
+        // No vertex-offset save/restore here: the offscreen slot's
+        // cursor is meant to accumulate across these renderItem calls
+        // so each slot's vertices land in a disjoint buffer region.
+        // popOffscreenSlot restores the swapchain frame's cursor at
+        // the end of the function.
         RenderViewport viewport(windowGeom, 1.0, atlasTarget);
-        const size_t savedOffset = vkRenderer->vertexBufferOffset();
         vkRenderer->renderItem(atlasTarget, viewport, handle->windowItem(),
                                Scene::PAINT_WINDOW_TRANSFORMED, infiniteRegion(),
                                WindowPaintData{});
-        vkRenderer->setVertexBufferOffset(savedOffset);
 
         slot.hasContent = true;
     }
 
     m_atlasRenderPass->end(cmd);
 
-    // Phase 3: mip cascade per slot + the publishing barrier that lets
-    // Qt's later submit sample these slots through the fragment shader.
+    // Mip cascade per slot + the publishing barrier that lets the
+    // post-pass sample these slots in the same submit chain.
     for (auto &[_handle, slot] : m_windowSlots) {
         if (slot.isFallback) {
             continue;
@@ -706,13 +714,12 @@ void OverviewEffectV2::renderWindowsToAtlas()
         m_atlas->generateMipsAndPublish(cmd, slot);
     }
 
-    // Async submit: a fence-scoped wait at the point of need is the
-    // existing pattern. We don't waitForSubmit here — the next render
-    // frame's prologue will wait via `m_lastAtlasSubmit`, and the main
-    // compositor's submit on the same queue picks up the atlas writes
-    // via the publishing barrier's same-queue ordering. Hot-path TODO
-    // for a later commit: batch into the main compositor cmd buffer to
-    // avoid this extra submit per frame.
+    vkRenderer->popOffscreenSlot();
+
+    // Async submit; the wait at the top of the next frame's call
+    // synchronises on the offscreen-slot buffer reuse. The main
+    // compositor submit on the same queue picks up the atlas writes
+    // through the publishing barrier's same-queue visibility.
     m_lastAtlasSubmit = m_vulkanCtx->submitSingleTimeCommandsAsync(cmd);
 }
 
