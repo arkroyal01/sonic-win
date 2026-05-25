@@ -1100,6 +1100,39 @@ protected:
     EffectsIterator m_currentDrawWindowIterator;
     EffectsIterator m_currentPaintWindowIterator;
     EffectsIterator m_currentPaintScreenIterator;
+
+public:
+    // Phase 7 frame-breakdown detail (KWIN_FRAME_BREAKDOWN_DETAIL=1).
+    // Filled by the per-effect wrappers in prePaintScreen / paintScreen /
+    // postPaintScreen; consumed by WorkspaceScene which forwards to
+    // RenderLoop::recordFrameDetail. Order is iterator order
+    // (outermost-first); each entry's .second is *inclusive* time
+    // (this effect + all downstream effects). Exclusive times are derived
+    // at write time by differencing consecutive entries. Lives on the
+    // handler (rather than per-call) because the iterator pattern means
+    // wrappers append after the recursive call returns. Pre-reserved to
+    // avoid allocation on the hot path.
+    using DetailTrace = std::vector<std::pair<QByteArray, std::chrono::nanoseconds>>;
+    DetailTrace consumePrepaintTrace()
+    {
+        return std::move(m_prepaintTrace);
+    }
+    DetailTrace consumePaintTrace()
+    {
+        return std::move(m_paintTrace);
+    }
+    void clearPrepaintTrace()
+    {
+        m_prepaintTrace.clear();
+    }
+    void clearPaintTrace()
+    {
+        m_paintTrace.clear();
+    }
+
+private:
+    DetailTrace m_prepaintTrace;
+    DetailTrace m_paintTrace;
     typedef QHash<QByteArray, QList<Effect *>> PropertyEffectMap;
     PropertyEffectMap m_propertiesForEffects;
     QHash<QByteArray, qulonglong> m_managedProperties;

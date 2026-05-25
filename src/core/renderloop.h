@@ -8,7 +8,12 @@
 
 #include "effect/globals.h"
 
+#include <QByteArray>
 #include <QObject>
+
+#include <chrono>
+#include <utility>
+#include <vector>
 
 namespace KWin
 {
@@ -103,6 +108,36 @@ public:
      * breakdown to land in a file.
      */
     void recordFrameBoundary(FrameBoundary which);
+
+    /**
+     * @brief Sub-phase of the prepaint/paint dispatch that the detail
+     * breakdown (KWIN_FRAME_BREAKDOWN_DETAIL=1) decomposes.
+     */
+    enum class FrameDetailPhase {
+        Prepaint, ///< CompositeStart → PrepaintEnd (scene prePaint + effects' prePaintScreen).
+        Paint, ///< BeginFrameEnd → PaintEnd (scene paint + effects' paintScreen).
+    };
+
+    /**
+     * @brief Stash the per-effect trace and scene-side time for the given
+     * phase, to be written to the sidecar detail CSV by
+     * notifyFrameCompleted().
+     *
+     * Called by WorkspaceScene at the end of prePaint / paint. The trace
+     * is in iterator order (outermost-first); exclusive per-effect times
+     * are derived at write time by differencing consecutive inclusive
+     * values. No-op when KWIN_FRAME_BREAKDOWN_DETAIL=0.
+     */
+    void recordFrameDetail(FrameDetailPhase phase,
+                           std::chrono::nanoseconds sceneTime,
+                           const std::vector<std::pair<QByteArray, std::chrono::nanoseconds>> &trace);
+
+    /**
+     * @brief True when the breakdown-detail env var is on, so callers can
+     * skip building a trace when it would be discarded. Cheap (reads a
+     * process-static).
+     */
+    static bool frameBreakdownDetailEnabled();
 
     /**
      * Schedules a compositing cycle at the next available moment.

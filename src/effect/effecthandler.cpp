@@ -17,6 +17,7 @@
 #include "core/inputdevice.h"
 #include "core/output.h"
 #include "core/renderbackend.h"
+#include "core/renderloop.h"
 #include "core/rendertarget.h"
 #include "core/renderviewport.h"
 #include "decorations/decorationbridge.h"
@@ -314,8 +315,17 @@ void EffectsHandler::reconfigure()
 void EffectsHandler::prePaintScreen(ScreenPrePaintData &data, std::chrono::milliseconds presentTime)
 {
     if (m_currentPaintScreenIterator != m_activeEffects.constEnd()) {
-        (*m_currentPaintScreenIterator++)->prePaintScreen(data, presentTime);
-        --m_currentPaintScreenIterator;
+        if (RenderLoop::frameBreakdownDetailEnabled()) {
+            Effect *e = *m_currentPaintScreenIterator++;
+            const auto t0 = std::chrono::steady_clock::now();
+            e->prePaintScreen(data, presentTime);
+            const auto incl = std::chrono::steady_clock::now() - t0;
+            m_prepaintTrace.emplace_back(e->metaObject()->className(), incl);
+            --m_currentPaintScreenIterator;
+        } else {
+            (*m_currentPaintScreenIterator++)->prePaintScreen(data, presentTime);
+            --m_currentPaintScreenIterator;
+        }
     }
     // no special final code
 }
@@ -323,8 +333,17 @@ void EffectsHandler::prePaintScreen(ScreenPrePaintData &data, std::chrono::milli
 void EffectsHandler::paintScreen(const RenderTarget &renderTarget, const RenderViewport &viewport, int mask, const QRegion &region, Output *screen)
 {
     if (m_currentPaintScreenIterator != m_activeEffects.constEnd()) {
-        (*m_currentPaintScreenIterator++)->paintScreen(renderTarget, viewport, mask, region, screen);
-        --m_currentPaintScreenIterator;
+        if (RenderLoop::frameBreakdownDetailEnabled()) {
+            Effect *e = *m_currentPaintScreenIterator++;
+            const auto t0 = std::chrono::steady_clock::now();
+            e->paintScreen(renderTarget, viewport, mask, region, screen);
+            const auto incl = std::chrono::steady_clock::now() - t0;
+            m_paintTrace.emplace_back(e->metaObject()->className(), incl);
+            --m_currentPaintScreenIterator;
+        } else {
+            (*m_currentPaintScreenIterator++)->paintScreen(renderTarget, viewport, mask, region, screen);
+            --m_currentPaintScreenIterator;
+        }
     } else {
         m_scene->finalPaintScreen(renderTarget, viewport, mask, region, screen);
     }
@@ -333,6 +352,10 @@ void EffectsHandler::paintScreen(const RenderTarget &renderTarget, const RenderV
 void EffectsHandler::postPaintScreen()
 {
     if (m_currentPaintScreenIterator != m_activeEffects.constEnd()) {
+        // postPaintScreen costs are not separately bucketed yet — the
+        // captured CSV shows the paint and postpaint columns staying below
+        // a tenth of a millisecond during overview activation, so a
+        // dedicated trace would be noise. Keep the original fast path.
         (*m_currentPaintScreenIterator++)->postPaintScreen();
         --m_currentPaintScreenIterator;
     }

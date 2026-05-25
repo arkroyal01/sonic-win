@@ -90,6 +90,22 @@ public:
     std::array<std::chrono::steady_clock::time_point, 8> m_frameBoundary{};
     std::chrono::steady_clock::time_point m_timerScheduledAt{};
 
+    // Phase 7 per-effect detail (KWIN_FRAME_BREAKDOWN_DETAIL=1). Filled by
+    // recordFrameDetail() during the corresponding phase; consumed and
+    // cleared by notifyFrameCompleted() at sidecar-CSV write time. Sidecar
+    // streams are opened lazily on the first row that crosses the
+    // threshold; header is written on open.
+    using DetailTrace = std::vector<std::pair<QByteArray, std::chrono::nanoseconds>>;
+    DetailTrace m_prepaintTrace;
+    DetailTrace m_paintTrace;
+    std::chrono::nanoseconds m_prepaintSceneNs{0};
+    std::chrono::nanoseconds m_paintSceneNs{0};
+    bool m_prepaintDetailSet = false;
+    bool m_paintDetailSet = false;
+    std::optional<std::fstream> m_prepaintDetailOutput;
+    std::optional<std::fstream> m_paintDetailOutput;
+    uint64_t m_frameSeq = 0;
+
     PresentationMode presentationMode = PresentationMode::VSync;
     int maxPendingFrameCount = 1;
 

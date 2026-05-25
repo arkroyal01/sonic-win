@@ -12,6 +12,7 @@
 #include "window.h"
 #include "workspace.h"
 
+#include <algorithm>
 #include <filesystem>
 
 using namespace std::chrono_literals;
@@ -78,6 +79,25 @@ static const double s_windowSeconds = envDouble("KWIN_VULKAN_TIGHT_SCHED_WINDOW_
 // default — the calls become no-ops so the dispatch path pays no cost
 // outside investigation runs.
 static const bool s_frameBreakdown = qEnvironmentVariableIntValue("KWIN_FRAME_BREAKDOWN") != 0;
+
+// Phase 7 per-effect prepaint/paint breakdown (KWIN_FRAME_BREAKDOWN_DETAIL=1).
+// When set, EffectsHandler captures per-effect inclusive timings during the
+// prePaintScreen / paintScreen / postPaintScreen iterator chain;
+// WorkspaceScene calls recordFrameDetail() with the trace + scene-side
+// total; notifyFrameCompleted() writes a sidecar CSV row (one per phase,
+// only when total exceeds the threshold). Independent from the cheaper
+// KWIN_FRAME_BREAKDOWN so the outer breakdown can stay on without paying
+// the per-effect trace cost.
+static const bool s_frameBreakdownDetail = qEnvironmentVariableIntValue("KWIN_FRAME_BREAKDOWN_DETAIL") != 0;
+
+// Threshold for sidecar emission, in milliseconds. Frames whose total
+// prepaint or paint time falls below this floor are skipped — keeps the
+// sidecar CSVs to spike-only data. Default 1 ms; can be set to 0 to
+// capture every frame.
+static const std::chrono::nanoseconds s_frameBreakdownDetailThreshold =
+    std::chrono::milliseconds(qEnvironmentVariableIsSet("KWIN_FRAME_BREAKDOWN_DETAIL_THRESHOLD_MS")
+                                  ? qEnvironmentVariableIntValue("KWIN_FRAME_BREAKDOWN_DETAIL_THRESHOLD_MS")
+                                  : 1);
 
 RenderLoopPrivate::RenderLoopPrivate(RenderLoop *q, Output *output)
     : q(q)
@@ -329,6 +349,71 @@ void RenderLoopPrivate::notifyFrameCompleted(std::chrono::nanoseconds timestamp,
                        << "," << timerDelay.count() << "," << dispToComposite.count() << "," << prepaint.count() << "," << beginframe.count() << "," << paint.count() << "," << endframe.count() << "," << postpaint.count() << "," << present.count() << "\n";
     }
 
+    // Phase 7 sidecar: write per-phase detail rows when WorkspaceScene
+    // recorded a trace this frame and the total crosses the threshold.
+    // Each phase has its own file; header is written lazily on the first
+    // emitted row. Trace order is *innermost-first* (the wrapper appends
+    // after the recursive call returns, so the deepest effect closes
+    // first). Inclusives increase monotonically: trace[0] is the smallest
+    // (no children), trace[N-1] is the outermost and equals total effects
+    // time. exclusive[i] = trace[i].inclusive - trace[i-1].inclusive
+    // (with sentinel 0 for i=0).
+    if (s_frameBreakdownDetail) {
+        const auto wallNs = std::chrono::steady_clock::now().time_since_epoch();
+        const auto writePhase = [&](const char *phaseName,
+                                    std::optional<std::fstream> &stream,
+                                    DetailTrace &trace,
+                                    std::chrono::nanoseconds sceneNs,
+                                    bool &setFlag) {
+            if (!setFlag) {
+                return;
+            }
+            setFlag = false;
+            const auto effectsTotal = trace.empty() ? std::chrono::nanoseconds::zero() : trace.back().second;
+            const auto totalNs = sceneNs + effectsTotal;
+            if (totalNs < s_frameBreakdownDetailThreshold) {
+                trace.clear();
+                return;
+            }
+            if (!stream) {
+                const std::string suffix = output ? output->name().toStdString() : std::string("(default)");
+                const std::string path = std::string("kwin perf ") + phaseName + " detail " + suffix + ".csv";
+                stream = std::fstream(path, std::ios::out);
+                std::error_code ec;
+                const auto absPath = std::filesystem::absolute(path, ec);
+                qCWarning(KWIN_CORE).noquote()
+                    << "RenderLoop: writing frame-breakdown detail to"
+                    << QString::fromStdString(ec ? path : absPath.string());
+                *stream << "frame_seq,wall_ns,phase,total_ns,scene_ns,details\n";
+            }
+            // Derive exclusive times: trace order is innermost-first, so
+            // each entry's child (if any) is the previous entry. Sort by
+            // exclusive descending so the dominant effect is first.
+            std::vector<std::pair<QByteArray, std::chrono::nanoseconds>> exclusive;
+            exclusive.reserve(trace.size());
+            for (size_t i = 0; i < trace.size(); ++i) {
+                const auto prev = (i == 0) ? std::chrono::nanoseconds::zero() : trace[i - 1].second;
+                exclusive.emplace_back(trace[i].first, trace[i].second - prev);
+            }
+            std::sort(exclusive.begin(), exclusive.end(), [](const auto &a, const auto &b) {
+                return a.second > b.second;
+            });
+            *stream << m_frameSeq << "," << wallNs.count() << "," << phaseName
+                    << "," << totalNs.count() << "," << sceneNs.count() << ",";
+            for (size_t i = 0; i < exclusive.size(); ++i) {
+                if (i > 0) {
+                    *stream << ";";
+                }
+                *stream << exclusive[i].first.constData() << "=" << exclusive[i].second.count();
+            }
+            *stream << "\n";
+            trace.clear();
+        };
+        writePhase("prepaint", m_prepaintDetailOutput, m_prepaintTrace, m_prepaintSceneNs, m_prepaintDetailSet);
+        writePhase("paint", m_paintDetailOutput, m_paintTrace, m_paintSceneNs, m_paintDetailSet);
+        ++m_frameSeq;
+    }
+
     Q_ASSERT(pendingFrameCount > 0);
     pendingFrameCount--;
 
@@ -531,6 +616,32 @@ void RenderLoop::recordFrameBoundary(FrameBoundary which)
         return;
     }
     d->m_frameBoundary[size_t(which)] = std::chrono::steady_clock::now();
+}
+
+bool RenderLoop::frameBreakdownDetailEnabled()
+{
+    return s_frameBreakdownDetail;
+}
+
+void RenderLoop::recordFrameDetail(FrameDetailPhase phase,
+                                   std::chrono::nanoseconds sceneTime,
+                                   const std::vector<std::pair<QByteArray, std::chrono::nanoseconds>> &trace)
+{
+    if (!s_frameBreakdownDetail) {
+        return;
+    }
+    switch (phase) {
+    case FrameDetailPhase::Prepaint:
+        d->m_prepaintTrace = trace;
+        d->m_prepaintSceneNs = sceneTime;
+        d->m_prepaintDetailSet = true;
+        break;
+    case FrameDetailPhase::Paint:
+        d->m_paintTrace = trace;
+        d->m_paintSceneNs = sceneTime;
+        d->m_paintDetailSet = true;
+        break;
+    }
 }
 
 void RenderLoop::setPresentationSafetyMargin(std::chrono::nanoseconds safetyMargin)

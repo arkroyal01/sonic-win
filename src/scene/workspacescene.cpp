@@ -257,7 +257,7 @@ QRegion WorkspaceScene::prePaint(SceneDelegate *delegate)
         painted_screen = painted_delegate->output();
     }
 
-    const RenderLoop *renderLoop = painted_screen->renderLoop();
+    RenderLoop *renderLoop = painted_screen->renderLoop();
     const std::chrono::milliseconds presentTime =
         std::chrono::duration_cast<std::chrono::milliseconds>(renderLoop->nextPresentationTimestamp());
 
@@ -275,15 +275,42 @@ QRegion WorkspaceScene::prePaint(SceneDelegate *delegate)
     effects->makeOpenGLContextCurrent();
     Q_EMIT preFrameRender();
 
+    // Phase 7 breakdown detail. Bracket the effects chain so the sidecar
+    // CSV can split scene-side time (this function's own work plus the
+    // post-effects window loop in preparePaint*) from effects-side time
+    // (the prePaintScreen chain). The effecthandler clears its prepaint
+    // trace before the call so a stale trace from a previous frame can't
+    // bleed in; the wrappers there append per-effect inclusive times
+    // (no-op when KWIN_FRAME_BREAKDOWN_DETAIL=0).
+    const bool detail = RenderLoop::frameBreakdownDetailEnabled();
+    if (detail) {
+        effects->clearPrepaintTrace();
+    }
+    const auto sceneStart = detail ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto effectsStart = detail ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+
     effects->prePaintScreen(prePaintData, m_expectedPresentTimestamp);
     m_paintContext.damage = prePaintData.paint;
     m_paintContext.mask = prePaintData.mask;
     m_paintContext.phase2Data.clear();
 
+    const auto effectsEnd = detail ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+
     if (m_paintContext.mask & (PAINT_SCREEN_TRANSFORMED | PAINT_SCREEN_WITH_TRANSFORMED_WINDOWS)) {
         preparePaintGenericScreen();
     } else {
         preparePaintSimpleScreen();
+    }
+
+    if (detail) {
+        const auto sceneEnd = std::chrono::steady_clock::now();
+        // scene-side = (this entry → effects start) + (effects end → after window loop).
+        // Note prePaintWindow inside preparePaint* recurses through the effects chain too;
+        // that cost is lumped into scene_ns for this pass (window-effect breakdown deferred).
+        const auto sceneNs = (effectsStart - sceneStart) + (sceneEnd - effectsEnd);
+        renderLoop->recordFrameDetail(RenderLoop::FrameDetailPhase::Prepaint,
+                                      std::chrono::duration_cast<std::chrono::nanoseconds>(sceneNs),
+                                      effects->consumePrepaintTrace());
     }
 
     return m_paintContext.damage.translated(-delegate->viewport().topLeft());
@@ -390,9 +417,23 @@ void WorkspaceScene::paint(const RenderTarget &renderTarget, const QRegion &regi
     Output *output = kwinApp()->operationMode() == Application::OperationMode::OperationModeX11 ? nullptr : painted_screen;
     RenderViewport viewport(output ? output->geometryF() : workspace()->geometry(), output ? output->scale() : 1, renderTarget);
 
+    // Phase 7 paint-phase detail. Same pattern as prePaint: bracket the
+    // effects chain, lump everything else (beginFrame, overlay, post-passes,
+    // endFrame) into the scene side. paintScreen recurses through finalPaint
+    // which actually walks WindowItems, so its inclusive cost includes the
+    // per-window draws — that's the right place to spot a heavy effect
+    // overriding paintScreen.
+    const bool detail = RenderLoop::frameBreakdownDetailEnabled();
+    if (detail) {
+        effects->clearPaintTrace();
+    }
+    const auto sceneStart = detail ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+
     m_renderer->beginFrame(renderTarget, viewport, region);
 
+    const auto effectsStart = detail ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     effects->paintScreen(renderTarget, viewport, m_paintContext.mask, region, painted_screen);
+    const auto effectsEnd = detail ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     m_paintScreenCount = 0;
 
     if (m_overlayItem) {
@@ -410,6 +451,15 @@ void WorkspaceScene::paint(const RenderTarget &renderTarget, const QRegion &regi
 
     Q_EMIT frameRendered();
     m_renderer->endFrame();
+
+    if (detail && painted_screen) {
+        const auto sceneEnd = std::chrono::steady_clock::now();
+        const auto sceneNs = (effectsStart - sceneStart) + (sceneEnd - effectsEnd);
+        painted_screen->renderLoop()->recordFrameDetail(
+            RenderLoop::FrameDetailPhase::Paint,
+            std::chrono::duration_cast<std::chrono::nanoseconds>(sceneNs),
+            effects->consumePaintTrace());
+    }
 }
 
 // the function that'll be eventually called by paintScreen() above
