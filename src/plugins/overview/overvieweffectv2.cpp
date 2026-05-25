@@ -1561,6 +1561,25 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
                 const BarTile &b = m_barTiles[m_focusedIndex];
                 pushFocusWash(b.ndcX, b.ndcY, b.ndcW, b.ndcH);
             }
+            // Drop-target wash: while a drag is active, brighten the
+            // bar tile the cursor is currently hovering over so the
+            // user gets visible "I will drop here" feedback. Uses the
+            // same wash as keyboard focus — both indicate "Enter or
+            // release lands here" semantically. Skip if the cursor's
+            // over the current desktop's tile (drop there is a no-op
+            // per the release handler).
+            if (m_dragActive) {
+                if (VirtualDesktop *under = hitTestBar(m_dragCurrentGlobal)) {
+                    if (under != effects->currentDesktop()) {
+                        for (const BarTile &b : m_barTiles) {
+                            if (b.desktop == under) {
+                                pushFocusWash(b.ndcX, b.ndcY, b.ndcW, b.ndcH);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -2111,15 +2130,29 @@ void OverviewEffectV2::windowInputMouseEvent(QEvent *event)
         }
         if (m_dragActive) {
             // Damage = where the tile *was* last frame ∪ where it is
-            // *this* frame. Outside that region the partial-repaint
-            // backend preserves the previous frame, so we don't waste
-            // a fullscreen recomposite on a cursor wiggle.
-            // kwin's compositor coalesces multiple addRepaint calls
-            // within a frame and caps presents at vblank, so no extra
-            // throttling needed here.
+            // *this* frame, plus the desktop-bar strip so the drop-
+            // target wash can appear/disappear on bar tiles as the
+            // cursor crosses them. Outside that region the partial-
+            // repaint backend preserves the previous frame, so we
+            // don't waste a fullscreen recomposite on a cursor
+            // wiggle. kwin's compositor coalesces multiple addRepaint
+            // calls within a frame and caps presents at vblank, so no
+            // extra throttling needed here.
             const QRect newRect = draggedTileScreenRect(pos);
-            if (newRect.isValid() || m_dragLastDamage.isValid()) {
-                effects->addRepaint(QRegion(m_dragLastDamage).united(QRegion(newRect)));
+            QRegion damage = QRegion(m_dragLastDamage).united(QRegion(newRect));
+            // Bar strip (kBarTop=-0.96, kBarHeight=0.16 in NDC → top
+            // ~9% of the screen). Cheap addition; covers any bar tile
+            // the cursor enters or leaves between frames.
+            if (effects) {
+                const QRect screen = effects->virtualScreenGeometry();
+                if (!screen.isEmpty()) {
+                    const int barTopPx = screen.y() + int(0.02 * screen.height());
+                    const int barHeightPx = int(0.16 * screen.height()) + kDragDamagePadPx * 2;
+                    damage += QRect(screen.x(), barTopPx, screen.width(), barHeightPx);
+                }
+            }
+            if (!damage.isEmpty()) {
+                effects->addRepaint(damage);
                 m_dragLastDamage = newRect;
             }
             Q_UNUSED(prev);
