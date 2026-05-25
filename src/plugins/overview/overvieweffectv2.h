@@ -135,6 +135,14 @@ private:
     /// call lands in phase 2c.
     void renderWindowsToAtlas();
 
+    /// Body of the fullscreen-post-pass callback registered on
+    /// activate. Records into Qt-free Vulkan: bind the V2 pipeline,
+    /// push the atlas as descriptor, loop over slots and draw one
+    /// textured quad per window. Position is a simple grid for now;
+    /// proper layout (window-from-its-real-position interpolated into
+    /// grid by `m_activationFactor`) is a later phase.
+    void renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbSize, VkFormat colorFormat);
+
     VulkanContext *m_vulkanCtx = nullptr;
     VkFormat m_pipelineColorFormat = VK_FORMAT_UNDEFINED;
     VkDescriptorSetLayout m_vkDescriptorSetLayout = VK_NULL_HANDLE;
@@ -160,6 +168,12 @@ private:
     /// reused region is GPU-finished, matching the WindowThumbnailSource
     /// pattern. Invalidated after the wait.
     VulkanSubmitHandle m_lastAtlasSubmit;
+
+    /// ID returned by `ItemRendererVulkan::registerFullscreenPostPass`.
+    /// `-1` means no callback registered. Registered at activate time,
+    /// unregistered when the slide-out animation reaches zero (so the
+    /// slide-out still draws the fading tiles).
+    int m_postPassId = -1;
 
     /// Connection to `WorkspaceScene::preFrameRender`. Active only
     /// while the effect is animating in or fully shown; disconnected at

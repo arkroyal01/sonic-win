@@ -93,6 +93,18 @@ OverviewEffectV2::OverviewEffectV2()
         if (qFuzzyCompare(m_activationFactor, 0.0)) {
             m_visible = false;
 #if HAVE_VULKAN
+            // Stop drawing tiles, then release atlas slots. Order
+            // matters: as long as the post-pass is registered, the
+            // renderer will try to sample from the atlas slots, so
+            // unregister BEFORE the slots get released.
+            if (m_postPassId != -1) {
+                if (auto *scene = Compositor::self()->scene()) {
+                    if (auto *vk = dynamic_cast<ItemRendererVulkan *>(scene->renderer())) {
+                        vk->unregisterFullscreenPostPass(m_postPassId);
+                    }
+                }
+                m_postPassId = -1;
+            }
             releaseAllSlots();
 #endif
             effects->addRepaintFull();
@@ -126,6 +138,14 @@ OverviewEffectV2::~OverviewEffectV2()
     }
 #if HAVE_VULKAN
     QObject::disconnect(m_preFrameConnection);
+    if (m_postPassId != -1) {
+        if (auto *scene = Compositor::self()->scene()) {
+            if (auto *vk = dynamic_cast<ItemRendererVulkan *>(scene->renderer())) {
+                vk->unregisterFullscreenPostPass(m_postPassId);
+            }
+        }
+        m_postPassId = -1;
+    }
     releaseAllSlots();
     destroyVulkanPipeline();
 #endif
@@ -592,6 +612,105 @@ void OverviewEffectV2::renderWindowsToAtlas()
     // avoid this extra submit per frame.
     m_lastAtlasSubmit = m_vulkanCtx->submitSingleTimeCommandsAsync(cmd);
 }
+
+void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbSize, VkFormat colorFormat)
+{
+    if (!m_atlas || m_windowSlots.empty() || !m_vulkanCtx) {
+        return;
+    }
+    if (!ensureVulkanPipeline(m_vulkanCtx, colorFormat)) {
+        return;
+    }
+
+    // Pick the atlas's SRGB view from any atlas-resident slot — they
+    // all share the singleton atlas image. Skip if only fallback
+    // slots are reserved (phase 2d doesn't sample fallbacks yet).
+    VkImageView atlasSrgbView = VK_NULL_HANDLE;
+    for (const auto &[_handle, slot] : m_windowSlots) {
+        if (!slot.isFallback && slot.hasContent) {
+            atlasSrgbView = slot.srgbView;
+            break;
+        }
+    }
+    if (atlasSrgbView == VK_NULL_HANDLE) {
+        return;
+    }
+
+    auto *backend = m_vulkanCtx->backend();
+    auto pushDescriptor = backend->cmdPushDescriptorSetKHR();
+    if (!pushDescriptor) {
+        // Pipeline was created with the push-descriptor flag in
+        // ensureVulkanPipeline; on hardware without the extension that
+        // flag would have failed earlier. Guard here for safety.
+        return;
+    }
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_vkPipeline);
+
+    VkDescriptorImageInfo imgInfo{};
+    imgInfo.sampler = m_atlas->sampler();
+    imgInfo.imageView = atlasSrgbView;
+    imgInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    VkWriteDescriptorSet write{};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstBinding = 0;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.pImageInfo = &imgInfo;
+    pushDescriptor(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_vkPipelineLayout, 0, 1, &write);
+
+    VkViewport vp{0.0f, 0.0f, float(fbSize.width()), float(fbSize.height()), 0.0f, 1.0f};
+    vkCmdSetViewport(cmd, 0, 1, &vp);
+    VkRect2D scissor{{0, 0}, {uint32_t(fbSize.width()), uint32_t(fbSize.height())}};
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+    // Simple square grid layout for phase 2d. Real layout — windows
+    // animating from their on-screen position into the grid based on
+    // m_activationFactor — is a later phase. The grid occupies 80% of
+    // the screen centred, leaving 10% margin all around.
+    int drawable = 0;
+    for (const auto &[_handle, slot] : m_windowSlots) {
+        if (!slot.isFallback && slot.hasContent) {
+            ++drawable;
+        }
+    }
+    if (drawable == 0) {
+        return;
+    }
+    const int cols = std::max(1, int(std::ceil(std::sqrt(double(drawable)))));
+    const int rows = (drawable + cols - 1) / cols;
+    const float cellW = 1.6f / cols;
+    const float cellH = 1.6f / rows;
+    constexpr float kTilePad = 0.9f;
+    const float atlasSize = float(VulkanThumbnailAtlas::kAtlasSize);
+
+    int idx = 0;
+    for (const auto &[handle, slot] : m_windowSlots) {
+        if (slot.isFallback || !slot.hasContent) {
+            continue;
+        }
+        const int col = idx % cols;
+        const int row = idx / cols;
+        const float x0 = -0.8f + col * cellW;
+        const float y0 = -0.8f + row * cellH;
+
+        OverviewQuadPushConstants pc{};
+        pc.quadRectNdc[0] = x0;
+        pc.quadRectNdc[1] = y0;
+        pc.quadRectNdc[2] = cellW * kTilePad;
+        pc.quadRectNdc[3] = cellH * kTilePad;
+        pc.atlasSlotUv[0] = float(slot.rect.x()) / atlasSize;
+        pc.atlasSlotUv[1] = float(slot.rect.y()) / atlasSize;
+        pc.atlasSlotUv[2] = float(slot.rect.width()) / atlasSize;
+        pc.atlasSlotUv[3] = float(slot.rect.height()) / atlasSize;
+        pc.opacity = float(m_activationFactor);
+
+        vkCmdPushConstants(cmd, m_vkPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
+                           0, sizeof(pc), &pc);
+        vkCmdDraw(cmd, 4, 1, 0, 0);
+        ++idx;
+    }
+}
 #endif // HAVE_VULKAN
 
 void OverviewEffectV2::activate()
@@ -609,6 +728,31 @@ void OverviewEffectV2::activate()
     if (auto *scene = Compositor::self()->scene()) {
         m_preFrameConnection = connect(scene, &WorkspaceScene::preFrameRender,
                                        this, &OverviewEffectV2::renderWindowsToAtlas);
+        // Register the fullscreen post-pass that actually draws the
+        // window tiles on top of the rendered scene. Lifetime extends
+        // through the slide-out animation so fading tiles stay visible
+        // until activationFactor reaches zero (unregistered in the
+        // animation-finished handler).
+        if (auto *vkRenderer = dynamic_cast<ItemRendererVulkan *>(scene->renderer())) {
+            m_postPassId = vkRenderer->registerFullscreenPostPass(
+                [this](VkCommandBuffer cmd, VulkanTexture * /*sceneCapture*/,
+                       const RenderTarget &target, const RenderViewport & /*viewport*/) {
+                auto *vkTarget = target.vulkanTarget();
+                if (!vkTarget) {
+                    return;
+                }
+                const QSize fbSize = target.size();
+                // Pull the swapchain colour format from the bound
+                // framebuffer so the pipeline cache key in
+                // ensureVulkanPipeline matches the active render
+                // pass — Vulkan only requires format + sample-count
+                // for pipeline / render-pass compatibility.
+                VkFormat fmt = m_vulkanCtx
+                    ? m_vulkanCtx->backend()->colorFormat()
+                    : VK_FORMAT_UNDEFINED;
+                renderTilesPostPass(cmd, fbSize, fmt);
+            });
+        }
     }
 #endif
     m_animation.stop();
