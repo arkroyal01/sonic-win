@@ -8,11 +8,30 @@
 
 #include "effect/effecthandler.h"
 
+#include <KGlobalAccel>
+#include <KLocalizedString>
+
+#include <QAction>
 #include <QEasingCurve>
 #include <QKeyEvent>
+#include <QKeySequence>
 
 namespace KWin
 {
+
+bool OverviewEffectV2::supported()
+{
+    // Gate strictly on the env var so the existing OverviewEffect stays
+    // the default. When the user opts in, this V2 effect takes over the
+    // same shortcut and OverviewEffect::supported() refuses to load.
+    if (qEnvironmentVariableIntValue("KWIN_OVERVIEW_V2") == 0) {
+        return false;
+    }
+    // Compositor check matches the existing plugin's predicate; V2 will
+    // later require Vulkan specifically once the renderer integration
+    // lands, but the skeleton works either way.
+    return effects && (effects->isOpenGLCompositing() || effects->isVulkanCompositing());
+}
 
 OverviewEffectV2::OverviewEffectV2()
 {
@@ -31,10 +50,32 @@ OverviewEffectV2::OverviewEffectV2()
             effects->addRepaintFull();
         }
     });
+
+    // Register the same `Overview` action name as the existing
+    // OverviewEffect — the user's saved keyboard binding carries over.
+    // mutual exclusion at supported() level guarantees only one plugin
+    // is loaded at a time, so there's no double-registration race.
+    m_toggleAction = new QAction(this);
+    m_toggleAction->setObjectName(QStringLiteral("Overview"));
+    m_toggleAction->setText(i18nc("@action Overview is the name of a Kwin effect", "Toggle Overview"));
+    m_toggleAction->setAutoRepeat(false);
+    const QKeySequence defaultShortcut = Qt::META | Qt::Key_W;
+    KGlobalAccel::self()->setDefaultShortcut(m_toggleAction, {defaultShortcut});
+    KGlobalAccel::self()->setShortcut(m_toggleAction, {defaultShortcut});
+    connect(m_toggleAction, &QAction::triggered, this, [this]() {
+        if (m_visible) {
+            deactivate();
+        } else {
+            activate();
+        }
+    });
 }
 
 OverviewEffectV2::~OverviewEffectV2()
 {
+    if (m_toggleAction) {
+        KGlobalAccel::self()->removeAllShortcuts(m_toggleAction);
+    }
 }
 
 void OverviewEffectV2::activate()

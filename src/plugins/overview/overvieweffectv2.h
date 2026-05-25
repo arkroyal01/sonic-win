@@ -10,6 +10,8 @@
 
 #include <QVariantAnimation>
 
+class QAction;
+
 namespace KWin
 {
 
@@ -45,6 +47,14 @@ public:
     OverviewEffectV2();
     ~OverviewEffectV2() override;
 
+    /// Plugin gate: this effect only loads when `KWIN_OVERVIEW_V2=1`.
+    /// The existing OverviewEffect mirrors this check so the two never
+    /// run at the same time and don't fight over the same global
+    /// shortcut. Phase 1b wiring; later phases may also require
+    /// `effects->isVulkanCompositing()` once the renderer path is
+    /// committed to Vulkan-only.
+    static bool supported();
+
     /// Activate the effect: starts the slide-in animation.
     void activate();
     /// Deactivate: animates slide-out then releases per-activation state.
@@ -75,6 +85,11 @@ private:
     /// fully shown, or animating out). Cleared at the end of the
     /// slide-out animation; until then, paintScreen draws.
     bool m_visible = false;
+
+    /// Global toggle shortcut. Same object name as the existing
+    /// OverviewEffect's `Overview` action so the user's saved binding
+    /// (default `Meta+W`) carries over without reconfiguration.
+    QAction *m_toggleAction = nullptr;
 };
 
 } // namespace KWin

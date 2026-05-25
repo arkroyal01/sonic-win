@@ -9,7 +9,6 @@ endif()
 set(overview_SOURCES
     main.cpp
     overvieweffect.cpp
-    overvieweffectv2.cpp
 )
 
 kconfig_add_kcfg_files(overview_SOURCES
@@ -37,3 +36,8 @@ target_link_libraries(overview PRIVATE
 
     Qt::Quick
 )
+
+# C++ overview rewrite, opt-in via KWIN_OVERVIEW_V2=1. Builds a sibling
+# plugin (overviewv2) that takes over the same shortcut when the env var
+# is set. See ./v2/CMakeLists.txt and the volcanic-branch plan.
+add_subdirectory(v2)
