@@ -203,16 +203,16 @@ private:
     void reserveSlotsForCurrentDesktop();
     /// Allocate small static snapshot slots for windows on *other*
     /// desktops so the desktop-bar mini-thumbnails have something to
-    /// sample. Each slot is a fixed small size (kBarSnapshotSize) so
+    /// sample. Each slot is a fixed small size (kBarThumbSize) so
     /// the atlas pressure is bounded even on heavy multi-desktop
     /// setups. EffectWindowVisibleRefs are acquired in
-    /// m_barSnapshotVisRefs to force the WindowItem visible long
+    /// m_barThumbVisRefs to force the WindowItem visible long
     /// enough for renderItem to produce content; they're dropped
     /// immediately after the first frame's snapshot render commits,
     /// so non-current-desktop windows don't stay force-visible (the
     /// "force visible per frame" version of phase 4b held them
     /// visible across activations and bloated VRAM to ~900 MB).
-    void reserveBarSnapshots();
+    void reserveBarThumbs();
     void releaseAllSlots();
 
     /// Hook for `WorkspaceScene::preFrameRender`: re-render each
@@ -252,7 +252,7 @@ private:
     std::unordered_map<Window *, VulkanThumbnailAtlas::Slot> m_windowSlots;
 
     /// Bar mini-thumbnail slots for non-current-desktop windows.
-    /// Small fixed size (kBarSnapshotSize), re-rendered per frame
+    /// Small fixed size (kBarThumbSize), re-rendered per frame
     /// alongside the current-desktop full-size slots so bar tiles
     /// show live window content, not stale snapshots. Released on
     /// deactivate like m_windowSlots. Memory cost of holding all
@@ -260,14 +260,14 @@ private:
     /// suspend hook (a50a7e6d1c + 1d51bf4e61) and the dedicated-
     /// allocation work (39cf11b882 + b8d35e7a0b) once the refs are
     /// dropped at deactivate.
-    std::unordered_map<Window *, VulkanThumbnailAtlas::Slot> m_barSnapshotSlots;
+    std::unordered_map<Window *, VulkanThumbnailAtlas::Slot> m_barThumbSlots;
 
     /// Per-off-desktop-window visibility refs, held for the entire
     /// overview lifetime. Without these, WindowItem::computeVisibility
     /// returns false for off-desktop windows and renderItem writes
     /// nothing into their atlas slot. Released in releaseAllSlots /
     /// the per-window destroy callback.
-    std::vector<EffectWindowVisibleRef> m_barSnapshotVisRefs;
+    std::vector<EffectWindowVisibleRef> m_barThumbVisRefs;
 
     /// Cached tile layout: one entry per drawable tile, in stacking
     /// order at activate-time (oldest below, freshest on top). The

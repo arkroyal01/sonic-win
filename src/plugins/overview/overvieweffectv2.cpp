@@ -499,7 +499,7 @@ void OverviewEffectV2::reserveSlotsForCurrentDesktop()
     }
 }
 
-void OverviewEffectV2::reserveBarSnapshots()
+void OverviewEffectV2::reserveBarThumbs()
 {
     if (!effects || !m_atlas || !m_vulkanCtx) {
         return;
@@ -514,7 +514,7 @@ void OverviewEffectV2::reserveBarSnapshots()
     // bloated kwin to. Each window's bar mini-thumbnail samples this
     // small slot; sampling at low LOD is still cheap (mip cascade is
     // built once when the snapshot is rendered).
-    constexpr QSize kBarSnapshotSize(256, 192);
+    constexpr QSize kBarThumbSize(256, 192);
 
     for (EffectWindow *ew : effects->stackingOrder()) {
         if (!ew || ew->isOnDesktop(currentDesktop)) {
@@ -536,7 +536,7 @@ void OverviewEffectV2::reserveBarSnapshots()
             || !handle->readyForPainting()) {
             continue;
         }
-        auto slot = m_atlas->reserve(kBarSnapshotSize);
+        auto slot = m_atlas->reserve(kBarThumbSize);
         if (!slot.isValid()) {
             qCWarning(KWIN_OVERVIEW_V2_LOG)
                 << "OverviewEffectV2: snapshot reserve failed for"
@@ -551,16 +551,16 @@ void OverviewEffectV2::reserveBarSnapshots()
         // down each window's SurfaceItem pixmap + decoration FBO +
         // shadow texture, and the dedicated-allocation work returns
         // that VRAM to the OS instead of pinning VMA blocks.
-        m_barSnapshotVisRefs.emplace_back(
+        m_barThumbVisRefs.emplace_back(
             ew,
             EffectWindow::PAINT_DISABLED | EffectWindow::PAINT_DISABLED_BY_DESKTOP
                 | EffectWindow::PAINT_DISABLED_BY_MINIMIZE
                 | EffectWindow::PAINT_DISABLED_BY_ACTIVITY);
-        m_barSnapshotSlots.emplace(handle, std::move(slot));
+        m_barThumbSlots.emplace(handle, std::move(slot));
         // Drop the snapshot slot if the window dies during overview.
         connect(handle, &QObject::destroyed, this, [this, handle]() {
-            auto it = m_barSnapshotSlots.find(handle);
-            if (it == m_barSnapshotSlots.end()) {
+            auto it = m_barThumbSlots.find(handle);
+            if (it == m_barThumbSlots.end()) {
                 return;
             }
             if (m_vulkanCtx && m_lastAtlasSubmit.isValid()) {
@@ -577,7 +577,7 @@ void OverviewEffectV2::reserveBarSnapshots()
                 m_dragCandidate = nullptr;
                 m_dragActive = false;
             }
-            m_barSnapshotSlots.erase(it);
+            m_barThumbSlots.erase(it);
         });
     }
 }
@@ -599,7 +599,7 @@ void OverviewEffectV2::releaseAllSlots()
             }
             m_atlas->release(slot);
         }
-        for (auto &[handle, slot] : m_barSnapshotSlots) {
+        for (auto &[handle, slot] : m_barThumbSlots) {
             if (handle) {
                 handle->unrefOffscreenRendering();
             }
@@ -607,8 +607,8 @@ void OverviewEffectV2::releaseAllSlots()
         }
     }
     m_windowSlots.clear();
-    m_barSnapshotSlots.clear();
-    m_barSnapshotVisRefs.clear();
+    m_barThumbSlots.clear();
+    m_barThumbVisRefs.clear();
     m_tileLayout.clear();
     m_barTiles.clear();
     m_dragCandidate = nullptr;
@@ -816,7 +816,7 @@ void OverviewEffectV2::renderDesktopBar(VkCommandBuffer cmd, const QSize &fbSize
     // Mini-thumbnails inside each bar tile. Current-desktop windows
     // use the full-size slot from m_windowSlots (sampled at low LOD
     // via the mip cascade); non-current-desktop windows use the small
-    // static snapshot in m_barSnapshotSlots. Both are atlas-resident
+    // static snapshot in m_barThumbSlots. Both are atlas-resident
     // and share the descriptor the caller already bound. Fallback
     // slots are rare (only m_windowSlots can overflow; snapshots are
     // sized small enough to always fit) and skipped here to avoid
@@ -844,7 +844,7 @@ void OverviewEffectV2::renderDesktopBar(VkCommandBuffer cmd, const QSize &fbSize
                 continue;
             }
             Window *handle = ew->window();
-            const auto &lookupMap = isCurrentTile ? m_windowSlots : m_barSnapshotSlots;
+            const auto &lookupMap = isCurrentTile ? m_windowSlots : m_barThumbSlots;
             auto it = lookupMap.find(handle);
             if (it == lookupMap.end()) {
                 continue;
@@ -921,16 +921,16 @@ void OverviewEffectV2::renderWindowsToAtlas()
     if (!m_atlas || !m_vulkanCtx) {
         return;
     }
-    // Off-desktop slots (m_barSnapshotSlots) re-render every frame
+    // Off-desktop slots (m_barThumbSlots) re-render every frame
     // alongside the current-desktop slots so bar mini-thumbnails are
-    // live, not stale snapshots. m_barSnapshotVisRefs keeps the
+    // live, not stale snapshots. m_barThumbVisRefs keeps the
     // off-desktop WindowItems visible for the whole overview
     // lifetime; releaseAllSlots drops them, the X11 suspend hook
     // (a50a7e6d1c + 1d51bf4e61) frees the per-window cached
     // resources, and the dedicated-allocation work (39cf11b882 +
     // b8d35e7a0b) returns that VRAM to the OS instead of pinning
     // VMA blocks.
-    if (m_windowSlots.empty() && m_barSnapshotSlots.empty()) {
+    if (m_windowSlots.empty() && m_barThumbSlots.empty()) {
         return;
     }
 
@@ -974,7 +974,7 @@ void OverviewEffectV2::renderWindowsToAtlas()
         }
     };
     findAtlas(m_windowSlots);
-    findAtlas(m_barSnapshotSlots);
+    findAtlas(m_barThumbSlots);
     const bool haveAtlasSlots = atlasImage != VK_NULL_HANDLE;
     if (haveAtlasSlots && !m_atlasFramebuffer) {
         m_atlasFramebuffer = VulkanFramebuffer::create(m_vulkanCtx, m_atlasRenderPass.get(),
@@ -1022,7 +1022,7 @@ void OverviewEffectV2::renderWindowsToAtlas()
             }
             m_atlas->prepareForRenderTo(cmd, slot);
         }
-        for (auto &[_handle, slot] : m_barSnapshotSlots) {
+        for (auto &[_handle, slot] : m_barThumbSlots) {
             if (slot.isFallback) {
                 continue;
             }
@@ -1085,7 +1085,7 @@ void OverviewEffectV2::renderWindowsToAtlas()
             }
             renderSlot(handle, slot);
         }
-        for (auto &[handle, slot] : m_barSnapshotSlots) {
+        for (auto &[handle, slot] : m_barThumbSlots) {
             if (slot.isFallback || !handle) {
                 continue;
             }
@@ -1166,7 +1166,7 @@ void OverviewEffectV2::renderWindowsToAtlas()
     for (auto &[_handle, slot] : m_windowSlots) {
         m_atlas->generateMipsAndPublish(cmd, slot);
     }
-    for (auto &[_handle, slot] : m_barSnapshotSlots) {
+    for (auto &[_handle, slot] : m_barThumbSlots) {
         m_atlas->generateMipsAndPublish(cmd, slot);
     }
 
@@ -1481,7 +1481,7 @@ void OverviewEffectV2::activate()
     m_grabbedKeyboard = effects->grabKeyboard(this);
 #if HAVE_VULKAN
     reserveSlotsForCurrentDesktop();
-    reserveBarSnapshots();
+    reserveBarThumbs();
     // Subscribe to preFrameRender so the atlas re-renders per frame
     // (per-window dirty tracking is a later optimisation). Bail out
     // gracefully if scene access fails — Phase 2c will gate behaviour
