@@ -415,22 +415,33 @@ void OverviewEffectV2::reserveSlotsForCurrentDesktop()
             continue;
         }
         Window *handle = ew->window();
-        if (!handle || !handle->isNormalWindow()) {
+        if (!handle) {
             continue;
         }
-        // isNormalWindow excludes OSDs, notifications, popups by
-        // window type — but during a fast desktop switch the VD-switch
-        // OSD can briefly report windowType=Normal before its
-        // _NET_WM_WINDOW_TYPE hint lands, and we'd reserve a slot for
-        // it. Re-check via the dedicated predicates so an OSD that
-        // slipped through the windowType check still gets filtered.
-        // readyForPainting also catches windows that haven't produced
-        // their first surface — they can't render anything useful into
-        // their atlas slot yet.
-        if (handle->isOnScreenDisplay() || handle->isNotification()
-            || handle->isCriticalNotification() || handle->isTooltip()
-            || handle->isComboBox() || handle->isDNDIcon()
-            || handle->isPopupWindow() || !handle->readyForPainting()) {
+        // Match V1's effective overview filter (overview/qml/main.qml
+        // + WindowFilterModel) and add skipSwitcher() as the OSD
+        // backstop:
+        //
+        // - isClient() — exclude X11 override-redirect / unmanaged
+        //   windows. Plasma's VD-switch OSD is an unmanaged popup, so
+        //   this is the one filter that catches it even when its
+        //   windowType hint hasn't propagated yet (the race that
+        //   isNormalWindow() loses).
+        // - isNormalWindow() — the windowType bucket V1 accepts (V1
+        //   also accepts Dialog; V2 stays stricter for now).
+        // - skipSwitcher() — the semantic "don't show me in any
+        //   window switcher / overview" flag. Plasma sets it on its
+        //   transient popups; catches anything our type checks miss.
+        // - dedicated transient-type predicates + readyForPainting:
+        //   defence in depth against the race where windowType
+        //   momentarily reports Normal before _NET_WM_WINDOW_TYPE is
+        //   parsed.
+        if (!handle->isClient() || !handle->isNormalWindow()
+            || handle->skipSwitcher() || handle->isOnScreenDisplay()
+            || handle->isNotification() || handle->isCriticalNotification()
+            || handle->isTooltip() || handle->isComboBox()
+            || handle->isDNDIcon() || handle->isPopupWindow()
+            || !handle->readyForPainting()) {
             continue;
         }
         const QSize size = handle->visibleGeometry().toAlignedRect().size();
