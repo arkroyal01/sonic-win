@@ -488,14 +488,28 @@ void VulkanThumbnailAtlas::generateMipsAndPublish(VkCommandBuffer cmd, Slot &slo
     // mip. After each level, transition the just-written level from
     // TRANSFER_WRITE to TRANSFER_READ so the next iteration can sample
     // it.
+    //
+    // Crucially: oldLayout must be GENERAL (not UNDEFINED) on this
+    // barrier. The atlas is shared across many slots; specifying
+    // UNDEFINED here would let the driver discard the *entire* mip
+    // level — wiping the downscales of every other slot already
+    // resident in the atlas. The atlas image is in GENERAL throughout
+    // its lifetime (prepareForRenderTo's all-mips transition handles
+    // the initial UNDEFINED→GENERAL on first use), so a same-layout
+    // access-mask-only barrier is correct here.
     QRect srcRect = slot.rect;
     for (uint32_t level = 1; level < slot.mipLevels; ++level) {
-        // First transition level N's storage to TRANSFER_WRITE.
+        // Make any prior shader reads of this level (from the published
+        // state at the end of the previous frame) and any prior
+        // transfer writes (this frame, if multiple slots share the
+        // cascade) visible to the upcoming TRANSFER_WRITE.
         VkImageMemoryBarrier toDst{};
         toDst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        toDst.srcAccessMask = 0;
+        toDst.srcAccessMask = VK_ACCESS_SHADER_READ_BIT
+            | VK_ACCESS_TRANSFER_WRITE_BIT
+            | VK_ACCESS_TRANSFER_READ_BIT;
         toDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        toDst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        toDst.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
         toDst.newLayout = VK_IMAGE_LAYOUT_GENERAL;
         toDst.image = slot.image;
         toDst.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -504,7 +518,8 @@ void VulkanThumbnailAtlas::generateMipsAndPublish(VkCommandBuffer cmd, Slot &slo
         toDst.subresourceRange.baseArrayLayer = 0;
         toDst.subresourceRange.layerCount = 1;
         vkCmdPipelineBarrier(cmd,
-                             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                                 | VK_PIPELINE_STAGE_TRANSFER_BIT,
                              VK_PIPELINE_STAGE_TRANSFER_BIT,
                              0, 0, nullptr, 0, nullptr, 1, &toDst);
 
