@@ -301,6 +301,11 @@ private:
     /// user changes the border binding live.
     QList<ElectricBorder> m_borderActivate;
 
+    /// V1 parity knob: when true, hide minimised windows from the
+    /// grid and skip them in atlas reservation. Read from the
+    /// Effect-overview / IgnoreMinimized config key (default false).
+    bool m_ignoreMinimized = false;
+
 #if HAVE_VULKAN
     /// Build the Vulkan pipeline used by `paintWindowTile()` to draw a
     /// textured quad sampling from `VulkanThumbnailAtlas`. Compatible

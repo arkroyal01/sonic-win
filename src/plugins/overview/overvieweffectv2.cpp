@@ -491,6 +491,9 @@ void OverviewEffectV2::reserveSlotsForCurrentDesktop()
             || !handle->readyForPainting()) {
             continue;
         }
+        if (m_ignoreMinimized && handle->isMinimized()) {
+            continue;
+        }
         const QSize size = handle->visibleGeometry().toAlignedRect().size();
         if (size.isEmpty()) {
             continue;
@@ -581,6 +584,9 @@ void OverviewEffectV2::reserveBarThumbs()
             || handle->isTooltip() || handle->isComboBox()
             || handle->isDNDIcon() || handle->isPopupWindow()
             || !handle->readyForPainting()) {
+            continue;
+        }
+        if (m_ignoreMinimized && handle->isMinimized()) {
             continue;
         }
         auto slot = m_atlas->reserve(kBarThumbSize);
@@ -725,6 +731,13 @@ void OverviewEffectV2::rebuildTileLayout(const QSize &fbSize)
         // check. Empty m_searchText short-circuits to "match all".
         if (!m_searchText.isEmpty()
             && !handle->caption().contains(m_searchText, Qt::CaseInsensitive)) {
+            continue;
+        }
+        // Dynamic IgnoreMinimized: a window minimised after the
+        // overview opened drops out without waiting for the next
+        // activation. Reservation site already filters at activate
+        // time; this catches the live state change.
+        if (m_ignoreMinimized && handle->isMinimized()) {
             continue;
         }
         drawable.push_back({handle, it->second, 0, 0, 0, 0, 0, 0, 0, 0});
@@ -2074,6 +2087,11 @@ void OverviewEffectV2::reconfigure(ReconfigureFlags flags)
         m_borderActivate.append(eb);
         effects->reserveElectricBorder(eb, this);
     }
+
+    // V1 parity knob: hide minimised windows from the grid + bar
+    // when set. Per-tile filter applied in reserveSlotsForCurrentDesktop,
+    // reserveBarThumbs and rebuildTileLayout. Default false matches V1.
+    m_ignoreMinimized = group.readEntry(QStringLiteral("IgnoreMinimized"), false);
 }
 
 bool OverviewEffectV2::borderActivated(ElectricBorder border)
