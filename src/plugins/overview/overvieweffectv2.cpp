@@ -2540,6 +2540,19 @@ void OverviewEffectV2::windowInputMouseEvent(QEvent *event)
     }
 
     if (event->type() == QEvent::MouseButtonRelease) {
+        // Middle-click on a grid tile closes the window without
+        // dismissing V2 — matches V1's TapHandler-on-middle behaviour.
+        // Lets the user reap several windows in one overview session.
+        // Skip if a drag was somehow in progress (LeftButton-only,
+        // but defensive in case kwin synthesises a Middle release).
+        if (mouseEvent->button() == Qt::MiddleButton) {
+            if (Window *target = hitTestTile(pos)) {
+                if (target->effectWindow()) {
+                    target->effectWindow()->closeWindow();
+                }
+            }
+            return;
+        }
         if (mouseEvent->button() != Qt::LeftButton) {
             return;
         }
