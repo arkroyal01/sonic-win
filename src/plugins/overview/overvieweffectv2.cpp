@@ -597,6 +597,8 @@ void OverviewEffectV2::releaseAllSlots()
     m_barSnapshotVisRefs.clear();
     m_tileLayout.clear();
     m_barTiles.clear();
+    m_dragCandidate = nullptr;
+    m_dragActive = false;
     m_fallbackFramebuffers.clear();
     m_atlasFramebuffer.reset();
     m_atlasRenderPass.reset();
@@ -1310,10 +1312,25 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
         pushDescriptor(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_vkPipelineLayout, 0, 1, &write);
     };
 
+    const float screenW = std::max(1.0f, float(fbSize.width()));
+    const float screenH = std::max(1.0f, float(fbSize.height()));
     auto pushAndDraw = [&](const TileLayout &t, float uvX, float uvY, float uvW, float uvH) {
+        float quadX = t.realNdcX + (t.gridNdcX - t.realNdcX) * factor;
+        float quadY = t.realNdcY + (t.gridNdcY - t.realNdcY) * factor;
+        // Drag offset: while the user is mid-drag from this tile, the
+        // tile follows the cursor (NDC space) instead of sitting in
+        // its grid cell. release commits the move-to-desktop if the
+        // cursor is over a bar tile; otherwise the next frame after
+        // m_dragActive clears snaps the tile back to its grid cell.
+        if (m_dragActive && t.handle == m_dragCandidate) {
+            const float dxNdc = 2.0f * float(m_dragCurrentGlobal.x() - m_dragPressGlobal.x()) / screenW;
+            const float dyNdc = 2.0f * float(m_dragCurrentGlobal.y() - m_dragPressGlobal.y()) / screenH;
+            quadX += dxNdc;
+            quadY += dyNdc;
+        }
         OverviewQuadPushConstants pc{};
-        pc.quadRectNdc[0] = t.realNdcX + (t.gridNdcX - t.realNdcX) * factor;
-        pc.quadRectNdc[1] = t.realNdcY + (t.gridNdcY - t.realNdcY) * factor;
+        pc.quadRectNdc[0] = quadX;
+        pc.quadRectNdc[1] = quadY;
         pc.quadRectNdc[2] = t.realNdcW + (t.gridNdcW - t.realNdcW) * factor;
         pc.quadRectNdc[3] = t.realNdcH + (t.gridNdcH - t.realNdcH) * factor;
         pc.atlasSlotUv[0] = uvX;
@@ -1812,70 +1829,148 @@ void OverviewEffectV2::grabbedKeyboardEvent(QKeyEvent *event)
 
 void OverviewEffectV2::windowInputMouseEvent(QEvent *event)
 {
-    if (!m_visible || event->type() != QEvent::MouseButtonPress) {
+    if (!m_visible) {
         return;
     }
     auto *mouseEvent = dynamic_cast<QMouseEvent *>(event);
-    if (!mouseEvent || mouseEvent->button() != Qt::LeftButton) {
+    if (!mouseEvent) {
         return;
     }
-    // Hold off clicks until the slide-in animation has substantially
-    // settled — otherwise the user clicks a tile that's still
-    // animating from its real position and the hit-test against the
-    // grid position misses. 0.95 is a comfortable threshold; the user
-    // can't perceive the last 5% of the OutCubic anyway.
+    // Hold off interaction until the slide-in animation has
+    // substantially settled — otherwise hit-tests miss against tiles
+    // still animating from their real positions. 0.95 is a comfortable
+    // threshold; the user can't perceive the last 5% of the OutCubic.
     if (m_activationFactor < 0.95) {
         return;
     }
+
     const QPoint pos = mouseEvent->globalPosition().toPoint();
-#if HAVE_VULKAN
-    // Bar hit-test first — it sits over the top edge of the screen and
-    // its rects are smaller targets than the grid tiles. Convert click
-    // to NDC the same way the post-pass does so geometry matches.
-    if (!m_barTiles.empty() && effects) {
-        const QRect screen = effects->virtualScreenGeometry();
-        if (!screen.isEmpty() && screen.contains(pos)) {
-            const float screenW = std::max(1.0f, float(screen.width()));
-            const float screenH = std::max(1.0f, float(screen.height()));
-            const float mxNdc = (float(pos.x() - screen.x()) / screenW) * 2.0f - 1.0f;
-            const float myNdc = (float(pos.y() - screen.y()) / screenH) * 2.0f - 1.0f;
-            for (const BarTile &b : m_barTiles) {
-                if (mxNdc >= b.ndcX && mxNdc <= b.ndcX + b.ndcW
-                    && myNdc >= b.ndcY && myNdc <= b.ndcY + b.ndcH) {
-                    // Tear down V2 *synchronously* before switching
-                    // desktops. The animated slide-out raced with
-                    // setCurrentDesktop's side effects (VD-switch OSD,
-                    // fadedesktop, KGlobalAccel state) and the
-                    // post-pass kept firing into the race — the next
-                    // activate would draw the VD OSD zoomed in
-                    // instead of windows, and Super+W silently broke
-                    // until something else (e.g. the VD plasmoid)
-                    // reset shortcut state. Snap everything to the
-                    // dormant state, then switch.
-                    VirtualDesktop *target = (b.desktop && b.desktop != effects->currentDesktop())
-                        ? b.desktop
-                        : nullptr;
-                    teardownImmediate();
-                    if (target) {
-                        effects->setCurrentDesktop(target);
-                    }
-                    return;
-                }
+
+    if (event->type() == QEvent::MouseMove) {
+        m_dragCurrentGlobal = pos;
+        if (m_dragCandidate && !m_dragActive) {
+            const QPoint delta = pos - m_dragPressGlobal;
+            if (delta.manhattanLength() >= kDragThresholdPx) {
+                m_dragActive = true;
             }
         }
-    }
-#endif
-    if (Window *target = hitTestTile(pos)) {
-        if (target->effectWindow()) {
-            effects->activateWindow(target->effectWindow());
+        if (m_dragActive) {
+            effects->addRepaintFull();
         }
-        deactivate();
         return;
     }
-    // Click outside any tile or bar: dismiss the overview (matches the
-    // QML overview's TapHandler on the underlay).
-    deactivate();
+
+    if (event->type() == QEvent::MouseButtonPress) {
+        if (mouseEvent->button() != Qt::LeftButton) {
+            return;
+        }
+#if HAVE_VULKAN
+        // Bar press → no candidate, no drag. Bar tiles are click-only.
+        // Match the bar hit-test that the existing release path uses
+        // and treat the bar press as a no-op so the release switches
+        // the desktop.
+        if (hitTestBar(pos)) {
+            return;
+        }
+#endif
+        // Grid press → record drag candidate. Don't commit any action
+        // yet; release decides between click (activate) and drag-drop
+        // (move-to-desktop).
+        if (Window *target = hitTestTile(pos)) {
+            m_dragCandidate = target;
+            m_dragPressGlobal = pos;
+            m_dragCurrentGlobal = pos;
+            m_dragActive = false;
+        } else {
+            m_dragCandidate = nullptr;
+        }
+        return;
+    }
+
+    if (event->type() == QEvent::MouseButtonRelease) {
+        if (mouseEvent->button() != Qt::LeftButton) {
+            return;
+        }
+        m_dragCurrentGlobal = pos;
+        const bool wasDrag = m_dragActive;
+        Window *candidate = m_dragCandidate;
+        m_dragCandidate = nullptr;
+        m_dragActive = false;
+
+        if (wasDrag && candidate) {
+            // Drop hit-test: bar tile under the cursor is the target
+            // desktop. Anything else cancels (just clear state and
+            // let the next frame snap the tile back to its grid cell).
+#if HAVE_VULKAN
+            if (VirtualDesktop *target = hitTestBar(pos)) {
+                if (target != effects->currentDesktop() && candidate->effectWindow()) {
+                    // Same teardown pattern as a bar-tile click —
+                    // synchronous so the desktop switch doesn't race
+                    // with the still-running slide-out and the
+                    // shortcut state stays coherent.
+                    effects->windowToDesktops(candidate->effectWindow(), {target});
+                }
+                teardownImmediate();
+                if (target != effects->currentDesktop()) {
+                    effects->setCurrentDesktop(target);
+                }
+                return;
+            }
+#endif
+            // Drop on empty space / source tile / grid: cancel.
+            effects->addRepaintFull();
+            return;
+        }
+
+        // Not a drag — fall through to the click logic. Bar hit-test
+        // first (smaller targets sit over the top of the screen).
+#if HAVE_VULKAN
+        if (VirtualDesktop *barTarget = hitTestBar(pos)) {
+            VirtualDesktop *target = (barTarget != effects->currentDesktop())
+                ? barTarget
+                : nullptr;
+            teardownImmediate();
+            if (target) {
+                effects->setCurrentDesktop(target);
+            }
+            return;
+        }
+#endif
+        if (Window *target = hitTestTile(pos)) {
+            if (target->effectWindow()) {
+                effects->activateWindow(target->effectWindow());
+            }
+            deactivate();
+            return;
+        }
+        // Click outside any tile or bar: dismiss.
+        deactivate();
+    }
 }
+
+#if HAVE_VULKAN
+VirtualDesktop *OverviewEffectV2::hitTestBar(const QPoint &globalPos) const
+{
+    if (m_barTiles.empty() || !effects) {
+        return nullptr;
+    }
+    const QRect screen = effects->virtualScreenGeometry();
+    if (screen.isEmpty() || !screen.contains(globalPos)) {
+        return nullptr;
+    }
+    const float screenW = std::max(1.0f, float(screen.width()));
+    const float screenH = std::max(1.0f, float(screen.height()));
+    const float mxNdc = (float(globalPos.x() - screen.x()) / screenW) * 2.0f - 1.0f;
+    const float myNdc = (float(globalPos.y() - screen.y()) / screenH) * 2.0f - 1.0f;
+    for (const BarTile &b : m_barTiles) {
+        if (mxNdc >= b.ndcX && mxNdc <= b.ndcX + b.ndcW
+            && myNdc >= b.ndcY && myNdc <= b.ndcY + b.ndcH) {
+            return b.desktop;
+        }
+    }
+    return nullptr;
+}
+#endif
 
 Window *OverviewEffectV2::hitTestTile(const QPoint &globalPos) const
 {

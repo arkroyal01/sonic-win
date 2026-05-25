@@ -113,6 +113,16 @@ private:
     /// post-pass draws — keeps the two paths trivially consistent.
     Window *hitTestTile(const QPoint &globalPos) const;
 
+#if HAVE_VULKAN
+    /// Hit-test a global mouse position against the desktop bar.
+    /// Returns the VirtualDesktop of the bar tile under @p globalPos,
+    /// or nullptr if the cursor isn't on any bar tile. Shared by the
+    /// click path (release on a bar tile switches desktop) and the
+    /// drag-drop path (release on a bar tile moves the dragged
+    /// window to that desktop).
+    VirtualDesktop *hitTestBar(const QPoint &globalPos) const;
+#endif
+
     /// State machine for the slide-in/out animation. Drives
     /// `m_activationFactor` (0 = hidden, 1 = fully shown) over
     /// `m_animationDuration` ms. We use QVariantAnimation rather than
@@ -150,6 +160,25 @@ private:
     /// indexes m_tileLayout. When FocusZone::Bar, indexes m_barTiles.
     /// -1 when m_focusZone == None.
     int m_focusedIndex = -1;
+
+    /// Drag-and-drop state for "drop a grid tile onto a bar tile to
+    /// move the window to that desktop". On MouseButtonPress over a
+    /// grid tile we record the candidate (m_dragCandidate) and the
+    /// press position but don't enter drag mode yet — a release
+    /// inside a small threshold falls through to the normal click
+    /// path so single-clicks keep working. Once the cursor moves
+    /// past the threshold we flip m_dragActive: the source tile
+    /// follows the cursor instead of sitting in its grid cell, and
+    /// a bar-tile hit at MouseButtonRelease commits the move via
+    /// effects->windowToDesktops.
+    Window *m_dragCandidate = nullptr;
+    QPoint m_dragPressGlobal;
+    QPoint m_dragCurrentGlobal;
+    bool m_dragActive = false;
+    /// Pixels the cursor must move from m_dragPressGlobal before a
+    /// press becomes a drag. Below this a release reverts to a
+    /// regular click (activate window + deactivate overview).
+    static constexpr int kDragThresholdPx = 6;
 
     /// Global toggle shortcut. Same object name as the existing
     /// OverviewEffect's `Overview` action so the user's saved binding
