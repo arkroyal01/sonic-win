@@ -418,6 +418,21 @@ void OverviewEffectV2::reserveSlotsForCurrentDesktop()
         if (!handle || !handle->isNormalWindow()) {
             continue;
         }
+        // isNormalWindow excludes OSDs, notifications, popups by
+        // window type — but during a fast desktop switch the VD-switch
+        // OSD can briefly report windowType=Normal before its
+        // _NET_WM_WINDOW_TYPE hint lands, and we'd reserve a slot for
+        // it. Re-check via the dedicated predicates so an OSD that
+        // slipped through the windowType check still gets filtered.
+        // readyForPainting also catches windows that haven't produced
+        // their first surface — they can't render anything useful into
+        // their atlas slot yet.
+        if (handle->isOnScreenDisplay() || handle->isNotification()
+            || handle->isCriticalNotification() || handle->isTooltip()
+            || handle->isComboBox() || handle->isDNDIcon()
+            || handle->isPopupWindow() || !handle->readyForPainting()) {
+            continue;
+        }
         const QSize size = handle->visibleGeometry().toAlignedRect().size();
         if (size.isEmpty()) {
             continue;
