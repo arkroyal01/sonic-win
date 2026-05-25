@@ -402,14 +402,18 @@ void OverviewEffectV2::reserveSlotsForCurrentDesktop()
     // Walk current-desktop windows in stacking order and reserve one
     // atlas slot per window, sized to the window's visible geometry
     // (matching the rendered region in WindowThumbnailSource's existing
-    // GL path). Hidden / unmanaged windows are skipped.
+    // GL path). Skip hidden/unmanaged windows, and also the desktop
+    // pseudo-window (plasmashell's wallpaper layer) and docks (panels):
+    // those serve as the captured-scene background and a separate panel
+    // strip respectively, not as overview tiles. Mirrors the V1
+    // overview's `isNormalWindow` filter in WindowHeapView.
     auto *currentDesktop = effects->currentDesktop();
     for (EffectWindow *ew : effects->stackingOrder()) {
         if (!ew || !currentDesktop || !ew->isOnDesktop(currentDesktop)) {
             continue;
         }
         Window *handle = ew->window();
-        if (!handle) {
+        if (!handle || !handle->isNormalWindow()) {
             continue;
         }
         const QSize size = handle->visibleGeometry().toAlignedRect().size();
@@ -422,6 +426,16 @@ void OverviewEffectV2::reserveSlotsForCurrentDesktop()
                                             << handle->caption().left(40) << size;
             continue;
         }
+        qCDebug(KWIN_OVERVIEW_V2_LOG).nospace()
+            << "reserve slot for '" << handle->caption().left(40) << "' size=" << size
+            << " atlasRect=" << slot.rect << " isFallback=" << slot.isFallback;
+        // Keep the offscreen pixmap rendered for this window for as
+        // long as we hold the slot. Without this, when the X11
+        // compositor decides the window is "not needed", its
+        // SurfaceItem's source texture becomes stale or unavailable
+        // and renderItem produces empty atlas slots. WindowThumbnail-
+        // Source uses the same ref/unref pattern.
+        handle->refOffscreenRendering();
         m_windowSlots.emplace(handle, std::move(slot));
         // Drop the slot the moment the window dies so renderWindowsToAtlas
         // doesn't dereference a stale pointer in handle->visibleGeometry()
@@ -441,6 +455,8 @@ void OverviewEffectV2::reserveSlotsForCurrentDesktop()
             if (m_atlas) {
                 m_atlas->release(it->second);
             }
+            // No unrefOffscreenRendering here — the window is being
+            // destroyed; KWin tears down its own ref tracking.
             m_windowSlots.erase(it);
         });
     }
@@ -458,6 +474,9 @@ void OverviewEffectV2::releaseAllSlots()
     }
     if (m_atlas) {
         for (auto &[handle, slot] : m_windowSlots) {
+            if (handle) {
+                handle->unrefOffscreenRendering();
+            }
             m_atlas->release(slot);
         }
     }
