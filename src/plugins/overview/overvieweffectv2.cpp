@@ -663,6 +663,13 @@ void OverviewEffectV2::releaseAllSlots()
     m_searchRenderedText.clear();
     m_searchTexture.reset();
     m_searchTextureSize = QSize();
+    m_addTileNdc = QRectF();
+    m_addTileHover = false;
+    // Drop the "+" icon texture so the V2 effect releases all GPU
+    // resources on deactivate (per the V2 active-memory rule). The
+    // texture is tiny (~16 KB) so re-uploading on the next activate
+    // is essentially free.
+    m_addIconTexture.reset();
     m_fallbackFramebuffers.clear();
     m_atlasFramebuffer.reset();
     m_atlasRenderPass.reset();
@@ -784,15 +791,12 @@ void OverviewEffectV2::rebuildBarLayout(const QSize &fbSize)
 {
     Q_UNUSED(fbSize);
     m_barTiles.clear();
+    m_addTileNdc = QRectF();
     if (!effects) {
         return;
     }
     const auto desktops = effects->desktops();
     const int n = desktops.size();
-    if (n <= 1) {
-        // Only one desktop → no bar (nothing to switch to).
-        return;
-    }
     VirtualDesktop *current = effects->currentDesktop();
 
     // Bar bounds in NDC. Positive viewport Y in the post-pass → -1 is
@@ -802,11 +806,16 @@ void OverviewEffectV2::rebuildBarLayout(const QSize &fbSize)
     // rect has equal NDC width and height). The strip is centred
     // horizontally. Keep kBarTop+kBarHeight in sync with kGridTop in
     // rebuildTileLayout so grid tiles and bar tiles don't overlap.
+    //
+    // The Add-VD tile lives at the trailing end of the strip and is
+    // always rendered, even with a single desktop, so users can
+    // create more VDs from inside the overview.
     constexpr float kBarTop = -0.96f;
     constexpr float kBarHeight = 0.16f;
     constexpr float kGutter = 0.012f;
     const float tileW = kBarHeight; // → screen aspect in pixel space
-    const float stripW = n * tileW + (n - 1) * kGutter;
+    const int totalSlots = n + 1; // desktop tiles + Add tile
+    const float stripW = totalSlots * tileW + (totalSlots - 1) * kGutter;
     const float stripLeft = -stripW * 0.5f;
 
     m_barTiles.reserve(n);
@@ -820,11 +829,12 @@ void OverviewEffectV2::rebuildBarLayout(const QSize &fbSize)
             desktops[i] == current,
         });
     }
+    m_addTileNdc = QRectF(stripLeft + n * (tileW + kGutter), kBarTop, tileW, kBarHeight);
 }
 
 void OverviewEffectV2::renderDesktopBar(VkCommandBuffer cmd, const QSize &fbSize)
 {
-    if (m_barTiles.empty() || m_vkPipelineLayout == VK_NULL_HANDLE) {
+    if ((m_barTiles.empty() && m_addTileNdc.isEmpty()) || m_vkPipelineLayout == VK_NULL_HANDLE) {
         return;
     }
     const float screenW = std::max(1.0f, float(fbSize.width()));
@@ -865,6 +875,31 @@ void OverviewEffectV2::renderDesktopBar(VkCommandBuffer cmd, const QSize &fbSize
         // the tiles.
         pc.opacity = (b.isCurrent ? 0.7f : 0.55f) * factor;
 
+        vkCmdPushConstants(cmd, m_vkPipelineLayout,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                           0, sizeof(pc), &pc);
+        vkCmdDraw(cmd, 4, 1, 0, 0);
+    }
+
+    // Add-VD affordance background. Same solid-tile draw as a bar
+    // tile but tinted neutrally and brightened on hover. The "+"
+    // icon overlay is drawn in a separate pass by the caller so it
+    // can swap the descriptor view to the persistent icon texture.
+    if (!m_addTileNdc.isEmpty()) {
+        OverviewQuadPushConstants pc{};
+        pc.quadRectNdc[0] = float(m_addTileNdc.x());
+        pc.quadRectNdc[1] = float(m_addTileNdc.y());
+        pc.quadRectNdc[2] = float(m_addTileNdc.width());
+        pc.quadRectNdc[3] = float(m_addTileNdc.height());
+        pc.atlasSlotUv[0] = 0.0f;
+        pc.atlasSlotUv[1] = 0.0f;
+        pc.atlasSlotUv[2] = 1.0f;
+        pc.atlasSlotUv[3] = 1.0f;
+        pc.tintRgba[0] = 0.5f;
+        pc.tintRgba[1] = 0.5f;
+        pc.tintRgba[2] = 0.55f;
+        pc.tintRgba[3] = 1.0f;
+        pc.opacity = (m_addTileHover ? 0.7f : 0.5f) * factor;
         vkCmdPushConstants(cmd, m_vkPipelineLayout,
                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                            0, sizeof(pc), &pc);
@@ -970,6 +1005,41 @@ void OverviewEffectV2::renderDesktopBar(VkCommandBuffer cmd, const QSize &fbSize
                                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                                0, sizeof(pc), &pc);
             vkCmdDraw(cmd, 4, 1, 0, 0);
+        }
+    }
+}
+
+void OverviewEffectV2::ensureBarIconTextures()
+{
+    // Persistent "+" icon. The "×" delete icon is allocated by the
+    // same path in the next commit (item 3b). Both are built once
+    // per V2 lifetime — they're small (~16 KB each at 64×64 RGBA)
+    // and the QPainter rendering is the only non-trivial cost.
+    if (!m_vulkanCtx) {
+        return;
+    }
+    if (!m_addIconTexture) {
+        const int sidePx = 64;
+        QImage img(sidePx, sidePx, QImage::Format_RGBA8888_Premultiplied);
+        img.fill(Qt::transparent);
+        QPainter p(&img);
+        p.setRenderHint(QPainter::Antialiasing);
+        // Thin "+" centred. White with the same tone as the bar
+        // tile labels so the affordance reads as a control, not as
+        // window content.
+        QPen pen(QColor(255, 255, 255, 230));
+        pen.setWidthF(sidePx * 0.10f);
+        pen.setCapStyle(Qt::RoundCap);
+        p.setPen(pen);
+        const float half = sidePx * 0.5f;
+        const float arm = sidePx * 0.28f;
+        p.drawLine(QPointF(half - arm, half), QPointF(half + arm, half));
+        p.drawLine(QPointF(half, half - arm), QPointF(half, half + arm));
+        p.end();
+        m_addIconTexture = VulkanTexture::upload(m_vulkanCtx, img);
+        if (!m_addIconTexture) {
+            qCWarning(KWIN_OVERVIEW_V2_LOG)
+                << "OverviewEffectV2: add-icon upload failed";
         }
     }
 }
@@ -1624,6 +1694,39 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
         }
     }
 
+    // Add-VD "+" icon overlay. Drawn after the bar pass so it stacks
+    // on top of the add-tile background. Uses its own image view
+    // (pushView swaps the binding); UV is the full texture.
+    ensureBarIconTextures();
+    if (!m_addTileNdc.isEmpty() && m_addIconTexture && m_addIconTexture->isValid()) {
+        pushView(m_addIconTexture->imageView());
+        // Inset the icon inside the tile so the "+" doesn't sit edge-
+        // to-edge. ~55% of the smaller tile dimension, centred.
+        const float iconFrac = 0.55f;
+        const float iconNdcW = float(m_addTileNdc.width()) * iconFrac;
+        const float iconNdcH = float(m_addTileNdc.height()) * iconFrac;
+        const float iconNdcX = float(m_addTileNdc.x())
+            + (float(m_addTileNdc.width()) - iconNdcW) * 0.5f;
+        const float iconNdcY = float(m_addTileNdc.y())
+            + (float(m_addTileNdc.height()) - iconNdcH) * 0.5f;
+        OverviewQuadPushConstants pc{};
+        pc.quadRectNdc[0] = iconNdcX;
+        pc.quadRectNdc[1] = iconNdcY;
+        pc.quadRectNdc[2] = iconNdcW;
+        pc.quadRectNdc[3] = iconNdcH;
+        pc.atlasSlotUv[0] = 0.0f;
+        pc.atlasSlotUv[1] = 0.0f;
+        pc.atlasSlotUv[2] = 1.0f;
+        pc.atlasSlotUv[3] = 1.0f;
+        // tintRgba.a = 0 → pure texture sample (premultiplied alpha
+        // from the QPainter render).
+        pc.opacity = factor;
+        vkCmdPushConstants(cmd, m_vkPipelineLayout,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                           0, sizeof(pc), &pc);
+        vkCmdDraw(cmd, 4, 1, 0, 0);
+    }
+
     // Search bar — only drawn while a filter is active. Lazily build /
     // update the texture, then bind its dedicated SRGB view and draw a
     // single quad centred between the desktop bar and the grid.
@@ -2245,6 +2348,24 @@ void OverviewEffectV2::windowInputMouseEvent(QEvent *event)
     if (event->type() == QEvent::MouseMove) {
         const QPoint prev = m_dragCurrentGlobal;
         m_dragCurrentGlobal = pos;
+        m_mouseGlobal = pos;
+#if HAVE_VULKAN
+        // Hover state for the Add-VD tile. Only repaint when the
+        // hover bit actually changes — most pointer movement doesn't
+        // cross the tile boundary, so the strip stays quiet.
+        const bool addHoverNow = hitTestAddTile(pos);
+        if (addHoverNow != m_addTileHover) {
+            m_addTileHover = addHoverNow;
+            if (effects) {
+                const QRect screen = effects->virtualScreenGeometry();
+                if (!screen.isEmpty()) {
+                    const int barTopPx = screen.y() + int(0.02 * screen.height());
+                    const int barHeightPx = int(0.16 * screen.height()) + kDragDamagePadPx * 2;
+                    effects->addRepaint(QRect(screen.x(), barTopPx, screen.width(), barHeightPx));
+                }
+            }
+        }
+#endif
         if (m_dragCandidate && !m_dragActive) {
             const QPoint delta = pos - m_dragPressGlobal;
             if (delta.manhattanLength() >= kDragThresholdPx) {
@@ -2296,8 +2417,9 @@ void OverviewEffectV2::windowInputMouseEvent(QEvent *event)
         // Bar press → no candidate, no drag. Bar tiles are click-only.
         // Match the bar hit-test that the existing release path uses
         // and treat the bar press as a no-op so the release switches
-        // the desktop.
-        if (hitTestBar(pos)) {
+        // the desktop. Same for the Add-VD tile — release creates the
+        // new desktop; press is a no-op.
+        if (hitTestBar(pos) || hitTestAddTile(pos)) {
             return;
         }
 #endif
@@ -2360,6 +2482,24 @@ void OverviewEffectV2::windowInputMouseEvent(QEvent *event)
         // Not a drag — fall through to the click logic. Bar hit-test
         // first (smaller targets sit over the top of the screen).
 #if HAVE_VULKAN
+        if (hitTestAddTile(pos)) {
+            // Create a new desktop and switch to it. Position past the
+            // last existing desktop so it appears at the end of the
+            // bar (where the "+" tile sat). createVirtualDesktop()
+            // takes a 1-based position; passing count()+1 appends.
+            auto *vdm = VirtualDesktopManager::self();
+            if (vdm) {
+                VirtualDesktop *created = vdm->createVirtualDesktop(vdm->count() + 1);
+                if (created && effects) {
+                    teardownImmediate();
+                    effects->setCurrentDesktop(created);
+                    return;
+                }
+            }
+            // Couldn't create (config-locked count, etc.) — just keep
+            // V2 open so the user notices nothing changed.
+            return;
+        }
         if (VirtualDesktop *barTarget = hitTestBar(pos)) {
             VirtualDesktop *target = (barTarget != effects->currentDesktop())
                 ? barTarget
@@ -2384,6 +2524,23 @@ void OverviewEffectV2::windowInputMouseEvent(QEvent *event)
 }
 
 #if HAVE_VULKAN
+bool OverviewEffectV2::hitTestAddTile(const QPoint &globalPos) const
+{
+    if (m_addTileNdc.isEmpty() || !effects) {
+        return false;
+    }
+    const QRect screen = effects->virtualScreenGeometry();
+    if (screen.isEmpty() || !screen.contains(globalPos)) {
+        return false;
+    }
+    const float screenW = std::max(1.0f, float(screen.width()));
+    const float screenH = std::max(1.0f, float(screen.height()));
+    const float mxNdc = (float(globalPos.x() - screen.x()) / screenW) * 2.0f - 1.0f;
+    const float myNdc = (float(globalPos.y() - screen.y()) / screenH) * 2.0f - 1.0f;
+    return mxNdc >= m_addTileNdc.x() && mxNdc <= m_addTileNdc.x() + m_addTileNdc.width()
+        && myNdc >= m_addTileNdc.y() && myNdc <= m_addTileNdc.y() + m_addTileNdc.height();
+}
+
 VirtualDesktop *OverviewEffectV2::hitTestBar(const QPoint &globalPos) const
 {
     if (m_barTiles.empty() || !effects) {

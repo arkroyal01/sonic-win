@@ -123,6 +123,13 @@ private:
     /// drag-drop path (release on a bar tile moves the dragged
     /// window to that desktop).
     VirtualDesktop *hitTestBar(const QPoint &globalPos) const;
+
+    /// Hit-test a global mouse position against the Add-VD tile at
+    /// the trailing end of the bar. Returns true when the cursor is
+    /// inside the "+" tile's NDC rect. Used by both the hover-state
+    /// tracker (MouseMove) and the release path (creates a new
+    /// virtual desktop and switches to it).
+    bool hitTestAddTile(const QPoint &globalPos) const;
 #endif
 
     /// Screen rect of the dragged tile for a given cursor position.
@@ -190,7 +197,18 @@ private:
     /// the overview), and reset to empty when V2 is torn down.
     QString m_searchText;
 
+    /// Last known global mouse position. Updated on every MouseMove
+    /// (not just drag), so hover state on bar tiles (used to reveal
+    /// the per-tile delete affordance) has a fresh cursor reading
+    /// even when no button is pressed.
+    QPoint m_mouseGlobal;
+
 #if HAVE_VULKAN
+    /// Pixel size of the bar tile's per-tile "×" delete affordance.
+    /// Kept small so it doesn't dominate the bar tile; sized to a
+    /// fixed proportion of the bar tile's height.
+    static constexpr float kDeleteAffordanceFrac = 0.28f;
+
     /// Cached texture for the on-screen search bar. Re-rendered via
     /// QPainter → QImage → VulkanTexture::upload only when
     /// m_searchText changes (compared against m_searchRenderedText).
@@ -208,7 +226,25 @@ private:
     /// (Re)build m_searchTexture from m_searchText. Idempotent: skips
     /// the QPainter+upload if m_searchRenderedText already matches.
     void updateSearchTexture();
+
+    /// Persistent icon textures for the bar's Add ("+") and Delete
+    /// ("×") affordances. QPainter-rendered into transparent
+    /// QImages, uploaded once per V2 lifetime — the icons don't
+    /// change while the effect runs. Released in releaseAllSlots
+    /// alongside m_searchTexture so VRAM goes back to zero on
+    /// deactivate.
+    std::unique_ptr<VulkanTexture> m_addIconTexture;
+    std::unique_ptr<VulkanTexture> m_deleteIconTexture;
+    void ensureBarIconTextures();
 #endif
+
+    /// Whether the cursor is currently inside the rect of the Add-VD
+    /// tile and whether it's over a specific bar tile's delete
+    /// affordance. Used for hover affordance reveal + drop-target
+    /// styling; cleared in releaseAllSlots so a deactivate doesn't
+    /// leak state into the next activation.
+    bool m_addTileHover = false;
+    int m_deleteAffordanceHover = -1; // index into m_barTiles, or -1
 
     Window *m_dragCandidate = nullptr;
     QPoint m_dragPressGlobal;
@@ -375,6 +411,12 @@ private:
         bool isCurrent;
     };
     std::vector<BarTile> m_barTiles;
+    /// NDC rect of the "+" Add-Virtual-Desktop affordance at the
+    /// trailing end of the bar. Always positioned, regardless of
+    /// desktop count (so a user with one desktop can still create
+    /// more from inside V2). Empty rect when the bar isn't shown
+    /// at all (e.g. effect not initialised).
+    QRectF m_addTileNdc;
     void rebuildBarLayout(const QSize &fbSize);
     void renderDesktopBar(VkCommandBuffer cmd, const QSize &fbSize);
 
