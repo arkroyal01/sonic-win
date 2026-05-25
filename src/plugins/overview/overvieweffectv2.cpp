@@ -156,6 +156,30 @@ OverviewEffectV2::OverviewEffectV2()
         }
     });
 
+    // Touchpad + touchscreen gesture activation. V1 binds 4-finger
+    // touchpad swipe up and 3-finger touchscreen swipe up to
+    // activate the overview, with the opposite direction to
+    // deactivate. We mirror those bindings as binary triggers (no
+    // progress-driven slide-in yet — see m_swipeActivateAction
+    // doc). QActions live for the effect's lifetime; the gesture
+    // API holds them by pointer.
+    m_swipeActivateAction = new QAction(this);
+    connect(m_swipeActivateAction, &QAction::triggered, this, [this]() {
+        if (!m_visible) {
+            activate();
+        }
+    });
+    m_swipeDeactivateAction = new QAction(this);
+    connect(m_swipeDeactivateAction, &QAction::triggered, this, [this]() {
+        if (m_visible) {
+            deactivate();
+        }
+    });
+    effects->registerTouchpadSwipeShortcut(SwipeDirection::Up, 4, m_swipeActivateAction, {});
+    effects->registerTouchpadSwipeShortcut(SwipeDirection::Down, 4, m_swipeDeactivateAction, {});
+    effects->registerTouchscreenSwipeShortcut(SwipeDirection::Up, 3, m_swipeActivateAction, {});
+    effects->registerTouchscreenSwipeShortcut(SwipeDirection::Down, 3, m_swipeDeactivateAction, {});
+
     // Pick up the same config the V1 overview uses (group
     // "Effect-overview" in kwinrc) so users get their saved
     // electric-border / config-knob preferences when V2 takes over.

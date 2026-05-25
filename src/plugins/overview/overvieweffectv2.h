@@ -233,6 +233,18 @@ private:
     /// (default `Meta+W`) carries over without reconfiguration.
     QAction *m_toggleAction = nullptr;
 
+    /// Touchpad / touchscreen swipe-to-activate handlers. KWin's
+    /// gesture API takes QActions for "gesture completed in this
+    /// direction", so we keep one action per direction-half: swipe-
+    /// up commits activation, swipe-down commits deactivation. The
+    /// progress callback isn't wired here — that's the smooth
+    /// "follow the swipe" UX V1 has via EffectTogglableState, and
+    /// would need V2's animation state machine to accept an
+    /// externally-driven m_activationFactor mid-flight. Tracked as a
+    /// follow-up; binary trigger covers the basic gesture for now.
+    QAction *m_swipeActivateAction = nullptr;
+    QAction *m_swipeDeactivateAction = nullptr;
+
     /// Electric borders reserved for activation, read from the
     /// Effect-overview / BorderActivate config key. Matches V1's
     /// behaviour and config schema so users get the same hot-corner
