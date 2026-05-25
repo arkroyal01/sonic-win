@@ -144,6 +144,14 @@ bool VulkanTexture::createImage(const QSize &size, VkFormat format, VkImageUsage
 
     VmaAllocationCreateInfo allocInfo{};
     allocInfo.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    // Large one-off images (decoration FBOs, scratch render targets,
+    // anything ~1 MiB or above) go in their own VkDeviceMemory so
+    // freeing them returns the page to the OS instead of pinning a
+    // VMA pool block. Below the threshold the sub-allocation savings
+    // from sharing a pool block are still worth it.
+    if (size.width() * size.height() * 4 >= 1024 * 1024) {
+        allocInfo.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+    }
 
     VkResult result = vmaCreateImage(VulkanAllocator::allocator(), &imageInfo, &allocInfo,
                                      &m_image, &m_allocation, nullptr);
@@ -192,6 +200,11 @@ bool VulkanTexture::createImageMutable(const QSize &size, VkFormat primaryFormat
 
     VmaAllocationCreateInfo allocInfo{};
     allocInfo.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    // Same size threshold as createImage — large mutable render
+    // targets get dedicated allocations so they return to OS on free.
+    if (size.width() * size.height() * 4 >= 1024 * 1024) {
+        allocInfo.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+    }
 
     VkResult result = vmaCreateImage(VulkanAllocator::allocator(), &imageInfo, &allocInfo,
                                      &m_image, &m_allocation, nullptr);

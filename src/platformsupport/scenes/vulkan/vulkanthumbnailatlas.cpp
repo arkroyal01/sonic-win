@@ -321,6 +321,11 @@ bool VulkanThumbnailAtlas::allocateFallback(QSize size, Slot *outSlot)
 
     VmaAllocationCreateInfo allocInfo{};
     allocInfo.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    // Same rationale as the atlas image: fallback slots are large
+    // per-window VkImages allocated on overview activate and freed
+    // on deactivate. Dedicated allocation returns the device memory
+    // straight to the OS instead of pinning a VMA pool block.
+    allocInfo.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
 
     FallbackRecord rec{};
     if (vmaCreateImage(VulkanAllocator::allocator(), &info, &allocInfo,
