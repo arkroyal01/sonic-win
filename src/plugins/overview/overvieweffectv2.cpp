@@ -34,7 +34,7 @@
 // `glslc -O`. The packed SPIR-V tables live in their own header so
 // clang-format doesn't blow them up to one element per line every
 // time this file is touched.
-#include "shaders/overview_quad_spv.h"
+#include "shaders/overview_quad_spv.inc"
 
 namespace
 {
