@@ -494,6 +494,13 @@ void OverviewEffectV2::reserveSlotsForCurrentDesktop()
         if (m_ignoreMinimized && handle->isMinimized()) {
             continue;
         }
+        // Activity filter: only show windows on the current activity.
+        // No-op when activities aren't enabled (isOnCurrentActivity
+        // returns true for every window in that case). Mirrors V1's
+        // implicit WindowFilterModel.activity binding.
+        if (!ew->isOnCurrentActivity()) {
+            continue;
+        }
         const QSize size = handle->visibleGeometry().toAlignedRect().size();
         if (size.isEmpty()) {
             continue;
@@ -587,6 +594,9 @@ void OverviewEffectV2::reserveBarThumbs()
             continue;
         }
         if (m_ignoreMinimized && handle->isMinimized()) {
+            continue;
+        }
+        if (!ew->isOnCurrentActivity()) {
             continue;
         }
         auto slot = m_atlas->reserve(kBarThumbSize);
@@ -738,6 +748,12 @@ void OverviewEffectV2::rebuildTileLayout(const QSize &fbSize)
         // activation. Reservation site already filters at activate
         // time; this catches the live state change.
         if (m_ignoreMinimized && handle->isMinimized()) {
+            continue;
+        }
+        // Dynamic activity filter: same reasoning — a window moved
+        // off the current activity mid-overview drops out without
+        // needing a re-activate.
+        if (ew && !ew->isOnCurrentActivity()) {
             continue;
         }
         drawable.push_back({handle, it->second, 0, 0, 0, 0, 0, 0, 0, 0});
