@@ -8,12 +8,22 @@
 
 #include "effect/effect.h"
 
+#include "config-kwin.h"
+
 #include <QVariantAnimation>
+
+#if HAVE_VULKAN
+#include <vulkan/vulkan.h>
+#endif
 
 class QAction;
 
 namespace KWin
 {
+
+#if HAVE_VULKAN
+class VulkanContext;
+#endif
 
 /**
  * @brief Rewrite of OverviewEffect that doesn't use Qt Quick.
@@ -90,6 +100,23 @@ private:
     /// OverviewEffect's `Overview` action so the user's saved binding
     /// (default `Meta+W`) carries over without reconfiguration.
     QAction *m_toggleAction = nullptr;
+
+#if HAVE_VULKAN
+    /// Build the Vulkan pipeline used by `paintWindowTile()` to draw a
+    /// textured quad sampling from `VulkanThumbnailAtlas`. Compatible
+    /// with the renderer's post-FX render pass (LOAD_OP_DONT_CARE,
+    /// finalLayout PRESENT_SRC_KHR). Idempotent; safe to call
+    /// repeatedly. Returns false if the underlying device rejects any
+    /// of the calls.
+    bool ensureVulkanPipeline(VulkanContext *ctx, VkFormat colorFormat);
+    void destroyVulkanPipeline();
+
+    VulkanContext *m_vulkanCtx = nullptr;
+    VkFormat m_pipelineColorFormat = VK_FORMAT_UNDEFINED;
+    VkDescriptorSetLayout m_vkDescriptorSetLayout = VK_NULL_HANDLE;
+    VkPipelineLayout m_vkPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline m_vkPipeline = VK_NULL_HANDLE;
+#endif
 };
 
 } // namespace KWin
