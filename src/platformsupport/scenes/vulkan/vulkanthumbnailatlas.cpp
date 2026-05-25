@@ -40,23 +40,42 @@ uint32_t mipLevelsForSize(QSize size)
 }
 } // namespace
 
+namespace
+{
+// Per-VulkanContext atlas registry. Local-static accessor instead of a
+// namespace-level static so dropForContext() and get() share storage
+// without exposing the map type in the header. Initialization order
+// for the static map is therefore well-defined (on first call), but
+// destruction at program exit could fire after the Vulkan device is
+// gone — VulkanContext::~VulkanContext drains this via
+// dropForContext() to avoid that race.
+std::unordered_map<VulkanContext *, std::unique_ptr<VulkanThumbnailAtlas>> &atlasRegistry()
+{
+    static std::unordered_map<VulkanContext *, std::unique_ptr<VulkanThumbnailAtlas>> atlases;
+    return atlases;
+}
+} // namespace
+
 VulkanThumbnailAtlas *VulkanThumbnailAtlas::get(VulkanContext *ctx)
 {
     if (!ctx) {
         return nullptr;
     }
-    // Lifetime tied to the VulkanContext: stored as a per-context
-    // singleton. Lookup is keyed by the pointer so multiple contexts
-    // (e.g., post-reset) each get their own atlas. Cleanup happens via
-    // the destructor when VulkanContext shuts down and pumps deferred
-    // destructions.
-    static std::unordered_map<VulkanContext *, std::unique_ptr<VulkanThumbnailAtlas>> atlases;
+    auto &atlases = atlasRegistry();
     auto it = atlases.find(ctx);
     if (it == atlases.end()) {
         auto atlas = std::unique_ptr<VulkanThumbnailAtlas>(new VulkanThumbnailAtlas(ctx));
         it = atlases.emplace(ctx, std::move(atlas)).first;
     }
     return it->second.get();
+}
+
+void VulkanThumbnailAtlas::dropForContext(VulkanContext *ctx)
+{
+    if (!ctx) {
+        return;
+    }
+    atlasRegistry().erase(ctx);
 }
 
 VulkanThumbnailAtlas::VulkanThumbnailAtlas(VulkanContext *ctx)

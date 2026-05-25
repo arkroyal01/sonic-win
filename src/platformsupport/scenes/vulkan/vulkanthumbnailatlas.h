@@ -100,6 +100,16 @@ public:
      */
     static VulkanThumbnailAtlas *get(VulkanContext *ctx);
 
+    /**
+     * @brief Tear down the atlas instance bound to @p ctx. Must be
+     * called from VulkanContext's destructor *before* the device is
+     * cleaned up — otherwise the atlas's static-storage destructor runs
+     * during global teardown when the Vulkan device is already gone,
+     * and the queued vkDestroyImageView calls crash with "Invalid
+     * device" (VUID-vkDestroyImageView-device-parameter).
+     */
+    static void dropForContext(VulkanContext *ctx);
+
     /// Reserve a slot at least `requestedSize` (atlas adds padding
     /// internally). Returns an invalid Slot only if both the atlas and
     /// the fallback path failed to allocate.

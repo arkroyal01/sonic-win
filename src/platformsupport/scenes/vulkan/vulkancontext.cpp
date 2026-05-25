@@ -16,6 +16,7 @@
 #include "vulkanframebuffer.h"
 #include "vulkanpipelinemanager.h"
 #include "vulkantexture.h"
+#include "vulkanthumbnailatlas.h"
 #include "workspace.h"
 
 #include <QDebug>
@@ -121,6 +122,13 @@ VulkanContext::~VulkanContext()
     if (s_currentContext == this) {
         doneCurrent();
     }
+    // Drop the per-context atlas singleton while the device is still
+    // alive. Its destructor queues image views via this context;
+    // letting it run during global static teardown would call
+    // vkDestroyImageView with a freed VkDevice and crash with
+    // VUID-vkDestroyImageView-device-parameter. cleanup() below drains
+    // the queue and tears down the device.
+    VulkanThumbnailAtlas::dropForContext(this);
     cleanup();
 }
 
