@@ -158,6 +158,16 @@ bool VulkanThumbnailAtlas::createAtlasImage()
 
     VmaAllocationCreateInfo allocInfo{};
     allocInfo.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    // Give the atlas its own VkDeviceMemory rather than a slice of a
+    // shared VMA block. The atlas is ~85 MB (4096² RGBA8 + 5 mip
+    // levels) and is allocated/freed in lock-step with V2 overview
+    // activations; without dedicated allocation VMA keeps the
+    // backing block in its free pool after dropForContext, so the
+    // 85 MB never returns to the OS. With this flag the destroy
+    // path frees the entire VkDeviceMemory and the system reclaims
+    // it. Worth it for any one-off allocation whose lifetime is
+    // bound to a user gesture rather than a continuous workload.
+    allocInfo.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
     if (vmaCreateImage(VulkanAllocator::allocator(), &info, &allocInfo,
                        &m_atlasImage, &m_atlasAlloc, nullptr)
         != VK_SUCCESS) {
