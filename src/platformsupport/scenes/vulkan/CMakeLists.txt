@@ -100,6 +100,9 @@ target_sources(kwin PRIVATE
     # GPU-side render-time query (vkCmdWriteTimestamp). Enabled by
     # KWIN_VULKAN_GPU_RENDER_TIME=1.
     vulkangpurendertimequery.cpp
+
+    # Shared mipmapped atlas for the WindowThumbnail Vulkan pipeline.
+    vulkanthumbnailatlas.cpp
 )
 
 target_link_libraries(kwin PRIVATE
