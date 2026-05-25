@@ -2092,6 +2092,17 @@ void OverviewEffectV2::reconfigure(ReconfigureFlags flags)
     // when set. Per-tile filter applied in reserveSlotsForCurrentDesktop,
     // reserveBarThumbs and rebuildTileLayout. Default false matches V1.
     m_ignoreMinimized = group.readEntry(QStringLiteral("IgnoreMinimized"), false);
+
+    // V1 parity knob: animation duration in ms. V1 advertises a
+    // QProperty backed by kwincompositing's animationTime() (default
+    // 400). Read the same Effect-overview key; clamp to 0 (instant)
+    // so a user with reduced-motion preferences set via the kcm
+    // gets snappy activations without code changes. Setting on the
+    // running QVariantAnimation lets a reconfigure take effect on
+    // the next activate without waiting for a kwin restart.
+    const int duration = group.readEntry(QStringLiteral("AnimationDuration"), 400);
+    m_animationDuration = std::max(0, duration);
+    m_animation.setDuration(m_animationDuration);
 }
 
 bool OverviewEffectV2::borderActivated(ElectricBorder border)
