@@ -14,6 +14,7 @@
 
 #include <memory>
 #include <unordered_map>
+#include <vector>
 
 #if HAVE_VULKAN
 #include "platformsupport/scenes/vulkan/vulkancontext.h" // for VulkanSubmitHandle
@@ -171,6 +172,28 @@ private:
     /// process-wide singleton owned by `VulkanThumbnailAtlas::get(ctx)`.
     VulkanThumbnailAtlas *m_atlas = nullptr;
     std::unordered_map<Window *, VulkanThumbnailAtlas::Slot> m_windowSlots;
+
+    /// Cached tile layout: one entry per drawable tile, in stacking
+    /// order at activate-time (oldest below, freshest on top). The
+    /// post-pass and the hit-test both iterate this vector so they
+    /// agree on grid position. `realNdcRect` is the window's true
+    /// on-screen rect in NDC (slide-in start); `gridNdcRect` is its
+    /// grid cell (slide-in end). Cleared in releaseAllSlots().
+    struct TileLayout
+    {
+        Window *handle;
+        VulkanThumbnailAtlas::Slot slot;
+        float realNdcX;
+        float realNdcY;
+        float realNdcW;
+        float realNdcH;
+        float gridNdcX;
+        float gridNdcY;
+        float gridNdcW;
+        float gridNdcH;
+    };
+    std::vector<TileLayout> m_tileLayout;
+    void rebuildTileLayout(const QSize &fbSize);
 
     /// Render pass + framebuffer used by `renderWindowsToAtlas()`. The
     /// framebuffer wraps the atlas's mip-0 view; viewport + scissor at

@@ -481,9 +481,82 @@ void OverviewEffectV2::releaseAllSlots()
         }
     }
     m_windowSlots.clear();
+    m_tileLayout.clear();
     m_atlasFramebuffer.reset();
     m_atlasRenderPass.reset();
     m_atlas = nullptr;
+}
+
+void OverviewEffectV2::rebuildTileLayout(const QSize &fbSize)
+{
+    m_tileLayout.clear();
+    if (m_windowSlots.empty() || !effects) {
+        return;
+    }
+    // Walk stacking order (oldest below, freshest on top) so the grid
+    // mirrors what the user expects: most-recently-focused tile in a
+    // consistent position across activations. unordered_map iteration
+    // would be deterministic-within-a-session but is implementation-
+    // defined; rebuilding from effects->stackingOrder gives a stable,
+    // documented order that both the post-pass and the hit-test
+    // consume.
+    std::vector<TileLayout> drawable;
+    drawable.reserve(m_windowSlots.size());
+    for (EffectWindow *ew : effects->stackingOrder()) {
+        if (!ew) {
+            continue;
+        }
+        Window *handle = ew->window();
+        auto it = m_windowSlots.find(handle);
+        if (it == m_windowSlots.end()) {
+            continue;
+        }
+        if (it->second.isFallback || !it->second.hasContent) {
+            continue;
+        }
+        drawable.push_back({handle, it->second, 0, 0, 0, 0, 0, 0, 0, 0});
+    }
+    const int n = drawable.size();
+    if (n == 0) {
+        return;
+    }
+    const int cols = std::max(1, int(std::ceil(std::sqrt(double(n)))));
+    const int rows = (n + cols - 1) / cols;
+    const float cellNdcW = 1.6f / cols;
+    const float cellNdcH = 1.6f / rows;
+    constexpr float kTilePad = 0.9f;
+    const float maxNdcW = cellNdcW * kTilePad;
+    const float maxNdcH = cellNdcH * kTilePad;
+    const float screenW = std::max(1.0f, float(fbSize.width()));
+    const float screenH = std::max(1.0f, float(fbSize.height()));
+    for (int i = 0; i < n; ++i) {
+        TileLayout &t = drawable[i];
+        const QRectF realGeom = t.handle->visibleGeometry();
+        t.realNdcX = (float(realGeom.x()) / screenW) * 2.0f - 1.0f;
+        t.realNdcY = (float(realGeom.y()) / screenH) * 2.0f - 1.0f;
+        t.realNdcW = (float(realGeom.width()) / screenW) * 2.0f;
+        t.realNdcH = (float(realGeom.height()) / screenH) * 2.0f;
+        // Aspect-preserving fit: realNdcW/realNdcH already encodes the
+        // window's pixel aspect (the X/Y NDC mapping has different
+        // scales — /screenW vs /screenH — so the ratio carries it).
+        // Pick the largest uniform scale that fits the cell, then
+        // centre the tile inside its cell so smaller windows don't
+        // stretch to fill.
+        const float scaleX = maxNdcW / std::max(1e-6f, t.realNdcW);
+        const float scaleY = maxNdcH / std::max(1e-6f, t.realNdcH);
+        const float scale = std::min(scaleX, scaleY);
+        const float tileNdcW = t.realNdcW * scale;
+        const float tileNdcH = t.realNdcH * scale;
+        const int col = i % cols;
+        const int row = i / cols;
+        const float cellOriginX = -0.8f + col * cellNdcW;
+        const float cellOriginY = -0.8f + row * cellNdcH;
+        t.gridNdcX = cellOriginX + (cellNdcW - tileNdcW) * 0.5f;
+        t.gridNdcY = cellOriginY + (cellNdcH - tileNdcH) * 0.5f;
+        t.gridNdcW = tileNdcW;
+        t.gridNdcH = tileNdcH;
+    }
+    m_tileLayout = std::move(drawable);
 }
 
 void OverviewEffectV2::renderWindowsToAtlas()
@@ -765,69 +838,34 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
     VkRect2D scissor{{0, 0}, {uint32_t(fbSize.width()), uint32_t(fbSize.height())}};
     vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-    // Layout: each tile lerps from its real on-screen rect (NDC) to a
-    // grid cell, driven by m_activationFactor. At factor=0 the tile
-    // sits exactly where its window is on screen; at factor=1 it sits
-    // in the grid. The slide-in animation is this lerp plus the
-    // opacity ramp from the existing fade. Grid occupies 80% of the
-    // screen, centred. Single-output X11 assumption: fbSize is the
-    // output size in pixels and Window::visibleGeometry() is in the
-    // same screen-pixel space.
-    int drawable = 0;
-    for (const auto &[_handle, slot] : m_windowSlots) {
-        if (!slot.isFallback && slot.hasContent) {
-            ++drawable;
-        }
-    }
-    if (drawable == 0) {
+    // Refresh the cached layout each frame: window geometries can shift
+    // (e.g. on resize during overview), and the hit-test must consume
+    // the same numbers we draw with — so they share `m_tileLayout`.
+    // Each tile lerps from its real on-screen rect (NDC) to a grid
+    // cell, driven by m_activationFactor; the cache holds both
+    // endpoints in aspect-preserving form.
+    rebuildTileLayout(fbSize);
+    if (m_tileLayout.empty()) {
         return;
     }
-    const int cols = std::max(1, int(std::ceil(std::sqrt(double(drawable)))));
-    const int rows = (drawable + cols - 1) / cols;
-    const float cellW = 1.6f / cols;
-    const float cellH = 1.6f / rows;
-    constexpr float kTilePad = 0.9f;
     const float atlasSize = float(VulkanThumbnailAtlas::kAtlasSize);
-    const float screenW = std::max(1.0f, float(fbSize.width()));
-    const float screenH = std::max(1.0f, float(fbSize.height()));
     const float factor = float(std::clamp(m_activationFactor, 0.0, 1.0));
 
-    int idx = 0;
-    for (const auto &[handle, slot] : m_windowSlots) {
-        if (slot.isFallback || !slot.hasContent || !handle) {
-            continue;
-        }
-        const QRectF realGeom = handle->visibleGeometry();
-        // Convert screen-pixel rect to NDC. Vulkan NDC: x in [-1, 1]
-        // left-to-right, y in [-1, 1] top-to-bottom (Y-down with our
-        // positive viewport height).
-        const float realX = (float(realGeom.x()) / screenW) * 2.0f - 1.0f;
-        const float realY = (float(realGeom.y()) / screenH) * 2.0f - 1.0f;
-        const float realW = (float(realGeom.width()) / screenW) * 2.0f;
-        const float realH = (float(realGeom.height()) / screenH) * 2.0f;
-
-        const int col = idx % cols;
-        const int row = idx / cols;
-        const float gridX = -0.8f + col * cellW;
-        const float gridY = -0.8f + row * cellH;
-        const float gridW = cellW * kTilePad;
-        const float gridH = cellH * kTilePad;
-
+    for (const TileLayout &t : m_tileLayout) {
         OverviewQuadPushConstants pc{};
-        pc.quadRectNdc[0] = realX + (gridX - realX) * factor;
-        pc.quadRectNdc[1] = realY + (gridY - realY) * factor;
-        pc.quadRectNdc[2] = realW + (gridW - realW) * factor;
-        pc.quadRectNdc[3] = realH + (gridH - realH) * factor;
-        pc.atlasSlotUv[0] = float(slot.rect.x()) / atlasSize;
-        pc.atlasSlotUv[1] = float(slot.rect.y()) / atlasSize;
-        pc.atlasSlotUv[2] = float(slot.rect.width()) / atlasSize;
-        pc.atlasSlotUv[3] = float(slot.rect.height()) / atlasSize;
+        pc.quadRectNdc[0] = t.realNdcX + (t.gridNdcX - t.realNdcX) * factor;
+        pc.quadRectNdc[1] = t.realNdcY + (t.gridNdcY - t.realNdcY) * factor;
+        pc.quadRectNdc[2] = t.realNdcW + (t.gridNdcW - t.realNdcW) * factor;
+        pc.quadRectNdc[3] = t.realNdcH + (t.gridNdcH - t.realNdcH) * factor;
+        pc.atlasSlotUv[0] = float(t.slot.rect.x()) / atlasSize;
+        pc.atlasSlotUv[1] = float(t.slot.rect.y()) / atlasSize;
+        pc.atlasSlotUv[2] = float(t.slot.rect.width()) / atlasSize;
+        pc.atlasSlotUv[3] = float(t.slot.rect.height()) / atlasSize;
         pc.opacity = factor;
 
         vkCmdPushConstants(cmd, m_vkPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
                            0, sizeof(pc), &pc);
         vkCmdDraw(cmd, 4, 1, 0, 0);
-        ++idx;
     }
 }
 #endif // HAVE_VULKAN
@@ -1010,58 +1048,26 @@ void OverviewEffectV2::windowInputMouseEvent(QEvent *event)
 Window *OverviewEffectV2::hitTestTile(const QPoint &globalPos) const
 {
 #if HAVE_VULKAN
-    if (m_windowSlots.empty() || !effects) {
+    if (m_tileLayout.empty() || !effects) {
         return nullptr;
     }
     const QRect screen = effects->virtualScreenGeometry();
     if (screen.isEmpty() || !screen.contains(globalPos)) {
         return nullptr;
     }
-    // Recompute the same grid the post-pass draws when factor==1: same
-    // column count, same cell sizing, same kTilePad. Iterate in the
-    // map's insertion-order-equivalent (unordered_map doesn't
-    // guarantee, but consistent within a session) and pick the first
-    // tile whose grid cell contains the click. Future polish: keep the
-    // (Window* → grid cell) layout cached alongside m_windowSlots so
-    // both the hit-test and the draw read the same map.
-    int drawable = 0;
-    for (const auto &[_handle, slot] : m_windowSlots) {
-        if (!slot.isFallback && slot.hasContent) {
-            ++drawable;
-        }
-    }
-    if (drawable == 0) {
-        return nullptr;
-    }
-    const int cols = std::max(1, int(std::ceil(std::sqrt(double(drawable)))));
-    const float cellW = 1.6f / cols;
-    const int rows = (drawable + cols - 1) / cols;
-    const float cellH = 1.6f / rows;
-    constexpr float kTilePad = 0.9f;
+    // Read the cached layout the post-pass built this frame — same grid
+    // cells, same ordering, no recomputation. virtualScreenGeometry is
+    // in scene coordinates; convert the click to NDC relative to its
+    // top-left.
     const float screenW = std::max(1.0f, float(screen.width()));
     const float screenH = std::max(1.0f, float(screen.height()));
-
-    // Mouse pos → NDC. virtualScreenGeometry is in scene coordinates;
-    // hit position relative to its top-left.
     const float mxNdc = (float(globalPos.x() - screen.x()) / screenW) * 2.0f - 1.0f;
     const float myNdc = (float(globalPos.y() - screen.y()) / screenH) * 2.0f - 1.0f;
-
-    int idx = 0;
-    for (const auto &[handle, slot] : m_windowSlots) {
-        if (slot.isFallback || !slot.hasContent || !handle) {
-            continue;
+    for (const TileLayout &t : m_tileLayout) {
+        if (mxNdc >= t.gridNdcX && mxNdc <= t.gridNdcX + t.gridNdcW
+            && myNdc >= t.gridNdcY && myNdc <= t.gridNdcY + t.gridNdcH) {
+            return t.handle;
         }
-        const int col = idx % cols;
-        const int row = idx / cols;
-        const float gridX = -0.8f + col * cellW;
-        const float gridY = -0.8f + row * cellH;
-        const float gridW = cellW * kTilePad;
-        const float gridH = cellH * kTilePad;
-        if (mxNdc >= gridX && mxNdc <= gridX + gridW
-            && myNdc >= gridY && myNdc <= gridY + gridH) {
-            return handle;
-        }
-        ++idx;
     }
 #endif
     Q_UNUSED(globalPos)
