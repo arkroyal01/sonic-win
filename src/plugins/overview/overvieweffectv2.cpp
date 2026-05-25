@@ -613,6 +613,7 @@ void OverviewEffectV2::releaseAllSlots()
     m_barTiles.clear();
     m_dragCandidate = nullptr;
     m_dragActive = false;
+    m_dragLastDamage = QRect();
     m_fallbackFramebuffers.clear();
     m_atlasFramebuffer.reset();
     m_atlasRenderPass.reset();
@@ -1862,15 +1863,33 @@ void OverviewEffectV2::windowInputMouseEvent(QEvent *event)
     const QPoint pos = mouseEvent->globalPosition().toPoint();
 
     if (event->type() == QEvent::MouseMove) {
+        const QPoint prev = m_dragCurrentGlobal;
         m_dragCurrentGlobal = pos;
         if (m_dragCandidate && !m_dragActive) {
             const QPoint delta = pos - m_dragPressGlobal;
             if (delta.manhattanLength() >= kDragThresholdPx) {
                 m_dragActive = true;
+                // First active frame: the settled grid rect becomes
+                // the "last damage" we union with so the tile's home
+                // cell gets repainted (no longer occupied by the
+                // tile) as the tile moves off it.
+                m_dragLastDamage = draggedTileScreenRect(m_dragPressGlobal);
             }
         }
         if (m_dragActive) {
-            effects->addRepaintFull();
+            // Damage = where the tile *was* last frame ∪ where it is
+            // *this* frame. Outside that region the partial-repaint
+            // backend preserves the previous frame, so we don't waste
+            // a fullscreen recomposite on a cursor wiggle.
+            // kwin's compositor coalesces multiple addRepaint calls
+            // within a frame and caps presents at vblank, so no extra
+            // throttling needed here.
+            const QRect newRect = draggedTileScreenRect(pos);
+            if (newRect.isValid() || m_dragLastDamage.isValid()) {
+                effects->addRepaint(QRegion(m_dragLastDamage).united(QRegion(newRect)));
+                m_dragLastDamage = newRect;
+            }
+            Q_UNUSED(prev);
         }
         return;
     }
@@ -1933,7 +1952,14 @@ void OverviewEffectV2::windowInputMouseEvent(QEvent *event)
             }
 #endif
             // Drop on empty space / source tile / grid: cancel.
-            effects->addRepaintFull();
+            // Damage = the strip the tile last covered ∪ its settled
+            // grid position so the snap-back is visible in one frame
+            // without a fullscreen recomposite.
+            const QRect settledRect = draggedTileScreenRect(m_dragPressGlobal);
+            if (m_dragLastDamage.isValid() || settledRect.isValid()) {
+                effects->addRepaint(QRegion(m_dragLastDamage).united(QRegion(settledRect)));
+            }
+            m_dragLastDamage = QRect();
             return;
         }
 
@@ -1986,6 +2012,47 @@ VirtualDesktop *OverviewEffectV2::hitTestBar(const QPoint &globalPos) const
     return nullptr;
 }
 #endif
+
+QRect OverviewEffectV2::draggedTileScreenRect(const QPoint &cursor) const
+{
+#if HAVE_VULKAN
+    if (!m_dragCandidate || !effects) {
+        return {};
+    }
+    const TileLayout *src = nullptr;
+    for (const TileLayout &t : m_tileLayout) {
+        if (t.handle == m_dragCandidate) {
+            src = &t;
+            break;
+        }
+    }
+    if (!src) {
+        return {};
+    }
+    const QRect screen = effects->virtualScreenGeometry();
+    if (screen.isEmpty()) {
+        return {};
+    }
+    const float screenW = float(screen.width());
+    const float screenH = float(screen.height());
+    // Settled grid screen rect, computed from the tile's stored NDC
+    // dims. (gridNdc.x + 1) * screenW / 2 maps NDC X back into the
+    // post-pass pixel space.
+    const float gridXpx = (src->gridNdcX + 1.0f) * 0.5f * screenW + screen.x();
+    const float gridYpx = (src->gridNdcY + 1.0f) * 0.5f * screenH + screen.y();
+    const float gridWpx = src->gridNdcW * 0.5f * screenW;
+    const float gridHpx = src->gridNdcH * 0.5f * screenH;
+    const QPoint delta = cursor - m_dragPressGlobal;
+    QRect rect(int(std::floor(gridXpx + delta.x())) - kDragDamagePadPx,
+               int(std::floor(gridYpx + delta.y())) - kDragDamagePadPx,
+               int(std::ceil(gridWpx)) + 2 * kDragDamagePadPx,
+               int(std::ceil(gridHpx)) + 2 * kDragDamagePadPx);
+    return rect.intersected(screen);
+#else
+    Q_UNUSED(cursor)
+    return {};
+#endif
+}
 
 Window *OverviewEffectV2::hitTestTile(const QPoint &globalPos) const
 {

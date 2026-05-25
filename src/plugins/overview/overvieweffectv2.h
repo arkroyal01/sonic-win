@@ -123,6 +123,15 @@ private:
     VirtualDesktop *hitTestBar(const QPoint &globalPos) const;
 #endif
 
+    /// Screen rect of the dragged tile for a given cursor position.
+    /// Used by the damage-tracking path in the mouse handler so we
+    /// can invalidate just the strip the tile sweeps across rather
+    /// than the whole screen. Returns an empty rect if there's no
+    /// drag candidate or its TileLayout isn't in m_tileLayout.
+    /// @p cursor is the global mouse position to project to; the
+    /// settled grid rect is computed from m_tileLayout[…].gridNdc.
+    QRect draggedTileScreenRect(const QPoint &cursor) const;
+
     /// State machine for the slide-in/out animation. Drives
     /// `m_activationFactor` (0 = hidden, 1 = fully shown) over
     /// `m_animationDuration` ms. We use QVariantAnimation rather than
@@ -175,10 +184,19 @@ private:
     QPoint m_dragPressGlobal;
     QPoint m_dragCurrentGlobal;
     bool m_dragActive = false;
+    /// Last frame's dragged-tile screen rect. Damage tracking uses
+    /// (last ∪ new) so a mouse move only invalidates the strip the
+    /// tile sweeps across, not the whole screen. Empty when no
+    /// previous frame applied a drag offset.
+    QRect m_dragLastDamage;
     /// Pixels the cursor must move from m_dragPressGlobal before a
     /// press becomes a drag. Below this a release reverts to a
     /// regular click (activate window + deactivate overview).
     static constexpr int kDragThresholdPx = 6;
+    /// Margin around the dragged tile's screen rect that gets added
+    /// to the damage region — covers mip filter footprint + the
+    /// focus-wash overlay so the trailing edge doesn't leave smear.
+    static constexpr int kDragDamagePadPx = 8;
 
     /// Global toggle shortcut. Same object name as the existing
     /// OverviewEffect's `Overview` action so the user's saved binding
