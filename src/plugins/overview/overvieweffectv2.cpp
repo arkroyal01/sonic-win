@@ -607,12 +607,17 @@ void OverviewEffectV2::rebuildTileLayout(const QSize &fbSize)
     }
     m_tileLayout = std::move(drawable);
 
-    // Clamp focus to the new tile count so layout changes (window
+    // Clamp grid focus to the new tile count so layout changes (window
     // closed during overview, window appeared) don't leave a stale
     // focus index pointing at nothing.
-    const int newN = int(m_tileLayout.size());
-    if (m_focusedTileIndex >= newN) {
-        m_focusedTileIndex = newN == 0 ? -1 : newN - 1;
+    if (m_focusZone == FocusZone::Grid) {
+        const int newN = int(m_tileLayout.size());
+        if (newN == 0) {
+            m_focusZone = FocusZone::None;
+            m_focusedIndex = -1;
+        } else if (m_focusedIndex >= newN) {
+            m_focusedIndex = newN - 1;
+        }
     }
 }
 
@@ -1111,19 +1116,16 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
         pushAndDraw(t, 0.0f, 0.0f, 1.0f, 1.0f);
     }
 
-    // Pass 2.5: focus highlight. Overlay a translucent white wash on
-    // the keyboard-focused tile so the user can see what Enter will
-    // activate. Same pipeline, tintRgba.a = 1 → solid tint; pc.opacity
-    // controls how strong the wash is. Drawn on top of the tile, so it
-    // brightens whatever pixels are already there (premultiplied blend
-    // with ONE_MINUS_SRC_ALPHA against the tile).
-    if (m_focusedTileIndex >= 0 && m_focusedTileIndex < int(m_tileLayout.size())) {
-        const TileLayout &t = m_tileLayout[m_focusedTileIndex];
+    // Pass 2.5: focus highlight on whichever zone owns keyboard
+    // focus. Overlay a translucent white wash so the user can see what
+    // Enter would activate. Same pipeline, tintRgba.a = 1 → solid
+    // tint; pc.opacity controls the wash strength.
+    auto pushFocusWash = [&](float ndcX, float ndcY, float ndcW, float ndcH) {
         OverviewQuadPushConstants pc{};
-        pc.quadRectNdc[0] = t.realNdcX + (t.gridNdcX - t.realNdcX) * factor;
-        pc.quadRectNdc[1] = t.realNdcY + (t.gridNdcY - t.realNdcY) * factor;
-        pc.quadRectNdc[2] = t.realNdcW + (t.gridNdcW - t.realNdcW) * factor;
-        pc.quadRectNdc[3] = t.realNdcH + (t.gridNdcH - t.realNdcH) * factor;
+        pc.quadRectNdc[0] = ndcX;
+        pc.quadRectNdc[1] = ndcY;
+        pc.quadRectNdc[2] = ndcW;
+        pc.quadRectNdc[3] = ndcH;
         pc.atlasSlotUv[0] = 0.0f;
         pc.atlasSlotUv[1] = 0.0f;
         pc.atlasSlotUv[2] = 1.0f;
@@ -1131,13 +1133,23 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
         pc.tintRgba[0] = 1.0f;
         pc.tintRgba[1] = 1.0f;
         pc.tintRgba[2] = 1.0f;
-        pc.tintRgba[3] = 1.0f; // tint mix weight: solid colour, no texture
-        pc.opacity = 0.25f * factor; // ~25% wash at settled
+        pc.tintRgba[3] = 1.0f;
+        pc.opacity = 0.25f * factor;
         vkCmdPushConstants(cmd, m_vkPipelineLayout,
                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                            0, sizeof(pc), &pc);
         vkCmdDraw(cmd, 4, 1, 0, 0);
+    };
+    if (m_focusZone == FocusZone::Grid && m_focusedIndex >= 0
+        && m_focusedIndex < int(m_tileLayout.size())) {
+        const TileLayout &t = m_tileLayout[m_focusedIndex];
+        pushFocusWash(t.realNdcX + (t.gridNdcX - t.realNdcX) * factor,
+                      t.realNdcY + (t.gridNdcY - t.realNdcY) * factor,
+                      t.realNdcW + (t.gridNdcW - t.realNdcW) * factor,
+                      t.realNdcH + (t.gridNdcH - t.realNdcH) * factor);
     }
+    // Bar-tile focus wash drawn after the bar pass below so it lands
+    // on top of the bar tile's own colour.
 
     // Pass 3: desktop bar. Solid-colour tiles (tintRgba.a == 1 in the
     // shader). The pipeline still requires a valid descriptor binding
@@ -1167,6 +1179,13 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
         if (anyView != VK_NULL_HANDLE) {
             pushView(anyView);
             renderDesktopBar(cmd);
+            // Bar-tile focus wash, drawn after the bar tiles so it
+            // brightens the focused desktop's tile in place.
+            if (m_focusZone == FocusZone::Bar && m_focusedIndex >= 0
+                && m_focusedIndex < int(m_barTiles.size())) {
+                const BarTile &b = m_barTiles[m_focusedIndex];
+                pushFocusWash(b.ndcX, b.ndcY, b.ndcW, b.ndcH);
+            }
         }
     }
 }
@@ -1178,7 +1197,8 @@ void OverviewEffectV2::activate()
         return;
     }
     m_visible = true;
-    m_focusedTileIndex = -1; // start unfocused; first arrow/Tab picks tile 0
+    m_focusZone = FocusZone::None; // first arrow/Tab picks tile 0 in grid
+    m_focusedIndex = -1;
     // Mouse interception is always on (bar clicks, tile clicks,
     // click-away dismiss). Keyboard grab is conditional — see below.
     effects->startMouseInterception(this, Qt::ArrowCursor);
@@ -1370,70 +1390,146 @@ void OverviewEffectV2::grabbedKeyboardEvent(QKeyEvent *event)
         return;
     }
 #if HAVE_VULKAN
-    // Tile navigation. The grid columns come from the same heuristic
-    // rebuildTileLayout uses; recomputing here keeps the nav in sync
-    // without needing a separate cache. Enter/Return activates the
-    // focused tile and dismisses, just like a click.
-    const int n = int(m_tileLayout.size());
-    if (n > 0) {
-        const int cols = std::max(1, int(std::ceil(std::sqrt(double(n)))));
-        const int rows = (n + cols - 1) / cols;
-        const int key = event->key();
+    // Navigation across the grid + bar (V1's "leak" pattern from
+    // qml/main.qml:201-240). Up at the top grid row jumps focus into
+    // the desktop bar; Down from the bar drops back into the grid's
+    // top row at the matching column. Enter activates the focused
+    // window tile or switches to the focused desktop, mirroring a
+    // click on the same element.
+    const int gridN = int(m_tileLayout.size());
+    const int barN = int(m_barTiles.size());
+    const int gridCols = gridN > 0 ? std::max(1, int(std::ceil(std::sqrt(double(gridN))))) : 1;
+    const int key = event->key();
+    if (gridN > 0 || barN > 0) {
+        // Pick a sensible default zone on the first navigation press —
+        // grid if there's anything there, otherwise the bar.
+        auto seedFocus = [&]() {
+            if (m_focusZone != FocusZone::None) {
+                return;
+            }
+            if (gridN > 0) {
+                m_focusZone = FocusZone::Grid;
+                m_focusedIndex = 0;
+            } else if (barN > 0) {
+                m_focusZone = FocusZone::Bar;
+                m_focusedIndex = 0;
+            }
+        };
+        auto repaint = [&]() {
+            effects->addRepaintFull();
+        };
+
         if (key == Qt::Key_Return || key == Qt::Key_Enter) {
-            if (m_focusedTileIndex >= 0 && m_focusedTileIndex < n) {
-                Window *handle = m_tileLayout[m_focusedTileIndex].handle;
+            if (m_focusZone == FocusZone::Grid && m_focusedIndex >= 0
+                && m_focusedIndex < gridN) {
+                Window *handle = m_tileLayout[m_focusedIndex].handle;
                 if (handle && handle->effectWindow()) {
                     effects->activateWindow(handle->effectWindow());
                 }
                 deactivate();
-            }
-            return;
-        }
-        auto moveFocus = [&](int newIndex) {
-            // Clamp into [0, n) with wraparound on Tab so the user can
-            // cycle through tiles without thinking about the edges.
-            // Arrow keys deliberately don't wrap (matches most grid
-            // navigation conventions).
-            if (n == 0) {
-                m_focusedTileIndex = -1;
                 return;
             }
-            m_focusedTileIndex = std::clamp(newIndex, 0, n - 1);
-            effects->addRepaintFull();
-        };
+            if (m_focusZone == FocusZone::Bar && m_focusedIndex >= 0
+                && m_focusedIndex < barN) {
+                // Same teardown path as a bar-tile click — snap V2
+                // down synchronously, then switch. Animated slide-out
+                // races with setCurrentDesktop's OSD / fadedesktop /
+                // KGlobalAccel state.
+                const BarTile &b = m_barTiles[m_focusedIndex];
+                VirtualDesktop *target = (b.desktop && b.desktop != effects->currentDesktop())
+                    ? b.desktop
+                    : nullptr;
+                teardownImmediate();
+                if (target) {
+                    effects->setCurrentDesktop(target);
+                }
+                return;
+            }
+        }
+
         const bool shiftTab = (key == Qt::Key_Backtab)
             || (key == Qt::Key_Tab && (event->modifiers() & Qt::ShiftModifier));
         if (key == Qt::Key_Tab && !shiftTab) {
-            const int next = (m_focusedTileIndex < 0) ? 0 : (m_focusedTileIndex + 1) % n;
-            moveFocus(next);
+            seedFocus();
+            const int n = (m_focusZone == FocusZone::Bar) ? barN : gridN;
+            if (n > 0) {
+                m_focusedIndex = (m_focusedIndex + 1) % n;
+                repaint();
+            }
             return;
         }
         if (shiftTab) {
-            const int prev = (m_focusedTileIndex <= 0) ? (n - 1) : (m_focusedTileIndex - 1);
-            moveFocus(prev);
+            seedFocus();
+            const int n = (m_focusZone == FocusZone::Bar) ? barN : gridN;
+            if (n > 0) {
+                m_focusedIndex = (m_focusedIndex <= 0) ? (n - 1) : (m_focusedIndex - 1);
+                repaint();
+            }
             return;
         }
+
         if (key == Qt::Key_Right) {
-            moveFocus((m_focusedTileIndex < 0) ? 0 : m_focusedTileIndex + 1);
+            seedFocus();
+            const int n = (m_focusZone == FocusZone::Bar) ? barN : gridN;
+            if (n > 0 && m_focusedIndex + 1 < n) {
+                m_focusedIndex++;
+                repaint();
+            }
             return;
         }
         if (key == Qt::Key_Left) {
-            moveFocus((m_focusedTileIndex < 0) ? 0 : m_focusedTileIndex - 1);
+            seedFocus();
+            if (m_focusedIndex > 0) {
+                m_focusedIndex--;
+                repaint();
+            }
             return;
         }
         if (key == Qt::Key_Down) {
-            const int base = (m_focusedTileIndex < 0) ? 0 : m_focusedTileIndex;
-            const int candidate = base + cols;
-            moveFocus(candidate < n ? candidate : base);
+            if (m_focusZone == FocusZone::Bar) {
+                if (gridN > 0) {
+                    // Drop into the top grid row at the matching
+                    // column. Bar tiles don't map 1:1 to grid columns,
+                    // so just take the column ratio.
+                    const int col = (barN > 1)
+                        ? int(double(m_focusedIndex) * gridCols / barN)
+                        : 0;
+                    m_focusZone = FocusZone::Grid;
+                    m_focusedIndex = std::clamp(col, 0, gridN - 1);
+                    repaint();
+                }
+                return;
+            }
+            seedFocus();
+            if (m_focusZone == FocusZone::Grid && gridN > 0) {
+                const int candidate = m_focusedIndex + gridCols;
+                if (candidate < gridN) {
+                    m_focusedIndex = candidate;
+                    repaint();
+                }
+            }
             return;
         }
         if (key == Qt::Key_Up) {
-            const int base = (m_focusedTileIndex < 0) ? 0 : m_focusedTileIndex;
-            const int candidate = base - cols;
-            moveFocus(candidate >= 0 ? candidate : base);
+            if (m_focusZone == FocusZone::Grid && m_focusedIndex < gridCols) {
+                // Top grid row → bar. Map grid column to bar tile.
+                if (barN > 0) {
+                    const int barIdx = (gridCols > 1)
+                        ? int(double(m_focusedIndex) * barN / gridCols)
+                        : 0;
+                    m_focusZone = FocusZone::Bar;
+                    m_focusedIndex = std::clamp(barIdx, 0, barN - 1);
+                    repaint();
+                }
+                return;
+            }
+            seedFocus();
+            if (m_focusZone == FocusZone::Grid && m_focusedIndex >= gridCols) {
+                m_focusedIndex -= gridCols;
+                repaint();
+            }
             return;
         }
-        Q_UNUSED(rows);
     }
 #endif
     // The compositor's keyboard grab swallows key presses before

@@ -133,12 +133,22 @@ private:
     /// focused window).
     bool m_grabbedKeyboard = false;
 
-    /// Index into m_tileLayout for the keyboard-focused tile, or -1
-    /// when no tile has focus. Tab/arrows move focus; Enter activates
-    /// the focused tile's window. The post-pass renders a brighter
-    /// tint on the focused tile so the user can see what Enter would
-    /// activate.
-    int m_focusedTileIndex = -1;
+    /// Where the keyboard focus currently lives — the window grid,
+    /// the desktop bar, or nowhere yet (first activation, or first
+    /// nav key not yet pressed). Arrow keys move focus across zones
+    /// (Up from top grid row → bar; Down from bar → top grid row),
+    /// mirroring the V1 overview's "leak" behaviour.
+    enum class FocusZone {
+        None,
+        Grid,
+        Bar,
+    };
+    FocusZone m_focusZone = FocusZone::None;
+
+    /// Index into the active zone's container. When FocusZone::Grid,
+    /// indexes m_tileLayout. When FocusZone::Bar, indexes m_barTiles.
+    /// -1 when m_focusZone == None.
+    int m_focusedIndex = -1;
 
     /// Global toggle shortcut. Same object name as the existing
     /// OverviewEffect's `Overview` action so the user's saved binding
