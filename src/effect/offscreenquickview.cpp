@@ -23,6 +23,12 @@
 #include <QQuickView>
 #include <QStyleHints>
 
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <mutex>
+#include <optional>
+
 #include <QOffscreenSurface>
 #include <QOpenGLContext>
 #include <QOpenGLFramebufferObject>
@@ -42,6 +48,57 @@
 
 namespace KWin
 {
+
+// OffscreenQuickView stage breakdown (KWIN_FRAME_BREAKDOWN_DETAIL=1). The
+// QML scene-graph update is the suspected hot path for QuickSceneEffect
+// stutter (Overview, Window-View, etc.); split it into polishItems,
+// beginFrame, sync, render, endFrame to attribute the cost. Threshold
+// shared with the per-effect breakdown so the sidecar stays spike-only.
+static const bool s_offscreenStageBreakdown =
+    qEnvironmentVariableIntValue("KWIN_FRAME_BREAKDOWN_DETAIL") != 0;
+static const std::chrono::nanoseconds s_offscreenStageThreshold =
+    std::chrono::milliseconds(qEnvironmentVariableIsSet("KWIN_FRAME_BREAKDOWN_DETAIL_THRESHOLD_MS")
+                                  ? qEnvironmentVariableIntValue("KWIN_FRAME_BREAKDOWN_DETAIL_THRESHOLD_MS")
+                                  : 1);
+
+// One sidecar file shared across all OffscreenQuickView instances in the
+// process. update() runs on the main thread so the mutex is uncontended
+// in practice, but it's cheap insurance against unexpected threading.
+static std::mutex s_offscreenStageMutex;
+static std::optional<std::fstream> s_offscreenStageOutput;
+static bool s_offscreenStageHeaderWritten = false;
+
+static void writeOffscreenStageRow(QQuickWindow *view,
+                                   std::chrono::nanoseconds wall,
+                                   std::chrono::nanoseconds total,
+                                   std::chrono::nanoseconds polish,
+                                   std::chrono::nanoseconds beginFrame,
+                                   std::chrono::nanoseconds sync,
+                                   std::chrono::nanoseconds render,
+                                   std::chrono::nanoseconds endFrame)
+{
+    std::lock_guard lock(s_offscreenStageMutex);
+    if (!s_offscreenStageOutput) {
+        const std::string path = "kwin perf offscreenquick detail (default).csv";
+        s_offscreenStageOutput = std::fstream(path, std::ios::out);
+        std::error_code ec;
+        const auto absPath = std::filesystem::absolute(path, ec);
+        qCWarning(LIBKWINEFFECTS).noquote()
+            << "OffscreenQuickView: writing stage breakdown to"
+            << QString::fromStdString(ec ? path : absPath.string());
+    }
+    if (!s_offscreenStageHeaderWritten) {
+        *s_offscreenStageOutput
+            << "wall_ns,view_size,total_ns,polish_ns,beginframe_ns,sync_ns,render_ns,endframe_ns\n";
+        s_offscreenStageHeaderWritten = true;
+    }
+    const QSize size = view ? view->size() : QSize();
+    *s_offscreenStageOutput
+        << wall.count() << ","
+        << size.width() << "x" << size.height() << ","
+        << total.count() << "," << polish.count() << "," << beginFrame.count()
+        << "," << sync.count() << "," << render.count() << "," << endFrame.count() << "\n";
+}
 
 class Q_DECL_HIDDEN OffscreenQuickView::Private
 {
@@ -446,14 +503,43 @@ void OffscreenQuickView::update()
     }
 #endif
 
-    d->m_renderControl->polishItems();
-    if (usingGl || usingVulkan) {
-        d->m_renderControl->beginFrame();
-    }
-    d->m_renderControl->sync();
-    d->m_renderControl->render();
-    if (usingGl || usingVulkan) {
-        d->m_renderControl->endFrame();
+    if (!s_offscreenStageBreakdown) {
+        d->m_renderControl->polishItems();
+        if (usingGl || usingVulkan) {
+            d->m_renderControl->beginFrame();
+        }
+        d->m_renderControl->sync();
+        d->m_renderControl->render();
+        if (usingGl || usingVulkan) {
+            d->m_renderControl->endFrame();
+        }
+    } else {
+        // Stage-level breakdown for QuickSceneEffect stutter attribution.
+        // The same five calls, each bracketed; sidecar row only when total
+        // exceeds the threshold so steady-state frames don't flood the log.
+        using clock = std::chrono::steady_clock;
+        const auto t0 = clock::now();
+        d->m_renderControl->polishItems();
+        const auto t1 = clock::now();
+        if (usingGl || usingVulkan) {
+            d->m_renderControl->beginFrame();
+        }
+        const auto t2 = clock::now();
+        d->m_renderControl->sync();
+        const auto t3 = clock::now();
+        d->m_renderControl->render();
+        const auto t4 = clock::now();
+        if (usingGl || usingVulkan) {
+            d->m_renderControl->endFrame();
+        }
+        const auto t5 = clock::now();
+        const auto total = t5 - t0;
+        if (total >= s_offscreenStageThreshold) {
+            writeOffscreenStageRow(d->m_view.get(),
+                                   t5.time_since_epoch(),
+                                   total,
+                                   t1 - t0, t2 - t1, t3 - t2, t4 - t3, t5 - t4);
+        }
     }
 
     if (usingGl) {
