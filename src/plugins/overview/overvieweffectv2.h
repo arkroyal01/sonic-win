@@ -7,6 +7,7 @@
 #pragma once
 
 #include "effect/effect.h"
+#include "effect/effectwindow.h" // EffectWindowVisibleRef
 
 #include "config-kwin.h"
 
@@ -171,6 +172,18 @@ private:
     /// atlas singleton is shared with future consumers (switchers,
     /// window-view) so memory stays bounded.
     void reserveSlotsForCurrentDesktop();
+    /// Allocate small static snapshot slots for windows on *other*
+    /// desktops so the desktop-bar mini-thumbnails have something to
+    /// sample. Each slot is a fixed small size (kBarSnapshotSize) so
+    /// the atlas pressure is bounded even on heavy multi-desktop
+    /// setups. EffectWindowVisibleRefs are acquired in
+    /// m_barSnapshotVisRefs to force the WindowItem visible long
+    /// enough for renderItem to produce content; they're dropped
+    /// immediately after the first frame's snapshot render commits,
+    /// so non-current-desktop windows don't stay force-visible (the
+    /// "force visible per frame" version of phase 4b held them
+    /// visible across activations and bloated VRAM to ~900 MB).
+    void reserveBarSnapshots();
     void releaseAllSlots();
 
     /// Hook for `WorkspaceScene::preFrameRender`: re-render each
@@ -208,6 +221,25 @@ private:
     /// process-wide singleton owned by `VulkanThumbnailAtlas::get(ctx)`.
     VulkanThumbnailAtlas *m_atlas = nullptr;
     std::unordered_map<Window *, VulkanThumbnailAtlas::Slot> m_windowSlots;
+
+    /// Snapshot slots for non-current-desktop windows. Small fixed
+    /// size; rendered exactly once at activate; static thereafter.
+    /// Sampled by the bar mini-thumbnail pass. Released on deactivate
+    /// like m_windowSlots.
+    std::unordered_map<Window *, VulkanThumbnailAtlas::Slot> m_barSnapshotSlots;
+
+    /// Per-snapshot WindowItem visibility refs, held just long enough
+    /// for the first renderWindowsToAtlas call to populate the
+    /// snapshot slots. Dropped immediately after that submit, so
+    /// non-current-desktop windows are only force-visible during the
+    /// snapshot render, not for the overview's whole lifetime.
+    std::vector<EffectWindowVisibleRef> m_barSnapshotVisRefs;
+
+    /// True once the snapshot slots have been rendered into the atlas
+    /// for this activation. renderWindowsToAtlas skips the snapshot
+    /// pass on subsequent frames so non-current windows' content
+    /// doesn't get blanked when their visibility ref is dropped.
+    bool m_barSnapshotsRendered = false;
 
     /// Cached tile layout: one entry per drawable tile, in stacking
     /// order at activate-time (oldest below, freshest on top). The
@@ -248,7 +280,7 @@ private:
     };
     std::vector<BarTile> m_barTiles;
     void rebuildBarLayout(const QSize &fbSize);
-    void renderDesktopBar(VkCommandBuffer cmd);
+    void renderDesktopBar(VkCommandBuffer cmd, const QSize &fbSize);
 
     /// Render pass + framebuffer used by `renderWindowsToAtlas()`. The
     /// framebuffer wraps the atlas's mip-0 view; viewport + scissor at
