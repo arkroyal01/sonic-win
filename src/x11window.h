@@ -341,6 +341,7 @@ protected:
     void doSetHidden() override;
     void doSetHiddenByShowDesktop() override;
     void doSetModal() override;
+    void doSetSuspended() override;
     bool belongsToDesktop() const override;
     bool doStartInteractiveMoveResize() override;
     bool isWaitingForInteractiveResizeSync() const override;

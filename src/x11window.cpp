@@ -2212,6 +2212,38 @@ void X11Window::doSetModal()
     info->setState(isModal() ? NET::Modal : NET::States(), NET::Modal);
 }
 
+void X11Window::doSetSuspended()
+{
+    // KWin's default Window::doSetSuspended is a no-op, so an X11
+    // window's SurfaceItem hangs on to its XComposite pixmap + the
+    // matching VkImage/GL texture import forever after the first
+    // materialisation. That's the source of the V2-overview VRAM
+    // bloat: forcing visibility briefly on every off-desktop window
+    // (so renderItem can render thumbnails) materialises every
+    // window's surface texture, and kwin never releases them again.
+    //
+    // When the WindowItem decides we're suspended — invisible AND
+    // nobody (animation effect, WindowThumbnailSource, overview)
+    // holding offscreen-rendering or visibility refs — destroy the
+    // SurfaceItem's cached pixmap so the X pixmap is freed and the
+    // VkImage import is released. SurfaceItem::preprocess() lazily
+    // re-creates the pixmap on the next render, so coming back out
+    // of suspend (e.g. switching to the window's desktop) just
+    // costs a re-import on the first frame.
+    //
+    // The unsuspend path is a no-op — preprocess() handles re-
+    // acquisition. Animation effects that need the texture *after*
+    // the window becomes invisible already hold EffectWindowVisibleRef
+    // (see src/effect/animationeffect.cpp:258), which keeps
+    // computeVisibility true and so suspended stays false.
+    if (!isSuspended()) {
+        return;
+    }
+    if (auto *surface = surfaceItem()) {
+        surface->destroyPixmap();
+    }
+}
+
 void X11Window::doSetOnActivities(const QStringList &activityList)
 {
 #if KWIN_BUILD_ACTIVITIES
