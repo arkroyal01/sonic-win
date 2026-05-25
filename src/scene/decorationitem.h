@@ -33,6 +33,15 @@ public:
     virtual void render(const QRegion &region) = 0;
     void invalidate();
 
+    /// Release any cached texture/FBO this renderer holds. Used by
+    /// X11Window::doSetSuspended (and any future suspend hook) to
+    /// reclaim VRAM when a window is no longer visible. The next
+    /// render() call must be able to lazily re-create the resources.
+    /// Default no-op for backends that don't allocate cached state.
+    virtual void discardCache()
+    {
+    }
+
     // TODO: Move damage tracking inside DecorationItem.
     QRegion damage() const;
     void addDamage(const QRegion &region);
@@ -83,6 +92,12 @@ public:
 
     DecorationRenderer *renderer() const;
     Window *window() const;
+
+    /// Forward to DecorationRenderer::discardCache(). Used by
+    /// X11Window::doSetSuspended to release the cached border/
+    /// titlebar FBO and have it re-created on the next render after
+    /// the window becomes visible again.
+    void discardCachedResources();
 
     QList<QRectF> shape() const override final;
     QRegion opaque() const override final;

@@ -26,6 +26,8 @@
 #include "killprompt.h"
 #include "netinfo.h"
 #include "placement.h"
+#include "scene/decorationitem.h"
+#include "scene/shadowitem.h"
 #include "scene/surfaceitem_x11.h"
 #include "scene/windowitem.h"
 #include "screenedge.h"
@@ -2241,6 +2243,21 @@ void X11Window::doSetSuspended()
     }
     if (auto *surface = surfaceItem()) {
         surface->destroyPixmap();
+    }
+    // SurfaceItem isn't the only WindowItem child holding GPU memory:
+    // DecorationItem keeps a border/titlebar FBO and ShadowItem keeps
+    // a nine-tile patch texture, both per-window. They survive longer
+    // than the source pixmap and account for a chunk of the residual
+    // VRAM after the V2 overview deactivates. Tear those down too;
+    // they re-allocate lazily on the next render after the window
+    // becomes visible again.
+    if (auto *wi = windowItem()) {
+        if (auto *decoration = wi->decorationItem()) {
+            decoration->discardCachedResources();
+        }
+        if (auto *shadow = wi->shadowItem()) {
+            shadow->discardCachedResources();
+        }
     }
 }
 

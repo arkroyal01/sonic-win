@@ -50,6 +50,16 @@ ShadowTextureProvider *ShadowItem::textureProvider() const
     return m_textureProvider.get();
 }
 
+void ShadowItem::discardCachedResources()
+{
+    if (m_textureProvider) {
+        m_textureProvider->discardCache();
+        // Mark the texture as dirty so the next preprocess re-uploads
+        // into the freshly-allocated VkImage.
+        m_textureDirty = true;
+    }
+}
+
 void ShadowItem::updateGeometry()
 {
     const QRectF rect = m_shadow->rect() + m_shadow->offset();

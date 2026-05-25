@@ -113,6 +113,18 @@ DecorationItem::DecorationItem(KDecoration3::Decoration *decoration, Window *win
     updateOutline();
 }
 
+void DecorationItem::discardCachedResources()
+{
+    if (m_renderer) {
+        m_renderer->discardCache();
+        // Force the next preprocess to repaint into the freshly-
+        // allocated texture; invalidate() marks the whole rect as
+        // damaged so render() doesn't see an empty damage region and
+        // skip the upload.
+        m_renderer->invalidate();
+    }
+}
+
 DecorationItem::~DecorationItem()
 {
 }

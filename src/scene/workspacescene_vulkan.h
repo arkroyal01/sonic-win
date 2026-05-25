@@ -58,6 +58,10 @@ public:
     ~VulkanShadowTextureProvider() override;
 
     void update() override;
+    void discardCache() override
+    {
+        m_texture.reset();
+    }
 
     VulkanTexture *texture() const
     {
@@ -87,6 +91,11 @@ public:
     ~SceneVulkanDecorationRenderer() override;
 
     void render(const QRegion &region) override;
+    void discardCache() override
+    {
+        m_texture.reset();
+        m_scratchImage = QImage();
+    }
 
     VulkanTexture *texture() const
     {

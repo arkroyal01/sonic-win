@@ -24,6 +24,14 @@ public:
 
     virtual void update() = 0;
 
+    /// Release any cached texture this provider holds. Used by
+    /// X11Window::doSetSuspended to reclaim VRAM when a window is no
+    /// longer visible. The next update() must be able to lazily
+    /// re-create the resources. Default no-op.
+    virtual void discardCache()
+    {
+    }
+
 protected:
     Shadow *m_shadow;
 };
@@ -41,6 +49,11 @@ public:
 
     Shadow *shadow() const;
     ShadowTextureProvider *textureProvider() const;
+
+    /// Forward to ShadowTextureProvider::discardCache(). Used by the
+    /// suspend hook to free the cached shadow texture for windows
+    /// that aren't currently visible.
+    void discardCachedResources();
 
 protected:
     WindowQuadList buildQuads() const override;
