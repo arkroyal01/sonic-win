@@ -97,6 +97,8 @@ public:
     // Effect API
     bool isActive() const override;
     int requestedEffectChainPosition() const override;
+    void reconfigure(ReconfigureFlags flags) override;
+    bool borderActivated(ElectricBorder border) override;
     void prePaintScreen(ScreenPrePaintData &data,
                         std::chrono::milliseconds presentTime) override;
     void paintScreen(const RenderTarget &renderTarget,
@@ -230,6 +232,14 @@ private:
     /// OverviewEffect's `Overview` action so the user's saved binding
     /// (default `Meta+W`) carries over without reconfiguration.
     QAction *m_toggleAction = nullptr;
+
+    /// Electric borders reserved for activation, read from the
+    /// Effect-overview / BorderActivate config key. Matches V1's
+    /// behaviour and config schema so users get the same hot-corner
+    /// they configured (default: top-left). Refreshed in
+    /// reconfigure() — kwin's settings panel triggers that when the
+    /// user changes the border binding live.
+    QList<ElectricBorder> m_borderActivate;
 
 #if HAVE_VULKAN
     /// Build the Vulkan pipeline used by `paintWindowTile()` to draw a

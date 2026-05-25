@@ -24,8 +24,10 @@
 #include "window.h"
 #endif
 
+#include <KConfigGroup>
 #include <KGlobalAccel>
 #include <KLocalizedString>
+#include <KSharedConfig>
 
 #include <QAction>
 #include <QEasingCurve>
@@ -147,6 +149,11 @@ OverviewEffectV2::OverviewEffectV2()
             activate();
         }
     });
+
+    // Pick up the same config the V1 overview uses (group
+    // "Effect-overview" in kwinrc) so users get their saved
+    // electric-border / config-knob preferences when V2 takes over.
+    reconfigure(ReconfigureAll);
 }
 
 OverviewEffectV2::~OverviewEffectV2()
@@ -154,6 +161,10 @@ OverviewEffectV2::~OverviewEffectV2()
     if (m_toggleAction) {
         KGlobalAccel::self()->removeAllShortcuts(m_toggleAction);
     }
+    for (const ElectricBorder &border : std::as_const(m_borderActivate)) {
+        effects->unreserveElectricBorder(border, this);
+    }
+    m_borderActivate.clear();
 #if HAVE_VULKAN
     QObject::disconnect(m_preFrameConnection);
     if (m_postPassId != -1) {
@@ -1825,6 +1836,44 @@ int OverviewEffectV2::requestedEffectChainPosition() const
     // existing OverviewEffect's position (kept in sync intentionally so
     // toggling between V1 and V2 doesn't perturb other effects).
     return 70;
+}
+
+void OverviewEffectV2::reconfigure(ReconfigureFlags flags)
+{
+    Q_UNUSED(flags);
+    // Read the V1 overview config group (Effect-overview in kwinrc)
+    // so user-saved settings carry across without needing to
+    // re-bind anything. New V2-specific knobs can live here too.
+    const auto cfg = KSharedConfig::openConfig();
+    const KConfigGroup group = cfg->group(QStringLiteral("Effect-overview"));
+
+    // Electric borders: same key as V1 (BorderActivate). Re-reserve
+    // on every reconfigure so a live settings change picks up.
+    for (const ElectricBorder &border : std::as_const(m_borderActivate)) {
+        effects->unreserveElectricBorder(border, this);
+    }
+    m_borderActivate.clear();
+    const QList<int> activateBorders = group.readEntry(
+        QStringLiteral("BorderActivate"),
+        QList<int>{int(ElectricTopLeft)});
+    for (const int border : activateBorders) {
+        const ElectricBorder eb = ElectricBorder(border);
+        m_borderActivate.append(eb);
+        effects->reserveElectricBorder(eb, this);
+    }
+}
+
+bool OverviewEffectV2::borderActivated(ElectricBorder border)
+{
+    if (!m_borderActivate.contains(border)) {
+        return false;
+    }
+    if (m_visible) {
+        deactivate();
+    } else {
+        activate();
+    }
+    return true;
 }
 
 void OverviewEffectV2::prePaintScreen(ScreenPrePaintData &data,
