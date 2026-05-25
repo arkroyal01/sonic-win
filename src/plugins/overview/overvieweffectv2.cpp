@@ -606,6 +606,14 @@ void OverviewEffectV2::rebuildTileLayout(const QSize &fbSize)
         t.gridNdcH = tileNdcH;
     }
     m_tileLayout = std::move(drawable);
+
+    // Clamp focus to the new tile count so layout changes (window
+    // closed during overview, window appeared) don't leave a stale
+    // focus index pointing at nothing.
+    const int newN = int(m_tileLayout.size());
+    if (m_focusedTileIndex >= newN) {
+        m_focusedTileIndex = newN == 0 ? -1 : newN - 1;
+    }
 }
 
 void OverviewEffectV2::rebuildBarLayout(const QSize &fbSize)
@@ -1103,6 +1111,34 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
         pushAndDraw(t, 0.0f, 0.0f, 1.0f, 1.0f);
     }
 
+    // Pass 2.5: focus highlight. Overlay a translucent white wash on
+    // the keyboard-focused tile so the user can see what Enter will
+    // activate. Same pipeline, tintRgba.a = 1 → solid tint; pc.opacity
+    // controls how strong the wash is. Drawn on top of the tile, so it
+    // brightens whatever pixels are already there (premultiplied blend
+    // with ONE_MINUS_SRC_ALPHA against the tile).
+    if (m_focusedTileIndex >= 0 && m_focusedTileIndex < int(m_tileLayout.size())) {
+        const TileLayout &t = m_tileLayout[m_focusedTileIndex];
+        OverviewQuadPushConstants pc{};
+        pc.quadRectNdc[0] = t.realNdcX + (t.gridNdcX - t.realNdcX) * factor;
+        pc.quadRectNdc[1] = t.realNdcY + (t.gridNdcY - t.realNdcY) * factor;
+        pc.quadRectNdc[2] = t.realNdcW + (t.gridNdcW - t.realNdcW) * factor;
+        pc.quadRectNdc[3] = t.realNdcH + (t.gridNdcH - t.realNdcH) * factor;
+        pc.atlasSlotUv[0] = 0.0f;
+        pc.atlasSlotUv[1] = 0.0f;
+        pc.atlasSlotUv[2] = 1.0f;
+        pc.atlasSlotUv[3] = 1.0f;
+        pc.tintRgba[0] = 1.0f;
+        pc.tintRgba[1] = 1.0f;
+        pc.tintRgba[2] = 1.0f;
+        pc.tintRgba[3] = 1.0f; // tint mix weight: solid colour, no texture
+        pc.opacity = 0.25f * factor; // ~25% wash at settled
+        vkCmdPushConstants(cmd, m_vkPipelineLayout,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                           0, sizeof(pc), &pc);
+        vkCmdDraw(cmd, 4, 1, 0, 0);
+    }
+
     // Pass 3: desktop bar. Solid-colour tiles (tintRgba.a == 1 in the
     // shader). The pipeline still requires a valid descriptor binding
     // even though the shader doesn't sample it for this path — reuse
@@ -1142,6 +1178,7 @@ void OverviewEffectV2::activate()
         return;
     }
     m_visible = true;
+    m_focusedTileIndex = -1; // start unfocused; first arrow/Tab picks tile 0
     // Mouse interception is always on (bar clicks, tile clicks,
     // click-away dismiss). Keyboard grab is conditional — see below.
     effects->startMouseInterception(this, Qt::ArrowCursor);
@@ -1332,6 +1369,73 @@ void OverviewEffectV2::grabbedKeyboardEvent(QKeyEvent *event)
         deactivate();
         return;
     }
+#if HAVE_VULKAN
+    // Tile navigation. The grid columns come from the same heuristic
+    // rebuildTileLayout uses; recomputing here keeps the nav in sync
+    // without needing a separate cache. Enter/Return activates the
+    // focused tile and dismisses, just like a click.
+    const int n = int(m_tileLayout.size());
+    if (n > 0) {
+        const int cols = std::max(1, int(std::ceil(std::sqrt(double(n)))));
+        const int rows = (n + cols - 1) / cols;
+        const int key = event->key();
+        if (key == Qt::Key_Return || key == Qt::Key_Enter) {
+            if (m_focusedTileIndex >= 0 && m_focusedTileIndex < n) {
+                Window *handle = m_tileLayout[m_focusedTileIndex].handle;
+                if (handle && handle->effectWindow()) {
+                    effects->activateWindow(handle->effectWindow());
+                }
+                deactivate();
+            }
+            return;
+        }
+        auto moveFocus = [&](int newIndex) {
+            // Clamp into [0, n) with wraparound on Tab so the user can
+            // cycle through tiles without thinking about the edges.
+            // Arrow keys deliberately don't wrap (matches most grid
+            // navigation conventions).
+            if (n == 0) {
+                m_focusedTileIndex = -1;
+                return;
+            }
+            m_focusedTileIndex = std::clamp(newIndex, 0, n - 1);
+            effects->addRepaintFull();
+        };
+        const bool shiftTab = (key == Qt::Key_Backtab)
+            || (key == Qt::Key_Tab && (event->modifiers() & Qt::ShiftModifier));
+        if (key == Qt::Key_Tab && !shiftTab) {
+            const int next = (m_focusedTileIndex < 0) ? 0 : (m_focusedTileIndex + 1) % n;
+            moveFocus(next);
+            return;
+        }
+        if (shiftTab) {
+            const int prev = (m_focusedTileIndex <= 0) ? (n - 1) : (m_focusedTileIndex - 1);
+            moveFocus(prev);
+            return;
+        }
+        if (key == Qt::Key_Right) {
+            moveFocus((m_focusedTileIndex < 0) ? 0 : m_focusedTileIndex + 1);
+            return;
+        }
+        if (key == Qt::Key_Left) {
+            moveFocus((m_focusedTileIndex < 0) ? 0 : m_focusedTileIndex - 1);
+            return;
+        }
+        if (key == Qt::Key_Down) {
+            const int base = (m_focusedTileIndex < 0) ? 0 : m_focusedTileIndex;
+            const int candidate = base + cols;
+            moveFocus(candidate < n ? candidate : base);
+            return;
+        }
+        if (key == Qt::Key_Up) {
+            const int base = (m_focusedTileIndex < 0) ? 0 : m_focusedTileIndex;
+            const int candidate = base - cols;
+            moveFocus(candidate >= 0 ? candidate : base);
+            return;
+        }
+        Q_UNUSED(rows);
+    }
+#endif
     // The compositor's keyboard grab swallows key presses before
     // KGlobalAccel can match them, so the user's configured toggle
     // (default Super+W) would otherwise never fire while the overview

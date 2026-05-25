@@ -133,6 +133,13 @@ private:
     /// focused window).
     bool m_grabbedKeyboard = false;
 
+    /// Index into m_tileLayout for the keyboard-focused tile, or -1
+    /// when no tile has focus. Tab/arrows move focus; Enter activates
+    /// the focused tile's window. The post-pass renders a brighter
+    /// tint on the focused tile so the user can see what Enter would
+    /// activate.
+    int m_focusedTileIndex = -1;
+
     /// Global toggle shortcut. Same object name as the existing
     /// OverviewEffect's `Overview` action so the user's saved binding
     /// (default `Meta+W`) carries over without reconfiguration.
