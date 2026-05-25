@@ -27,6 +27,7 @@ class QAction;
 namespace KWin
 {
 
+class VirtualDesktop;
 class Window;
 
 #if HAVE_VULKAN
@@ -194,6 +195,25 @@ private:
     };
     std::vector<TileLayout> m_tileLayout;
     void rebuildTileLayout(const QSize &fbSize);
+
+    /// Top-of-screen desktop bar: one entry per virtual desktop, in
+    /// the same order as `effects->desktops()`. Click hit-test and
+    /// the post-pass both consume this; `isCurrent` toggles the
+    /// active-desktop highlight tint. Refreshed each frame inside the
+    /// post-pass so a desktop add/remove between activations is
+    /// picked up automatically.
+    struct BarTile
+    {
+        VirtualDesktop *desktop;
+        float ndcX;
+        float ndcY;
+        float ndcW;
+        float ndcH;
+        bool isCurrent;
+    };
+    std::vector<BarTile> m_barTiles;
+    void rebuildBarLayout(const QSize &fbSize);
+    void renderDesktopBar(VkCommandBuffer cmd);
 
     /// Render pass + framebuffer used by `renderWindowsToAtlas()`. The
     /// framebuffer wraps the atlas's mip-0 view; viewport + scissor at

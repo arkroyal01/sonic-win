@@ -15,6 +15,13 @@ layout(push_constant) uniform PC {
     vec4 quadRectNdc;
     // Normalised UV sub-rect within the atlas: xy = top-left, zw = size.
     vec4 atlasSlotUv;
+    // Tint colour and weight. tintRgba.a controls the mix between the
+    // sampled atlas pixel (.a=0) and the solid tint (.a=1) — lets the
+    // post-pass draw both atlas-backed window tiles AND solid-colour
+    // tiles (desktop bar) from one pipeline. Read in the fragment
+    // stage; declared here so the push-constant range covers both
+    // stages.
+    vec4 tintRgba;
     // Per-frame uniform alpha for the slide-in animation.
     float opacity;
 } pc;

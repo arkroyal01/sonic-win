@@ -57,17 +57,20 @@ using KWin::OverviewEffectV2Shaders::kFragSpv;
 using KWin::OverviewEffectV2Shaders::kVertSpv;
 
 // Push-constant block layout must mirror the GLSL `PC` struct in
-// shaders/overview_quad.vert. Stored in shader-readable order; offsets
-// 0..32 and 32..36 must match the GLSL `layout(offset = …)` rules (no
-// explicit offsets used → tightly packed, vec4 alignment honoured).
+// shaders/overview_quad.{vert,frag}. Tightly packed std140-style: vec4
+// fields are 16-byte aligned, the trailing float follows naturally.
+// tintRgba lets the post-pass draw both atlas-backed window tiles
+// (tintRgba.a == 0) and solid-colour bar tiles (tintRgba.a == 1) from
+// one pipeline.
 struct OverviewQuadPushConstants
 {
     float quadRectNdc[4];
     float atlasSlotUv[4];
+    float tintRgba[4];
     float opacity;
 };
-static_assert(sizeof(OverviewQuadPushConstants) == 36,
-              "Push-constant layout must match shaders/overview_quad.vert");
+static_assert(sizeof(OverviewQuadPushConstants) == 52,
+              "Push-constant layout must match shaders/overview_quad.{vert,frag}");
 } // namespace
 
 #endif // HAVE_VULKAN
@@ -228,12 +231,11 @@ bool OverviewEffectV2::ensureVulkanPipeline(VulkanContext *ctx, VkFormat colorFo
         return false;
     }
 
-    // Push constants are only accessed in the vertex stage — fragment
-    // receives opacity via the vertex-output varying at location 1, not
-    // through its own PC block. Narrower stageFlags keeps the
-    // validation layer quiet.
+    // Push constants are accessed in both stages: vertex reads quad
+    // geometry and atlas UVs, fragment reads tintRgba to mix solid
+    // colours for bar tiles into the sampled atlas pixel.
     VkPushConstantRange pcRange{};
-    pcRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    pcRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     pcRange.offset = 0;
     pcRange.size = sizeof(OverviewQuadPushConstants);
     VkPipelineLayoutCreateInfo plInfo{};
@@ -483,6 +485,7 @@ void OverviewEffectV2::releaseAllSlots()
     }
     m_windowSlots.clear();
     m_tileLayout.clear();
+    m_barTiles.clear();
     m_fallbackFramebuffers.clear();
     m_atlasFramebuffer.reset();
     m_atlasRenderPass.reset();
@@ -538,8 +541,12 @@ void OverviewEffectV2::rebuildTileLayout(const QSize &fbSize)
     }
     const int cols = std::max(1, int(std::ceil(std::sqrt(double(n)))));
     const int rows = (n + cols - 1) / cols;
+    // Grid top sits just below the desktop bar (kBarTop + kBarHeight +
+    // a small gap); see rebuildBarLayout for the bar's NDC bounds.
+    constexpr float kGridTop = -0.78f;
+    constexpr float kGridBottom = 0.8f;
     const float cellNdcW = 1.6f / cols;
-    const float cellNdcH = 1.6f / rows;
+    const float cellNdcH = (kGridBottom - kGridTop) / rows;
     constexpr float kTilePad = 0.9f;
     const float maxNdcW = cellNdcW * kTilePad;
     const float maxNdcH = cellNdcH * kTilePad;
@@ -566,13 +573,101 @@ void OverviewEffectV2::rebuildTileLayout(const QSize &fbSize)
         const int col = i % cols;
         const int row = i / cols;
         const float cellOriginX = -0.8f + col * cellNdcW;
-        const float cellOriginY = -0.8f + row * cellNdcH;
+        const float cellOriginY = kGridTop + row * cellNdcH;
         t.gridNdcX = cellOriginX + (cellNdcW - tileNdcW) * 0.5f;
         t.gridNdcY = cellOriginY + (cellNdcH - tileNdcH) * 0.5f;
         t.gridNdcW = tileNdcW;
         t.gridNdcH = tileNdcH;
     }
     m_tileLayout = std::move(drawable);
+}
+
+void OverviewEffectV2::rebuildBarLayout(const QSize &fbSize)
+{
+    Q_UNUSED(fbSize);
+    m_barTiles.clear();
+    if (!effects) {
+        return;
+    }
+    const auto desktops = effects->desktops();
+    const int n = desktops.size();
+    if (n <= 1) {
+        // Only one desktop → no bar (nothing to switch to).
+        return;
+    }
+    VirtualDesktop *current = effects->currentDesktop();
+
+    // Bar bounds in NDC. Positive viewport Y in the post-pass → -1 is
+    // the top of the screen. Bar gets a thin band at the top with
+    // small side margins. Keep the y-extent in sync with kGridTop in
+    // rebuildTileLayout so grid tiles and bar tiles don't overlap.
+    constexpr float kBarTop = -0.96f;
+    constexpr float kBarHeight = 0.16f;
+    constexpr float kBarLeft = -0.96f;
+    constexpr float kBarRight = 0.96f;
+    constexpr float kGutter = 0.012f;
+    const float totalW = kBarRight - kBarLeft;
+    const float tileW = (totalW - (n - 1) * kGutter) / float(n);
+
+    m_barTiles.reserve(n);
+    for (int i = 0; i < n; ++i) {
+        m_barTiles.push_back({
+            desktops[i],
+            kBarLeft + i * (tileW + kGutter),
+            kBarTop,
+            tileW,
+            kBarHeight,
+            desktops[i] == current,
+        });
+    }
+}
+
+void OverviewEffectV2::renderDesktopBar(VkCommandBuffer cmd)
+{
+    if (m_barTiles.empty() || m_vkPipelineLayout == VK_NULL_HANDLE) {
+        return;
+    }
+    // The pipeline is already bound, descriptor set 0 already has an
+    // atlas-or-fallback image bound from the window-tile passes (the
+    // shader doesn't sample it when tintRgba.a == 1, but Vulkan still
+    // requires a valid binding). Viewport+scissor are also set to the
+    // full framebuffer; bar tiles draw at their own NDC rects.
+    const float factor = float(std::clamp(m_activationFactor, 0.0, 1.0));
+    for (const BarTile &b : m_barTiles) {
+        OverviewQuadPushConstants pc{};
+        pc.quadRectNdc[0] = b.ndcX;
+        pc.quadRectNdc[1] = b.ndcY;
+        pc.quadRectNdc[2] = b.ndcW;
+        pc.quadRectNdc[3] = b.ndcH;
+        // atlasSlotUv unused when tintRgba.a == 1, but keep it sane.
+        pc.atlasSlotUv[0] = 0.0f;
+        pc.atlasSlotUv[1] = 0.0f;
+        pc.atlasSlotUv[2] = 1.0f;
+        pc.atlasSlotUv[3] = 1.0f;
+        // Bright translucent white for the current desktop, dimmer
+        // grey for the rest. The .a field is the tint mix weight
+        // (1.0 = pure solid), not the final alpha — that comes from
+        // pc.opacity below.
+        if (b.isCurrent) {
+            pc.tintRgba[0] = 0.95f;
+            pc.tintRgba[1] = 0.95f;
+            pc.tintRgba[2] = 1.0f;
+        } else {
+            pc.tintRgba[0] = 0.35f;
+            pc.tintRgba[1] = 0.35f;
+            pc.tintRgba[2] = 0.4f;
+        }
+        pc.tintRgba[3] = 1.0f;
+        // Translucent so the dimmed scene-capture background shows
+        // through; ramps with activation so the bar fades in alongside
+        // the tiles.
+        pc.opacity = (b.isCurrent ? 0.7f : 0.55f) * factor;
+
+        vkCmdPushConstants(cmd, m_vkPipelineLayout,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                           0, sizeof(pc), &pc);
+        vkCmdDraw(cmd, 4, 1, 0, 0);
+    }
 }
 
 void OverviewEffectV2::renderWindowsToAtlas()
@@ -872,7 +967,7 @@ void OverviewEffectV2::drawSceneCaptureBackground(VkCommandBuffer cmd, VulkanTex
     pc.atlasSlotUv[2] = 1.0f;
     pc.atlasSlotUv[3] = 1.0f;
     pc.opacity = bgOpacity;
-    vkCmdPushConstants(cmd, m_vkPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
+    vkCmdPushConstants(cmd, m_vkPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                        0, sizeof(pc), &pc);
     vkCmdDraw(cmd, 4, 1, 0, 0);
 }
@@ -895,14 +990,14 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
         return;
     }
 
-    // Refresh the cached layout each frame: window geometries can shift
-    // (e.g. on resize during overview), and the hit-test must consume
-    // the same numbers we draw with — so they share `m_tileLayout`.
-    // Each tile lerps from its real on-screen rect (NDC) to a grid
-    // cell, driven by m_activationFactor; the cache holds both
-    // endpoints in aspect-preserving form.
+    // Refresh both layout caches each frame: window geometries can
+    // shift (e.g. on resize during overview), and the hit-test must
+    // consume the same numbers we draw with — so they share
+    // `m_tileLayout` and `m_barTiles`. Each tile lerps from its real
+    // on-screen rect to a grid cell; the bar sits at the top.
     rebuildTileLayout(fbSize);
-    if (m_tileLayout.empty()) {
+    rebuildBarLayout(fbSize);
+    if (m_tileLayout.empty() && m_barTiles.empty()) {
         return;
     }
 
@@ -940,7 +1035,7 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
         pc.atlasSlotUv[2] = uvW;
         pc.atlasSlotUv[3] = uvH;
         pc.opacity = factor;
-        vkCmdPushConstants(cmd, m_vkPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
+        vkCmdPushConstants(cmd, m_vkPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                            0, sizeof(pc), &pc);
         vkCmdDraw(cmd, 4, 1, 0, 0);
     };
@@ -978,6 +1073,29 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
         }
         pushView(t.slot.srgbView);
         pushAndDraw(t, 0.0f, 0.0f, 1.0f, 1.0f);
+    }
+
+    // Pass 3: desktop bar. Solid-colour tiles (tintRgba.a == 1 in the
+    // shader). The pipeline still requires a valid descriptor binding
+    // even though the shader doesn't sample it for this path — reuse
+    // whatever view we already bound from a tile pass. With no atlas
+    // slots and no fallbacks we have nothing valid to bind, so skip
+    // the bar; the user can fall back to the global Super+arrow
+    // shortcuts in that (unusual) case.
+    if (!m_barTiles.empty()) {
+        VkImageView anyView = atlasSrgbView;
+        if (anyView == VK_NULL_HANDLE) {
+            for (const TileLayout &t : m_tileLayout) {
+                if (t.slot.srgbView != VK_NULL_HANDLE) {
+                    anyView = t.slot.srgbView;
+                    break;
+                }
+            }
+        }
+        if (anyView != VK_NULL_HANDLE) {
+            pushView(anyView);
+            renderDesktopBar(cmd);
+        }
     }
 }
 #endif // HAVE_VULKAN
@@ -1168,6 +1286,30 @@ void OverviewEffectV2::windowInputMouseEvent(QEvent *event)
         return;
     }
     const QPoint pos = mouseEvent->globalPosition().toPoint();
+#if HAVE_VULKAN
+    // Bar hit-test first — it sits over the top edge of the screen and
+    // its rects are smaller targets than the grid tiles. Convert click
+    // to NDC the same way the post-pass does so geometry matches.
+    if (!m_barTiles.empty() && effects) {
+        const QRect screen = effects->virtualScreenGeometry();
+        if (!screen.isEmpty() && screen.contains(pos)) {
+            const float screenW = std::max(1.0f, float(screen.width()));
+            const float screenH = std::max(1.0f, float(screen.height()));
+            const float mxNdc = (float(pos.x() - screen.x()) / screenW) * 2.0f - 1.0f;
+            const float myNdc = (float(pos.y() - screen.y()) / screenH) * 2.0f - 1.0f;
+            for (const BarTile &b : m_barTiles) {
+                if (mxNdc >= b.ndcX && mxNdc <= b.ndcX + b.ndcW
+                    && myNdc >= b.ndcY && myNdc <= b.ndcY + b.ndcH) {
+                    if (b.desktop && b.desktop != effects->currentDesktop()) {
+                        effects->setCurrentDesktop(b.desktop);
+                    }
+                    deactivate();
+                    return;
+                }
+            }
+        }
+    }
+#endif
     if (Window *target = hitTestTile(pos)) {
         if (target->effectWindow()) {
             effects->activateWindow(target->effectWindow());
@@ -1175,8 +1317,8 @@ void OverviewEffectV2::windowInputMouseEvent(QEvent *event)
         deactivate();
         return;
     }
-    // Click outside any tile: dismiss the overview (matches the QML
-    // overview's TapHandler on the underlay).
+    // Click outside any tile or bar: dismiss the overview (matches the
+    // QML overview's TapHandler on the underlay).
     deactivate();
 }
 
