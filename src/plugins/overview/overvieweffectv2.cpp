@@ -736,10 +736,14 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
     VkRect2D scissor{{0, 0}, {uint32_t(fbSize.width()), uint32_t(fbSize.height())}};
     vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-    // Simple square grid layout for phase 2d. Real layout — windows
-    // animating from their on-screen position into the grid based on
-    // m_activationFactor — is a later phase. The grid occupies 80% of
-    // the screen centred, leaving 10% margin all around.
+    // Layout: each tile lerps from its real on-screen rect (NDC) to a
+    // grid cell, driven by m_activationFactor. At factor=0 the tile
+    // sits exactly where its window is on screen; at factor=1 it sits
+    // in the grid. The slide-in animation is this lerp plus the
+    // opacity ramp from the existing fade. Grid occupies 80% of the
+    // screen, centred. Single-output X11 assumption: fbSize is the
+    // output size in pixels and Window::visibleGeometry() is in the
+    // same screen-pixel space.
     int drawable = 0;
     for (const auto &[_handle, slot] : m_windowSlots) {
         if (!slot.isFallback && slot.hasContent) {
@@ -755,27 +759,41 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
     const float cellH = 1.6f / rows;
     constexpr float kTilePad = 0.9f;
     const float atlasSize = float(VulkanThumbnailAtlas::kAtlasSize);
+    const float screenW = std::max(1.0f, float(fbSize.width()));
+    const float screenH = std::max(1.0f, float(fbSize.height()));
+    const float factor = float(std::clamp(m_activationFactor, 0.0, 1.0));
 
     int idx = 0;
     for (const auto &[handle, slot] : m_windowSlots) {
-        if (slot.isFallback || !slot.hasContent) {
+        if (slot.isFallback || !slot.hasContent || !handle) {
             continue;
         }
+        const QRectF realGeom = handle->visibleGeometry();
+        // Convert screen-pixel rect to NDC. Vulkan NDC: x in [-1, 1]
+        // left-to-right, y in [-1, 1] top-to-bottom (Y-down with our
+        // positive viewport height).
+        const float realX = (float(realGeom.x()) / screenW) * 2.0f - 1.0f;
+        const float realY = (float(realGeom.y()) / screenH) * 2.0f - 1.0f;
+        const float realW = (float(realGeom.width()) / screenW) * 2.0f;
+        const float realH = (float(realGeom.height()) / screenH) * 2.0f;
+
         const int col = idx % cols;
         const int row = idx / cols;
-        const float x0 = -0.8f + col * cellW;
-        const float y0 = -0.8f + row * cellH;
+        const float gridX = -0.8f + col * cellW;
+        const float gridY = -0.8f + row * cellH;
+        const float gridW = cellW * kTilePad;
+        const float gridH = cellH * kTilePad;
 
         OverviewQuadPushConstants pc{};
-        pc.quadRectNdc[0] = x0;
-        pc.quadRectNdc[1] = y0;
-        pc.quadRectNdc[2] = cellW * kTilePad;
-        pc.quadRectNdc[3] = cellH * kTilePad;
+        pc.quadRectNdc[0] = realX + (gridX - realX) * factor;
+        pc.quadRectNdc[1] = realY + (gridY - realY) * factor;
+        pc.quadRectNdc[2] = realW + (gridW - realW) * factor;
+        pc.quadRectNdc[3] = realH + (gridH - realH) * factor;
         pc.atlasSlotUv[0] = float(slot.rect.x()) / atlasSize;
         pc.atlasSlotUv[1] = float(slot.rect.y()) / atlasSize;
         pc.atlasSlotUv[2] = float(slot.rect.width()) / atlasSize;
         pc.atlasSlotUv[3] = float(slot.rect.height()) / atlasSize;
-        pc.opacity = float(m_activationFactor);
+        pc.opacity = factor;
 
         vkCmdPushConstants(cmd, m_vkPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
                            0, sizeof(pc), &pc);
