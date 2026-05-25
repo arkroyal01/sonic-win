@@ -222,24 +222,23 @@ private:
     VulkanThumbnailAtlas *m_atlas = nullptr;
     std::unordered_map<Window *, VulkanThumbnailAtlas::Slot> m_windowSlots;
 
-    /// Snapshot slots for non-current-desktop windows. Small fixed
-    /// size; rendered exactly once at activate; static thereafter.
-    /// Sampled by the bar mini-thumbnail pass. Released on deactivate
-    /// like m_windowSlots.
+    /// Bar mini-thumbnail slots for non-current-desktop windows.
+    /// Small fixed size (kBarSnapshotSize), re-rendered per frame
+    /// alongside the current-desktop full-size slots so bar tiles
+    /// show live window content, not stale snapshots. Released on
+    /// deactivate like m_windowSlots. Memory cost of holding all
+    /// off-desktop WindowItems visible is recovered by the X11
+    /// suspend hook (a50a7e6d1c + 1d51bf4e61) and the dedicated-
+    /// allocation work (39cf11b882 + b8d35e7a0b) once the refs are
+    /// dropped at deactivate.
     std::unordered_map<Window *, VulkanThumbnailAtlas::Slot> m_barSnapshotSlots;
 
-    /// Per-snapshot WindowItem visibility refs, held just long enough
-    /// for the first renderWindowsToAtlas call to populate the
-    /// snapshot slots. Dropped immediately after that submit, so
-    /// non-current-desktop windows are only force-visible during the
-    /// snapshot render, not for the overview's whole lifetime.
+    /// Per-off-desktop-window visibility refs, held for the entire
+    /// overview lifetime. Without these, WindowItem::computeVisibility
+    /// returns false for off-desktop windows and renderItem writes
+    /// nothing into their atlas slot. Released in releaseAllSlots /
+    /// the per-window destroy callback.
     std::vector<EffectWindowVisibleRef> m_barSnapshotVisRefs;
-
-    /// True once the snapshot slots have been rendered into the atlas
-    /// for this activation. renderWindowsToAtlas skips the snapshot
-    /// pass on subsequent frames so non-current windows' content
-    /// doesn't get blanked when their visibility ref is dropped.
-    bool m_barSnapshotsRendered = false;
 
     /// Cached tile layout: one entry per drawable tile, in stacking
     /// order at activate-time (oldest below, freshest on top). The

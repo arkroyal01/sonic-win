@@ -536,14 +536,13 @@ void OverviewEffectV2::reserveBarSnapshots()
             continue;
         }
         handle->refOffscreenRendering();
-        // Force the WindowItem visible long enough for the upcoming
-        // renderItem to walk the scene graph and produce content. The
-        // ref is released as soon as the snapshot pass commits its
-        // command buffer (m_barSnapshotsRendered flag flips and the
-        // vector clears), so we don't pin non-current-desktop
-        // SurfaceTextures across the overview's lifetime — that was
-        // the source of the 750 MB regression in the previous
-        // attempt.
+        // Force the WindowItem visible for the whole overview
+        // lifetime so renderItem produces content for off-desktop
+        // windows every frame (live mini-thumbnails). The ref is
+        // released at deactivate; the X11 suspend hook then tears
+        // down each window's SurfaceItem pixmap + decoration FBO +
+        // shadow texture, and the dedicated-allocation work returns
+        // that VRAM to the OS instead of pinning VMA blocks.
         m_barSnapshotVisRefs.emplace_back(
             ew,
             EffectWindow::PAINT_DISABLED | EffectWindow::PAINT_DISABLED_BY_DESKTOP
@@ -596,7 +595,6 @@ void OverviewEffectV2::releaseAllSlots()
     m_windowSlots.clear();
     m_barSnapshotSlots.clear();
     m_barSnapshotVisRefs.clear();
-    m_barSnapshotsRendered = false;
     m_tileLayout.clear();
     m_barTiles.clear();
     m_fallbackFramebuffers.clear();
@@ -907,12 +905,16 @@ void OverviewEffectV2::renderWindowsToAtlas()
     if (!m_atlas || !m_vulkanCtx) {
         return;
     }
-    // Snapshot pass runs once per activation: it captures non-current-
-    // desktop windows into their small static slots, then drops the
-    // visibility refs that made the WindowItems renderable. After
-    // that, only the per-frame current-desktop slots need work.
-    const bool needsSnapshotRender = !m_barSnapshotsRendered && !m_barSnapshotSlots.empty();
-    if (m_windowSlots.empty() && !needsSnapshotRender) {
+    // Off-desktop slots (m_barSnapshotSlots) re-render every frame
+    // alongside the current-desktop slots so bar mini-thumbnails are
+    // live, not stale snapshots. m_barSnapshotVisRefs keeps the
+    // off-desktop WindowItems visible for the whole overview
+    // lifetime; releaseAllSlots drops them, the X11 suspend hook
+    // (a50a7e6d1c + 1d51bf4e61) frees the per-window cached
+    // resources, and the dedicated-allocation work (39cf11b882 +
+    // b8d35e7a0b) returns that VRAM to the OS instead of pinning
+    // VMA blocks.
+    if (m_windowSlots.empty() && m_barSnapshotSlots.empty()) {
         return;
     }
 
@@ -1004,13 +1006,11 @@ void OverviewEffectV2::renderWindowsToAtlas()
             }
             m_atlas->prepareForRenderTo(cmd, slot);
         }
-        if (needsSnapshotRender) {
-            for (auto &[_handle, slot] : m_barSnapshotSlots) {
-                if (slot.isFallback) {
-                    continue;
-                }
-                m_atlas->prepareForRenderTo(cmd, slot);
+        for (auto &[_handle, slot] : m_barSnapshotSlots) {
+            if (slot.isFallback) {
+                continue;
             }
+            m_atlas->prepareForRenderTo(cmd, slot);
         }
 
         // Single render pass covering all atlas-slot writes. Each
@@ -1069,13 +1069,11 @@ void OverviewEffectV2::renderWindowsToAtlas()
             }
             renderSlot(handle, slot);
         }
-        if (needsSnapshotRender) {
-            for (auto &[handle, slot] : m_barSnapshotSlots) {
-                if (slot.isFallback || !handle) {
-                    continue;
-                }
-                renderSlot(handle, slot);
+        for (auto &[handle, slot] : m_barSnapshotSlots) {
+            if (slot.isFallback || !handle) {
+                continue;
             }
+            renderSlot(handle, slot);
         }
 
         m_atlasRenderPass->end(cmd);
@@ -1152,10 +1150,8 @@ void OverviewEffectV2::renderWindowsToAtlas()
     for (auto &[_handle, slot] : m_windowSlots) {
         m_atlas->generateMipsAndPublish(cmd, slot);
     }
-    if (needsSnapshotRender) {
-        for (auto &[_handle, slot] : m_barSnapshotSlots) {
-            m_atlas->generateMipsAndPublish(cmd, slot);
-        }
+    for (auto &[_handle, slot] : m_barSnapshotSlots) {
+        m_atlas->generateMipsAndPublish(cmd, slot);
     }
 
     vkRenderer->popOffscreenSlot();
@@ -1165,19 +1161,6 @@ void OverviewEffectV2::renderWindowsToAtlas()
     // compositor submit on the same queue picks up the atlas writes
     // through the publishing barrier's same-queue visibility.
     m_lastAtlasSubmit = m_vulkanCtx->submitSingleTimeCommandsAsync(cmd);
-
-    if (needsSnapshotRender) {
-        // Snapshots are committed (their mip chains live in the
-        // atlas). Drop the visibility refs now — renderItem already
-        // walked the scene graph during the body above, so the
-        // WindowItems no longer need to be forced visible. Releasing
-        // here is what keeps the overview from holding non-current-
-        // desktop SurfaceTextures across the activation; the previous
-        // approach kept refs until deactivate and bloated VRAM into
-        // the hundreds of MB.
-        m_barSnapshotsRendered = true;
-        m_barSnapshotVisRefs.clear();
-    }
 }
 
 void OverviewEffectV2::drawSceneCaptureBackground(VkCommandBuffer cmd, VulkanTexture *sceneCapture,
