@@ -1183,6 +1183,34 @@ void OverviewEffectV2::deactivate()
     m_animation.start();
 }
 
+void OverviewEffectV2::teardownImmediate()
+{
+    if (!m_visible) {
+        return;
+    }
+    m_animation.stop();
+#if HAVE_VULKAN
+    QObject::disconnect(m_preFrameConnection);
+    m_preFrameConnection = {};
+#endif
+    effects->stopMouseInterception(this);
+    effects->ungrabKeyboard();
+#if HAVE_VULKAN
+    if (m_postPassId != -1) {
+        if (auto *scene = Compositor::self()->scene()) {
+            if (auto *vk = dynamic_cast<ItemRendererVulkan *>(scene->renderer())) {
+                vk->unregisterFullscreenPostPass(m_postPassId);
+            }
+        }
+        m_postPassId = -1;
+    }
+    releaseAllSlots();
+#endif
+    m_activationFactor = 0.0;
+    m_visible = false;
+    effects->addRepaintFull();
+}
+
 bool OverviewEffectV2::isActive() const
 {
     return m_visible;
@@ -1302,17 +1330,20 @@ void OverviewEffectV2::windowInputMouseEvent(QEvent *event)
             for (const BarTile &b : m_barTiles) {
                 if (mxNdc >= b.ndcX && mxNdc <= b.ndcX + b.ndcW
                     && myNdc >= b.ndcY && myNdc <= b.ndcY + b.ndcH) {
-                    // Release the keyboard grab *before* switching
-                    // desktops. setCurrentDesktop on an active grab
-                    // leaves KGlobalAccel's Super+W registration in a
-                    // dead state on the new desktop — the next
-                    // activate/deactivate cycle silently breaks the
-                    // shortcut. Ungrabbing first keeps both desktops'
-                    // shortcut state coherent.
+                    // Tear down V2 *synchronously* before switching
+                    // desktops. The animated slide-out raced with
+                    // setCurrentDesktop's side effects (VD-switch OSD,
+                    // fadedesktop, KGlobalAccel state) and the
+                    // post-pass kept firing into the race — the next
+                    // activate would draw the VD OSD zoomed in
+                    // instead of windows, and Super+W silently broke
+                    // until something else (e.g. the VD plasmoid)
+                    // reset shortcut state. Snap everything to the
+                    // dormant state, then switch.
                     VirtualDesktop *target = (b.desktop && b.desktop != effects->currentDesktop())
                         ? b.desktop
                         : nullptr;
-                    deactivate();
+                    teardownImmediate();
                     if (target) {
                         effects->setCurrentDesktop(target);
                     }

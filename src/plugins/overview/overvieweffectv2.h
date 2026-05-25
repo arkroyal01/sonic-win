@@ -82,6 +82,17 @@ public:
     /// Deactivate: animates slide-out then releases per-activation state.
     void deactivate();
 
+private:
+    /// Synchronous teardown — releases grabs, unregisters the post-
+    /// pass, releases atlas slots, snaps activationFactor to 0 and
+    /// clears m_visible. Used when an animated slide-out would race
+    /// with an immediately-following state change (e.g. bar-click
+    /// desktop switch, where setCurrentDesktop's OSD + effect chain
+    /// fight V2's still-rendering post-pass and leave KGlobalAccel in
+    /// a dead state).
+    void teardownImmediate();
+
+public:
     // Effect API
     bool isActive() const override;
     int requestedEffectChainPosition() const override;
