@@ -33,14 +33,93 @@
 #include "scene/workspacescene_vulkan.h"
 #endif
 
+#include <QHash>
 #include <QOpenGLContext>
 #include <QQuickWindow>
 #include <QRunnable>
 #include <QSGImageNode>
 #include <QSGTextureProvider>
+#include <QTimer>
 
 namespace KWin
 {
+
+// Damage-rate diagnostic for the WindowThumbnailSource pipeline. When
+// KWIN_FRAME_BREAKDOWN_DETAIL=1, counts how many damage signals each
+// source receives per second and logs the top contributors. The damage
+// signal is what propagates QML "dirty" through to the desktop-tile
+// layer FBO; a flood here forces the per-tile FBO re-render every frame.
+static const bool s_thumbnailDamageDiagnostic =
+    qEnvironmentVariableIntValue("KWIN_FRAME_BREAKDOWN_DETAIL") != 0;
+
+namespace
+{
+struct DamageCounter
+{
+    // Window* used as a key; the flush callback only reads caption() for
+    // entries whose Window is still alive at flush time. Captions cached
+    // alongside the count so a window that fires damage then immediately
+    // closes still shows up by name in the last log line.
+    QHash<Window *, std::pair<uint32_t, QString>> perWindow;
+    QTimer *flushTimer = nullptr;
+};
+static DamageCounter &damageCounter()
+{
+    static DamageCounter c;
+    return c;
+}
+static void recordDamage(Window *handle)
+{
+    if (!s_thumbnailDamageDiagnostic || !handle) {
+        return;
+    }
+    auto &c = damageCounter();
+    if (!c.flushTimer) {
+        c.flushTimer = new QTimer();
+        c.flushTimer->setInterval(1000);
+        c.flushTimer->setTimerType(Qt::CoarseTimer);
+        QObject::connect(c.flushTimer, &QTimer::timeout, []() {
+            auto &cc = damageCounter();
+            if (cc.perWindow.empty()) {
+                return;
+            }
+            QStringList parts;
+            uint32_t total = 0;
+            for (auto it = cc.perWindow.begin(); it != cc.perWindow.end(); ++it) {
+                if (it.value().first == 0) {
+                    continue;
+                }
+                total += it.value().first;
+                parts.append(QStringLiteral("%1=%2").arg(it.value().second.left(40)).arg(it.value().first));
+            }
+            if (total == 0) {
+                return;
+            }
+            std::sort(parts.begin(), parts.end(), [](const QString &a, const QString &b) {
+                return a.section(QLatin1Char('='), -1).toUInt() > b.section(QLatin1Char('='), -1).toUInt();
+            });
+            qCWarning(KWIN_SCRIPTING).noquote()
+                << "WindowThumbnailSource damage rate (per second): total=" << total
+                << " breakdown=" << parts.mid(0, 10).join(QLatin1Char(';'));
+            for (auto it = cc.perWindow.begin(); it != cc.perWindow.end(); ++it) {
+                it.value().first = 0;
+            }
+        });
+        c.flushTimer->start();
+    }
+    auto &entry = c.perWindow[handle];
+    entry.first++;
+    // Refresh caption each tick so renamed windows show their current title.
+    entry.second = handle->caption();
+}
+static void removeDamageEntry(Window *handle)
+{
+    if (!s_thumbnailDamageDiagnostic) {
+        return;
+    }
+    damageCounter().perWindow.remove(handle);
+}
+}
 
 static bool useGlThumbnails()
 {
@@ -66,8 +145,16 @@ WindowThumbnailSource::WindowThumbnailSource(QQuickWindow *view, Window *handle)
         Q_EMIT changed();
     });
     connect(handle, &Window::damaged, this, [this]() {
+        recordDamage(m_handle);
         m_dirty = true;
-        Q_EMIT changed();
+        // Deliberately do not emit changed() here. update() (driven by
+        // WorkspaceScene::preFrameRender every frame) will emit it after
+        // the texture has actually been re-rendered. Eliminates the
+        // duplicate dirty notification per damage event — every damage
+        // used to fire two QML "item update" hops (once from this slot,
+        // once from update()'s post-render emit), each propagating up
+        // the QML tree to any layer-enabled ancestor and forcing the
+        // tile FBO to dirty twice.
     });
 
     connect(Compositor::self()->scene(), &WorkspaceScene::preFrameRender, this, &WindowThumbnailSource::update);
@@ -79,6 +166,7 @@ WindowThumbnailSource::~WindowThumbnailSource()
 {
 
     if (m_handle) {
+        removeDamageEntry(m_handle);
         m_handle->unrefOffscreenRendering();
     }
 
