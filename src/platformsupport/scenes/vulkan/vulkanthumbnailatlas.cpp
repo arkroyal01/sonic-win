@@ -78,6 +78,14 @@ void VulkanThumbnailAtlas::dropForContext(VulkanContext *ctx)
     atlasRegistry().erase(ctx);
 }
 
+VkImageView VulkanThumbnailAtlas::atlasView()
+{
+    if (!ensureAtlasInitialized()) {
+        return VK_NULL_HANDLE;
+    }
+    return m_atlasSrgbView;
+}
+
 VulkanThumbnailAtlas::VulkanThumbnailAtlas(VulkanContext *ctx)
     : m_context(ctx)
 {

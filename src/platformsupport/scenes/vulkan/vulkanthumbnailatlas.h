@@ -140,6 +140,14 @@ public:
         return m_sampler;
     }
 
+    /// SRGB image view of the shared atlas, lazily allocating the
+    /// atlas image on first call. Use this when a consumer needs any
+    /// valid view bound to the descriptor — e.g. the OverviewEffectV2
+    /// desktop bar, whose shader doesn't actually sample but still
+    /// requires a non-null binding. Returns VK_NULL_HANDLE only if
+    /// atlas initialisation fails.
+    VkImageView atlasView();
+
     /// Mip levels in any atlas-resident slot.
     static constexpr uint32_t kMipLevels = 5;
     /// Atlas dimensions (square).

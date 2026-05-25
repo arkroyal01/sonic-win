@@ -126,6 +126,13 @@ private:
     /// slide-out animation; until then, paintScreen draws.
     bool m_visible = false;
 
+    /// Whether activate() actually grabbed the keyboard. Skipped on
+    /// empty desktops (no tiles to navigate, and the ungrab call
+    /// otherwise leaves KGlobalAccel's Super+W routing dead — the
+    /// keyboard focus chain has nowhere to return to without a
+    /// focused window).
+    bool m_grabbedKeyboard = false;
+
     /// Global toggle shortcut. Same object name as the existing
     /// OverviewEffect's `Overview` action so the user's saved binding
     /// (default `Meta+W`) carries over without reconfiguration.

@@ -991,7 +991,7 @@ void OverviewEffectV2::drawSceneCaptureBackground(VkCommandBuffer cmd, VulkanTex
 
 void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbSize, VkFormat colorFormat)
 {
-    if (!m_atlas || m_windowSlots.empty() || !m_vulkanCtx) {
+    if (!m_atlas || !m_vulkanCtx) {
         return;
     }
     if (!ensureVulkanPipeline(m_vulkanCtx, colorFormat)) {
@@ -1109,6 +1109,14 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
                 }
             }
         }
+        if (anyView == VK_NULL_HANDLE) {
+            // Empty current desktop: no slot views to borrow. Force-
+            // initialise the atlas to get its own view so the bar can
+            // still draw — costs the atlas image's VRAM (~85 MB) on
+            // the first frame, but the user is actively staring at
+            // the overview so the trade is reasonable.
+            anyView = m_atlas->atlasView();
+        }
         if (anyView != VK_NULL_HANDLE) {
             pushView(anyView);
             renderDesktopBar(cmd);
@@ -1123,14 +1131,29 @@ void OverviewEffectV2::activate()
         return;
     }
     m_visible = true;
-    // Capture mouse + keyboard. The keyboard grab routes through
-    // grabbedKeyboardEvent (Esc-to-dismiss); the mouse interception
-    // sends clicks through windowInputMouseEvent (tile hit-test or
-    // click-outside dismiss).
+    // Mouse interception is always on (bar clicks, tile clicks,
+    // click-away dismiss). Keyboard grab is conditional — see below.
     effects->startMouseInterception(this, Qt::ArrowCursor);
-    effects->grabKeyboard(this);
 #if HAVE_VULKAN
     reserveSlotsForCurrentDesktop();
+#endif
+    // Skip the keyboard grab on empty desktops. EffectsHandler::
+    // ungrabKeyboard runs input()->keyboard()->update(), which on an
+    // empty desktop has nowhere to return focus to and silently
+    // breaks KGlobalAccel's Super+W routing for the rest of the
+    // session (until some other path — e.g. the VD plasmoid —
+    // re-arms the focus chain). On empty desktops the user can still
+    // click bar tiles via the mouse intercept, and Super+W keeps
+    // working as a global toggle because we never grab it away.
+    m_grabbedKeyboard = false;
+#if HAVE_VULKAN
+    if (!m_windowSlots.empty()) {
+        m_grabbedKeyboard = effects->grabKeyboard(this);
+    }
+#else
+    m_grabbedKeyboard = effects->grabKeyboard(this);
+#endif
+#if HAVE_VULKAN
     // Subscribe to preFrameRender so the atlas re-renders per frame
     // (per-window dirty tracking is a later optimisation). Bail out
     // gracefully if scene access fails — Phase 2c will gate behaviour
@@ -1192,7 +1215,10 @@ void OverviewEffectV2::deactivate()
     // immediately interact with normal windows again while the slide-
     // out animation finishes drawing.
     effects->stopMouseInterception(this);
-    effects->ungrabKeyboard();
+    if (m_grabbedKeyboard) {
+        effects->ungrabKeyboard();
+        m_grabbedKeyboard = false;
+    }
     m_animation.stop();
     m_animation.setDirection(QVariantAnimation::Backward);
     m_animation.start();
@@ -1209,7 +1235,10 @@ void OverviewEffectV2::teardownImmediate()
     m_preFrameConnection = {};
 #endif
     effects->stopMouseInterception(this);
-    effects->ungrabKeyboard();
+    if (m_grabbedKeyboard) {
+        effects->ungrabKeyboard();
+        m_grabbedKeyboard = false;
+    }
 #if HAVE_VULKAN
     if (m_postPassId != -1) {
         if (auto *scene = Compositor::self()->scene()) {
