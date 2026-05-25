@@ -1328,23 +1328,19 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
 
     const float screenW = std::max(1.0f, float(fbSize.width()));
     const float screenH = std::max(1.0f, float(fbSize.height()));
+    // Drag offset in NDC for the tile being dragged. Recomputed here
+    // so pushAndDraw stays focused on push-constant assembly.
+    const QPointF dragOffsetNdc = (m_dragActive)
+        ? QPointF(2.0 * (m_dragCurrentGlobal.x() - m_dragPressGlobal.x()) / screenW,
+                  2.0 * (m_dragCurrentGlobal.y() - m_dragPressGlobal.y()) / screenH)
+        : QPointF(0, 0);
     auto pushAndDraw = [&](const TileLayout &t, float uvX, float uvY, float uvW, float uvH) {
-        float quadX = t.realNdcX + (t.gridNdcX - t.realNdcX) * factor;
-        float quadY = t.realNdcY + (t.gridNdcY - t.realNdcY) * factor;
-        // Drag offset: while the user is mid-drag from this tile, the
-        // tile follows the cursor (NDC space) instead of sitting in
-        // its grid cell. release commits the move-to-desktop if the
-        // cursor is over a bar tile; otherwise the next frame after
-        // m_dragActive clears snaps the tile back to its grid cell.
-        if (m_dragActive && t.handle == m_dragCandidate) {
-            const float dxNdc = 2.0f * float(m_dragCurrentGlobal.x() - m_dragPressGlobal.x()) / screenW;
-            const float dyNdc = 2.0f * float(m_dragCurrentGlobal.y() - m_dragPressGlobal.y()) / screenH;
-            quadX += dxNdc;
-            quadY += dyNdc;
-        }
+        const bool dragging = m_dragActive && t.handle == m_dragCandidate;
         OverviewQuadPushConstants pc{};
-        pc.quadRectNdc[0] = quadX;
-        pc.quadRectNdc[1] = quadY;
+        pc.quadRectNdc[0] = t.realNdcX + (t.gridNdcX - t.realNdcX) * factor
+            + (dragging ? float(dragOffsetNdc.x()) : 0.0f);
+        pc.quadRectNdc[1] = t.realNdcY + (t.gridNdcY - t.realNdcY) * factor
+            + (dragging ? float(dragOffsetNdc.y()) : 0.0f);
         pc.quadRectNdc[2] = t.realNdcW + (t.gridNdcW - t.realNdcW) * factor;
         pc.quadRectNdc[3] = t.realNdcH + (t.gridNdcH - t.realNdcH) * factor;
         pc.atlasSlotUv[0] = uvX;
