@@ -12,7 +12,11 @@
 
 #include <QVariantAnimation>
 
+#include <memory>
+#include <unordered_map>
+
 #if HAVE_VULKAN
+#include "platformsupport/scenes/vulkan/vulkanthumbnailatlas.h"
 #include <vulkan/vulkan.h>
 #endif
 
@@ -21,8 +25,12 @@ class QAction;
 namespace KWin
 {
 
+class Window;
+
 #if HAVE_VULKAN
 class VulkanContext;
+class VulkanFramebuffer;
+class VulkanRenderPass;
 #endif
 
 /**
@@ -111,11 +119,46 @@ private:
     bool ensureVulkanPipeline(VulkanContext *ctx, VkFormat colorFormat);
     void destroyVulkanPipeline();
 
+    /// On activate(): reserve a `VulkanThumbnailAtlas` slot per window on
+    /// the current virtual desktop, sized to the window's visible
+    /// geometry. Slots are released on deactivation completion. The
+    /// atlas singleton is shared with future consumers (switchers,
+    /// window-view) so memory stays bounded.
+    void reserveSlotsForCurrentDesktop();
+    void releaseAllSlots();
+
+    /// Hook for `WorkspaceScene::preFrameRender`: re-render each
+    /// reserved slot's source window into its atlas region, then run
+    /// the mip cascade and the publishing barrier. No-op when V2 is
+    /// dormant. Phase 2b just sets the framework up; the renderItem
+    /// call lands in phase 2c.
+    void renderWindowsToAtlas();
+
     VulkanContext *m_vulkanCtx = nullptr;
     VkFormat m_pipelineColorFormat = VK_FORMAT_UNDEFINED;
     VkDescriptorSetLayout m_vkDescriptorSetLayout = VK_NULL_HANDLE;
     VkPipelineLayout m_vkPipelineLayout = VK_NULL_HANDLE;
     VkPipeline m_vkPipeline = VK_NULL_HANDLE;
+
+    /// Atlas-backed slot per active source window. Created on activate,
+    /// released on deactivate completion. The atlas itself is a
+    /// process-wide singleton owned by `VulkanThumbnailAtlas::get(ctx)`.
+    VulkanThumbnailAtlas *m_atlas = nullptr;
+    std::unordered_map<Window *, VulkanThumbnailAtlas::Slot> m_windowSlots;
+
+    /// Render pass + framebuffer used by `renderWindowsToAtlas()`. The
+    /// framebuffer wraps the atlas's mip-0 view; viewport + scissor at
+    /// draw time restrict each window's render to its slot's sub-rect.
+    /// Both lazily built on first use and torn down with the rest of
+    /// the Vulkan resources on deactivation.
+    std::unique_ptr<VulkanRenderPass> m_atlasRenderPass;
+    std::unique_ptr<VulkanFramebuffer> m_atlasFramebuffer;
+
+    /// Connection to `WorkspaceScene::preFrameRender`. Active only
+    /// while the effect is animating in or fully shown; disconnected at
+    /// the start of slide-out so we stop scheduling atlas writes once
+    /// the user dismisses.
+    QMetaObject::Connection m_preFrameConnection;
 #endif
 };
 

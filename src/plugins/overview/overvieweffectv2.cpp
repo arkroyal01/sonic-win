@@ -10,13 +10,17 @@
 
 #if HAVE_VULKAN
 #include "compositor.h"
+#include "effect/effectwindow.h"
 #include "platformsupport/scenes/vulkan/vulkanbackend.h"
 #include "platformsupport/scenes/vulkan/vulkancontext.h"
+#include "platformsupport/scenes/vulkan/vulkanframebuffer.h"
 #include "platformsupport/scenes/vulkan/vulkanrenderpass.h"
 #include "platformsupport/scenes/vulkan/vulkanthumbnailatlas.h"
 #include "scene/itemrenderer_vulkan.h"
 #include "scene/workspacescene.h"
 #include "utils/common.h"
+#include "virtualdesktops.h"
+#include "window.h"
 #endif
 
 #include <KGlobalAccel>
@@ -88,6 +92,9 @@ OverviewEffectV2::OverviewEffectV2()
     connect(&m_animation, &QVariantAnimation::finished, this, [this]() {
         if (qFuzzyCompare(m_activationFactor, 0.0)) {
             m_visible = false;
+#if HAVE_VULKAN
+            releaseAllSlots();
+#endif
             effects->addRepaintFull();
         }
     });
@@ -118,6 +125,8 @@ OverviewEffectV2::~OverviewEffectV2()
         KGlobalAccel::self()->removeAllShortcuts(m_toggleAction);
     }
 #if HAVE_VULKAN
+    QObject::disconnect(m_preFrameConnection);
+    releaseAllSlots();
     destroyVulkanPipeline();
 #endif
 }
@@ -336,6 +345,79 @@ void OverviewEffectV2::destroyVulkanPipeline()
     m_pipelineColorFormat = VK_FORMAT_UNDEFINED;
     m_vulkanCtx = nullptr;
 }
+
+void OverviewEffectV2::reserveSlotsForCurrentDesktop()
+{
+    if (!effects || !effects->isVulkanCompositing()) {
+        return;
+    }
+    auto *scene = Compositor::self()->scene();
+    if (!scene) {
+        return;
+    }
+    auto *vkRenderer = dynamic_cast<ItemRendererVulkan *>(scene->renderer());
+    if (!vkRenderer) {
+        return;
+    }
+    m_vulkanCtx = vkRenderer->context();
+    if (!m_vulkanCtx) {
+        return;
+    }
+    m_atlas = VulkanThumbnailAtlas::get(m_vulkanCtx);
+    if (!m_atlas) {
+        return;
+    }
+
+    // Walk current-desktop windows in stacking order and reserve one
+    // atlas slot per window, sized to the window's visible geometry
+    // (matching the rendered region in WindowThumbnailSource's existing
+    // GL path). Hidden / unmanaged windows are skipped.
+    auto *currentDesktop = effects->currentDesktop();
+    for (EffectWindow *ew : effects->stackingOrder()) {
+        if (!ew || !currentDesktop || !ew->isOnDesktop(currentDesktop)) {
+            continue;
+        }
+        Window *handle = ew->window();
+        if (!handle) {
+            continue;
+        }
+        const QSize size = handle->visibleGeometry().toAlignedRect().size();
+        if (size.isEmpty()) {
+            continue;
+        }
+        auto slot = m_atlas->reserve(size);
+        if (!slot.isValid()) {
+            qCWarning(KWIN_VULKAN) << "OverviewEffectV2: atlas reserve failed for"
+                                   << handle->caption().left(40) << size;
+            continue;
+        }
+        m_windowSlots.emplace(handle, std::move(slot));
+    }
+}
+
+void OverviewEffectV2::releaseAllSlots()
+{
+    if (m_atlas) {
+        for (auto &[handle, slot] : m_windowSlots) {
+            m_atlas->release(slot);
+        }
+    }
+    m_windowSlots.clear();
+    m_atlasFramebuffer.reset();
+    m_atlasRenderPass.reset();
+    m_atlas = nullptr;
+}
+
+void OverviewEffectV2::renderWindowsToAtlas()
+{
+    // Phase 2b stub: the framework is in place — `m_windowSlots`
+    // holds a slot per active window, the atlas singleton is bound,
+    // and this slot is connected to WorkspaceScene::preFrameRender
+    // for every frame while the effect is animating or shown. The
+    // actual ItemRendererVulkan::renderItem call + mip-cascade
+    // submission lands in phase 2c, after the slot lifecycle is
+    // shaken out under real activations.
+}
 #endif // HAVE_VULKAN
 
 void OverviewEffectV2::activate()
@@ -344,6 +426,17 @@ void OverviewEffectV2::activate()
         return;
     }
     m_visible = true;
+#if HAVE_VULKAN
+    reserveSlotsForCurrentDesktop();
+    // Subscribe to preFrameRender so the atlas re-renders per frame
+    // (per-window dirty tracking is a later optimisation). Bail out
+    // gracefully if scene access fails — Phase 2c will gate behaviour
+    // on this anyway.
+    if (auto *scene = Compositor::self()->scene()) {
+        m_preFrameConnection = connect(scene, &WorkspaceScene::preFrameRender,
+                                       this, &OverviewEffectV2::renderWindowsToAtlas);
+    }
+#endif
     m_animation.stop();
     m_animation.setDirection(QVariantAnimation::Forward);
     m_animation.start();
@@ -354,6 +447,13 @@ void OverviewEffectV2::deactivate()
     if (!m_visible) {
         return;
     }
+#if HAVE_VULKAN
+    // Stop scheduling atlas writes as soon as deactivation starts; the
+    // slot resources are released only after the slide-out animation
+    // completes (the existing m_animation.finished slot handles that).
+    QObject::disconnect(m_preFrameConnection);
+    m_preFrameConnection = {};
+#endif
     m_animation.stop();
     m_animation.setDirection(QVariantAnimation::Backward);
     m_animation.start();
