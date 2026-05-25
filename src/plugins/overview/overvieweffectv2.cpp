@@ -455,6 +455,7 @@ void OverviewEffectV2::reserveSlotsForCurrentDesktop()
             if (m_atlas) {
                 m_atlas->release(it->second);
             }
+            m_fallbackFramebuffers.erase(handle);
             // No unrefOffscreenRendering here — the window is being
             // destroyed; KWin tears down its own ref tracking.
             m_windowSlots.erase(it);
@@ -482,6 +483,7 @@ void OverviewEffectV2::releaseAllSlots()
     }
     m_windowSlots.clear();
     m_tileLayout.clear();
+    m_fallbackFramebuffers.clear();
     m_atlasFramebuffer.reset();
     m_atlasRenderPass.reset();
     m_atlas = nullptr;
@@ -511,7 +513,7 @@ void OverviewEffectV2::rebuildTileLayout(const QSize &fbSize)
         if (it == m_windowSlots.end()) {
             continue;
         }
-        if (it->second.isFallback || !it->second.hasContent) {
+        if (!it->second.hasContent) {
             continue;
         }
         drawable.push_back({handle, it->second, 0, 0, 0, 0, 0, 0, 0, 0});
@@ -574,13 +576,9 @@ void OverviewEffectV2::renderWindowsToAtlas()
         return;
     }
 
-    // Lazy-build the shared atlas render pass + framebuffer. Both wrap
-    // the atlas's mip-0 view at the full 4096² extent; per-slot
-    // viewport + scissor restricts each renderItem call to the slot's
-    // sub-rect. The atlas image is the same singleton across activations,
-    // so these survive across the slot release/reserve cycle as long as
-    // the VulkanContext doesn't change. Atlas overflow → per-source
-    // dedicated image (fallback) is deferred to phase 2d.
+    // Lazy-build the shared atlas render pass. Reused for fallback
+    // framebuffers too — same color format and GENERAL layouts on both
+    // sides, so render-pass compatibility holds.
     constexpr VkFormat kAtlasFormat = VK_FORMAT_R8G8B8A8_SRGB;
     if (!m_atlasRenderPass) {
         m_atlasRenderPass = VulkanRenderPass::createForAtlasWrite(m_vulkanCtx, kAtlasFormat);
@@ -591,8 +589,8 @@ void OverviewEffectV2::renderWindowsToAtlas()
     }
 
     // Find one atlas-resident slot to learn the shared image+view (any
-    // such slot points at the same atlas resources). Fallback-only
-    // captures are skipped this commit.
+    // such slot points at the same atlas resources). If every slot is
+    // a fallback we skip the atlas render pass entirely.
     VkImage atlasImage = VK_NULL_HANDLE;
     VkImageView atlasMipZero = VK_NULL_HANDLE;
     for (const auto &[_handle, slot] : m_windowSlots) {
@@ -602,10 +600,8 @@ void OverviewEffectV2::renderWindowsToAtlas()
             break;
         }
     }
-    if (atlasImage == VK_NULL_HANDLE) {
-        return; // only fallback slots — phase 2d
-    }
-    if (!m_atlasFramebuffer) {
+    const bool haveAtlasSlots = atlasImage != VK_NULL_HANDLE;
+    if (haveAtlasSlots && !m_atlasFramebuffer) {
         m_atlasFramebuffer = VulkanFramebuffer::create(m_vulkanCtx, m_atlasRenderPass.get(),
                                                        atlasMipZero,
                                                        QSize(VulkanThumbnailAtlas::kAtlasSize,
@@ -639,32 +635,81 @@ void OverviewEffectV2::renderWindowsToAtlas()
     // when we're done.
     vkRenderer->pushOffscreenSlot();
 
-    // Pre-pass barriers (one per slot, all on mip 0). The atlas image
-    // stays in GENERAL throughout (see createForAtlasWrite); these are
-    // memory barriers, not layout transitions.
-    for (auto &[_handle, slot] : m_windowSlots) {
-        if (slot.isFallback) {
-            continue;
+    VkClearValue clearVal{};
+
+    if (haveAtlasSlots) {
+        // Pre-pass barriers for atlas slots. The atlas image stays in
+        // GENERAL throughout (see createForAtlasWrite); these are
+        // memory barriers, not layout transitions.
+        for (auto &[_handle, slot] : m_windowSlots) {
+            if (slot.isFallback) {
+                continue;
+            }
+            m_atlas->prepareForRenderTo(cmd, slot);
         }
-        m_atlas->prepareForRenderTo(cmd, slot);
+
+        // Single render pass covering all atlas-slot writes. Each
+        // slot's renderItem sets its own viewport + scissor so the GPU
+        // only touches that slot's sub-rect.
+        const VkRect2D fullArea{
+            {0, 0},
+            {uint32_t(VulkanThumbnailAtlas::kAtlasSize), uint32_t(VulkanThumbnailAtlas::kAtlasSize)},
+        };
+        m_atlasRenderPass->begin(cmd, m_atlasFramebuffer->framebuffer(), fullArea, &clearVal, 1);
+
+        auto vkRT = std::make_unique<VulkanRenderTarget>(m_atlasFramebuffer.get());
+        vkRT->setCommandBuffer(cmd);
+        RenderTarget atlasTarget(vkRT.get());
+
+        for (auto &[handle, slot] : m_windowSlots) {
+            if (slot.isFallback || !handle) {
+                continue;
+            }
+            const QRectF windowGeom = handle->visibleGeometry();
+            if (windowGeom.isEmpty()) {
+                continue;
+            }
+
+            // Y-flipped viewport matches the main render path (and
+            // WindowThumbnailSource's existing GL path) so the
+            // resulting mip-0 layout reads top-down.
+            VkViewport vp{};
+            vp.x = float(slot.rect.x());
+            vp.y = float(slot.rect.y() + slot.rect.height());
+            vp.width = float(slot.rect.width());
+            vp.height = -float(slot.rect.height());
+            vp.minDepth = 0.0f;
+            vp.maxDepth = 1.0f;
+            vkCmdSetViewport(cmd, 0, 1, &vp);
+
+            VkRect2D scissor{
+                {int32_t(slot.rect.x()), int32_t(slot.rect.y())},
+                {uint32_t(slot.rect.width()), uint32_t(slot.rect.height())},
+            };
+            vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+            // No vertex-offset save/restore here: the offscreen slot's
+            // cursor is meant to accumulate across these renderItem
+            // calls so each slot's vertices land in a disjoint buffer
+            // region. popOffscreenSlot restores the swapchain frame's
+            // cursor at the end of the function.
+            RenderViewport viewport(windowGeom, 1.0, atlasTarget);
+            vkRenderer->renderItem(atlasTarget, viewport, handle->windowItem(),
+                                   Scene::PAINT_WINDOW_TRANSFORMED, infiniteRegion(),
+                                   WindowPaintData{});
+
+            slot.hasContent = true;
+        }
+
+        m_atlasRenderPass->end(cmd);
     }
 
-    // Single render pass covering all atlas-slot writes. Each slot's
-    // renderItem sets its own viewport + scissor so the GPU only
-    // touches that slot's sub-rect.
-    VkClearValue clearVal{};
-    const VkRect2D fullArea{
-        {0, 0},
-        {uint32_t(VulkanThumbnailAtlas::kAtlasSize), uint32_t(VulkanThumbnailAtlas::kAtlasSize)},
-    };
-    m_atlasRenderPass->begin(cmd, m_atlasFramebuffer->framebuffer(), fullArea, &clearVal, 1);
-
-    auto vkRT = std::make_unique<VulkanRenderTarget>(m_atlasFramebuffer.get());
-    vkRT->setCommandBuffer(cmd);
-    RenderTarget atlasTarget(vkRT.get());
-
+    // Fallback slots — one dedicated image per source. Each gets its
+    // own framebuffer (cached on m_fallbackFramebuffers) and its own
+    // begin/end on the shared render pass. Same Y-flipped viewport
+    // convention as the atlas pass.
     for (auto &[handle, slot] : m_windowSlots) {
-        if (slot.isFallback || !handle) {
+        if (!slot.isFallback || !handle) {
             continue;
         }
         const QRectF windowGeom = handle->visibleGeometry();
@@ -672,45 +717,62 @@ void OverviewEffectV2::renderWindowsToAtlas()
             continue;
         }
 
-        // Y-flipped viewport matches the main render path (and
-        // WindowThumbnailSource's existing GL path) so the resulting
-        // mip-0 layout reads top-down.
+        auto &fb = m_fallbackFramebuffers[handle];
+        if (!fb) {
+            fb = VulkanFramebuffer::create(m_vulkanCtx, m_atlasRenderPass.get(),
+                                           slot.mipZeroView, slot.rect.size());
+            if (!fb) {
+                qCWarning(KWIN_OVERVIEW_V2_LOG)
+                    << "OverviewEffectV2: fallback framebuffer wrap failed for"
+                    << handle->caption().left(40) << slot.rect.size();
+                m_fallbackFramebuffers.erase(handle);
+                continue;
+            }
+            fb->setColorImage(slot.image);
+        }
+
+        m_atlas->prepareForRenderTo(cmd, slot);
+
+        const VkRect2D fullArea{
+            {0, 0},
+            {uint32_t(slot.rect.width()), uint32_t(slot.rect.height())},
+        };
+        m_atlasRenderPass->begin(cmd, fb->framebuffer(), fullArea, &clearVal, 1);
+
+        auto vkRT = std::make_unique<VulkanRenderTarget>(fb.get());
+        vkRT->setCommandBuffer(cmd);
+        RenderTarget fallbackTarget(vkRT.get());
+
         VkViewport vp{};
-        vp.x = float(slot.rect.x());
-        vp.y = float(slot.rect.y() + slot.rect.height());
+        vp.x = 0.0f;
+        vp.y = float(slot.rect.height());
         vp.width = float(slot.rect.width());
         vp.height = -float(slot.rect.height());
         vp.minDepth = 0.0f;
         vp.maxDepth = 1.0f;
         vkCmdSetViewport(cmd, 0, 1, &vp);
 
-        VkRect2D scissor{
-            {int32_t(slot.rect.x()), int32_t(slot.rect.y())},
+        const VkRect2D scissor{
+            {0, 0},
             {uint32_t(slot.rect.width()), uint32_t(slot.rect.height())},
         };
         vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-        // No vertex-offset save/restore here: the offscreen slot's
-        // cursor is meant to accumulate across these renderItem calls
-        // so each slot's vertices land in a disjoint buffer region.
-        // popOffscreenSlot restores the swapchain frame's cursor at
-        // the end of the function.
-        RenderViewport viewport(windowGeom, 1.0, atlasTarget);
-        vkRenderer->renderItem(atlasTarget, viewport, handle->windowItem(),
+        RenderViewport viewport(windowGeom, 1.0, fallbackTarget);
+        vkRenderer->renderItem(fallbackTarget, viewport, handle->windowItem(),
                                Scene::PAINT_WINDOW_TRANSFORMED, infiniteRegion(),
                                WindowPaintData{});
+
+        m_atlasRenderPass->end(cmd);
 
         slot.hasContent = true;
     }
 
-    m_atlasRenderPass->end(cmd);
-
-    // Mip cascade per slot + the publishing barrier that lets the
-    // post-pass sample these slots in the same submit chain.
+    // Mip cascade + publishing barrier for every slot — atlas and
+    // fallback share the same prepare/publish API. Without this the
+    // post-pass would sample undefined memory for tiles drawn at less
+    // than 1:1 (mip > 0).
     for (auto &[_handle, slot] : m_windowSlots) {
-        if (slot.isFallback) {
-            continue;
-        }
         m_atlas->generateMipsAndPublish(cmd, slot);
     }
 
@@ -803,20 +865,6 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
         return;
     }
 
-    // Pick the atlas's SRGB view from any atlas-resident slot — they
-    // all share the singleton atlas image. Skip if only fallback
-    // slots are reserved (phase 2d doesn't sample fallbacks yet).
-    VkImageView atlasSrgbView = VK_NULL_HANDLE;
-    for (const auto &[_handle, slot] : m_windowSlots) {
-        if (!slot.isFallback && slot.hasContent) {
-            atlasSrgbView = slot.srgbView;
-            break;
-        }
-    }
-    if (atlasSrgbView == VK_NULL_HANDLE) {
-        return;
-    }
-
     auto *backend = m_vulkanCtx->backend();
     auto pushDescriptor = backend->cmdPushDescriptorSetKHR();
     if (!pushDescriptor) {
@@ -825,25 +873,6 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
         // flag would have failed earlier. Guard here for safety.
         return;
     }
-
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_vkPipeline);
-
-    VkDescriptorImageInfo imgInfo{};
-    imgInfo.sampler = m_atlas->sampler();
-    imgInfo.imageView = atlasSrgbView;
-    imgInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-    VkWriteDescriptorSet write{};
-    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    write.dstBinding = 0;
-    write.descriptorCount = 1;
-    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    write.pImageInfo = &imgInfo;
-    pushDescriptor(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_vkPipelineLayout, 0, 1, &write);
-
-    VkViewport vp{0.0f, 0.0f, float(fbSize.width()), float(fbSize.height()), 0.0f, 1.0f};
-    vkCmdSetViewport(cmd, 0, 1, &vp);
-    VkRect2D scissor{{0, 0}, {uint32_t(fbSize.width()), uint32_t(fbSize.height())}};
-    vkCmdSetScissor(cmd, 0, 1, &scissor);
 
     // Refresh the cached layout each frame: window geometries can shift
     // (e.g. on resize during overview), and the hit-test must consume
@@ -855,24 +884,79 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
     if (m_tileLayout.empty()) {
         return;
     }
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_vkPipeline);
+    VkViewport vp{0.0f, 0.0f, float(fbSize.width()), float(fbSize.height()), 0.0f, 1.0f};
+    vkCmdSetViewport(cmd, 0, 1, &vp);
+    VkRect2D scissor{{0, 0}, {uint32_t(fbSize.width()), uint32_t(fbSize.height())}};
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+
     const float atlasSize = float(VulkanThumbnailAtlas::kAtlasSize);
     const float factor = float(std::clamp(m_activationFactor, 0.0, 1.0));
 
-    for (const TileLayout &t : m_tileLayout) {
+    auto pushView = [&](VkImageView view) {
+        VkDescriptorImageInfo imgInfo{};
+        imgInfo.sampler = m_atlas->sampler();
+        imgInfo.imageView = view;
+        imgInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkWriteDescriptorSet write{};
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstBinding = 0;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        write.pImageInfo = &imgInfo;
+        pushDescriptor(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_vkPipelineLayout, 0, 1, &write);
+    };
+
+    auto pushAndDraw = [&](const TileLayout &t, float uvX, float uvY, float uvW, float uvH) {
         OverviewQuadPushConstants pc{};
         pc.quadRectNdc[0] = t.realNdcX + (t.gridNdcX - t.realNdcX) * factor;
         pc.quadRectNdc[1] = t.realNdcY + (t.gridNdcY - t.realNdcY) * factor;
         pc.quadRectNdc[2] = t.realNdcW + (t.gridNdcW - t.realNdcW) * factor;
         pc.quadRectNdc[3] = t.realNdcH + (t.gridNdcH - t.realNdcH) * factor;
-        pc.atlasSlotUv[0] = float(t.slot.rect.x()) / atlasSize;
-        pc.atlasSlotUv[1] = float(t.slot.rect.y()) / atlasSize;
-        pc.atlasSlotUv[2] = float(t.slot.rect.width()) / atlasSize;
-        pc.atlasSlotUv[3] = float(t.slot.rect.height()) / atlasSize;
+        pc.atlasSlotUv[0] = uvX;
+        pc.atlasSlotUv[1] = uvY;
+        pc.atlasSlotUv[2] = uvW;
+        pc.atlasSlotUv[3] = uvH;
         pc.opacity = factor;
-
         vkCmdPushConstants(cmd, m_vkPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
                            0, sizeof(pc), &pc);
         vkCmdDraw(cmd, 4, 1, 0, 0);
+    };
+
+    // Pass 1: atlas-resident tiles share the singleton atlas view.
+    // One descriptor push, then a batch of draws.
+    VkImageView atlasSrgbView = VK_NULL_HANDLE;
+    for (const TileLayout &t : m_tileLayout) {
+        if (!t.slot.isFallback) {
+            atlasSrgbView = t.slot.srgbView;
+            break;
+        }
+    }
+    if (atlasSrgbView != VK_NULL_HANDLE) {
+        pushView(atlasSrgbView);
+        for (const TileLayout &t : m_tileLayout) {
+            if (t.slot.isFallback) {
+                continue;
+            }
+            pushAndDraw(t,
+                        float(t.slot.rect.x()) / atlasSize,
+                        float(t.slot.rect.y()) / atlasSize,
+                        float(t.slot.rect.width()) / atlasSize,
+                        float(t.slot.rect.height()) / atlasSize);
+        }
+    }
+
+    // Pass 2: fallback tiles each have their own dedicated image, so
+    // re-push the descriptor per draw. UV is the full texture (the
+    // slot owns the entire image). With typical fallback counts in the
+    // single digits the per-tile descriptor switch is negligible.
+    for (const TileLayout &t : m_tileLayout) {
+        if (!t.slot.isFallback) {
+            continue;
+        }
+        pushView(t.slot.srgbView);
+        pushAndDraw(t, 0.0f, 0.0f, 1.0f, 1.0f);
     }
 }
 #endif // HAVE_VULKAN

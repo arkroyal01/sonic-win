@@ -203,6 +203,15 @@ private:
     std::unique_ptr<VulkanRenderPass> m_atlasRenderPass;
     std::unique_ptr<VulkanFramebuffer> m_atlasFramebuffer;
 
+    /// One framebuffer per fallback slot — windows that didn't fit in
+    /// the shared atlas get a dedicated VkImage from the atlas
+    /// allocator and we wrap its mip-0 view here. Reuses
+    /// m_atlasRenderPass (same format + GENERAL layouts); only the
+    /// framebuffer differs. Lazily built per-slot inside
+    /// renderWindowsToAtlas and torn down in releaseAllSlots / the
+    /// per-window destroy callback.
+    std::unordered_map<Window *, std::unique_ptr<VulkanFramebuffer>> m_fallbackFramebuffers;
+
     /// Tracks the previous per-frame atlas submit. Waited on before
     /// recording the next frame so the shared streaming vertex buffer's
     /// reused region is GPU-finished, matching the WindowThumbnailSource
