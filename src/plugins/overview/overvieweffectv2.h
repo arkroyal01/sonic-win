@@ -90,8 +90,15 @@ public:
                      const QRegion &region, Output *screen) override;
     void postPaintScreen() override;
     void grabbedKeyboardEvent(QKeyEvent *event) override;
+    void windowInputMouseEvent(QEvent *event) override;
 
 private:
+    /// Hit-test a global mouse position against the current tile grid.
+    /// Returns the Window* whose tile contains @p globalPos, or nullptr
+    /// if the click is outside any tile. Recomputes the same grid the
+    /// post-pass draws — keeps the two paths trivially consistent.
+    Window *hitTestTile(const QPoint &globalPos) const;
+
     /// State machine for the slide-in/out animation. Drives
     /// `m_activationFactor` (0 = hidden, 1 = fully shown) over
     /// `m_animationDuration` ms. We use QVariantAnimation rather than

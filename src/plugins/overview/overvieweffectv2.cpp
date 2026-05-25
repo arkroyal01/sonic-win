@@ -809,6 +809,12 @@ void OverviewEffectV2::activate()
         return;
     }
     m_visible = true;
+    // Capture mouse + keyboard. The keyboard grab routes through
+    // grabbedKeyboardEvent (Esc-to-dismiss); the mouse interception
+    // sends clicks through windowInputMouseEvent (tile hit-test or
+    // click-outside dismiss).
+    effects->startMouseInterception(this, Qt::ArrowCursor);
+    effects->grabKeyboard(this);
 #if HAVE_VULKAN
     reserveSlotsForCurrentDesktop();
     // Subscribe to preFrameRender so the atlas re-renders per frame
@@ -868,6 +874,11 @@ void OverviewEffectV2::deactivate()
     QObject::disconnect(m_preFrameConnection);
     m_preFrameConnection = {};
 #endif
+    // Release input grabs at the start of deactivate; the user can
+    // immediately interact with normal windows again while the slide-
+    // out animation finishes drawing.
+    effects->stopMouseInterception(this);
+    effects->ungrabKeyboard();
     m_animation.stop();
     m_animation.setDirection(QVariantAnimation::Backward);
     m_animation.start();
@@ -935,6 +946,97 @@ void OverviewEffectV2::grabbedKeyboardEvent(QKeyEvent *event)
     if (event->type() == QEvent::KeyPress && event->key() == Qt::Key_Escape) {
         deactivate();
     }
+}
+
+void OverviewEffectV2::windowInputMouseEvent(QEvent *event)
+{
+    if (!m_visible || event->type() != QEvent::MouseButtonPress) {
+        return;
+    }
+    auto *mouseEvent = dynamic_cast<QMouseEvent *>(event);
+    if (!mouseEvent || mouseEvent->button() != Qt::LeftButton) {
+        return;
+    }
+    // Hold off clicks until the slide-in animation has substantially
+    // settled — otherwise the user clicks a tile that's still
+    // animating from its real position and the hit-test against the
+    // grid position misses. 0.95 is a comfortable threshold; the user
+    // can't perceive the last 5% of the OutCubic anyway.
+    if (m_activationFactor < 0.95) {
+        return;
+    }
+    const QPoint pos = mouseEvent->globalPosition().toPoint();
+    if (Window *target = hitTestTile(pos)) {
+        if (target->effectWindow()) {
+            effects->activateWindow(target->effectWindow());
+        }
+        deactivate();
+        return;
+    }
+    // Click outside any tile: dismiss the overview (matches the QML
+    // overview's TapHandler on the underlay).
+    deactivate();
+}
+
+Window *OverviewEffectV2::hitTestTile(const QPoint &globalPos) const
+{
+#if HAVE_VULKAN
+    if (m_windowSlots.empty() || !effects) {
+        return nullptr;
+    }
+    const QRect screen = effects->virtualScreenGeometry();
+    if (screen.isEmpty() || !screen.contains(globalPos)) {
+        return nullptr;
+    }
+    // Recompute the same grid the post-pass draws when factor==1: same
+    // column count, same cell sizing, same kTilePad. Iterate in the
+    // map's insertion-order-equivalent (unordered_map doesn't
+    // guarantee, but consistent within a session) and pick the first
+    // tile whose grid cell contains the click. Future polish: keep the
+    // (Window* → grid cell) layout cached alongside m_windowSlots so
+    // both the hit-test and the draw read the same map.
+    int drawable = 0;
+    for (const auto &[_handle, slot] : m_windowSlots) {
+        if (!slot.isFallback && slot.hasContent) {
+            ++drawable;
+        }
+    }
+    if (drawable == 0) {
+        return nullptr;
+    }
+    const int cols = std::max(1, int(std::ceil(std::sqrt(double(drawable)))));
+    const float cellW = 1.6f / cols;
+    const int rows = (drawable + cols - 1) / cols;
+    const float cellH = 1.6f / rows;
+    constexpr float kTilePad = 0.9f;
+    const float screenW = std::max(1.0f, float(screen.width()));
+    const float screenH = std::max(1.0f, float(screen.height()));
+
+    // Mouse pos → NDC. virtualScreenGeometry is in scene coordinates;
+    // hit position relative to its top-left.
+    const float mxNdc = (float(globalPos.x() - screen.x()) / screenW) * 2.0f - 1.0f;
+    const float myNdc = (float(globalPos.y() - screen.y()) / screenH) * 2.0f - 1.0f;
+
+    int idx = 0;
+    for (const auto &[handle, slot] : m_windowSlots) {
+        if (slot.isFallback || !slot.hasContent || !handle) {
+            continue;
+        }
+        const int col = idx % cols;
+        const int row = idx / cols;
+        const float gridX = -0.8f + col * cellW;
+        const float gridY = -0.8f + row * cellH;
+        const float gridW = cellW * kTilePad;
+        const float gridH = cellH * kTilePad;
+        if (mxNdc >= gridX && mxNdc <= gridX + gridW
+            && myNdc >= gridY && myNdc <= gridY + gridH) {
+            return handle;
+        }
+        ++idx;
+    }
+#endif
+    Q_UNUSED(globalPos)
+    return nullptr;
 }
 
 } // namespace KWin
