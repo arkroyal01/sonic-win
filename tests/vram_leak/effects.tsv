@@ -1,0 +1,107 @@
+# Effect dispatch table for tests/vram_leak/run.sh
+# Columns: id<TAB>category<TAB>detail<TAB>perf_class_substr
+#
+# Category and detail forms:
+#   overlay  + kga:<Action>            -- invoke kglobalaccel action twice
+#                                         (QuickSceneEffects toggle on 2nd call)
+#   overlay  + kga2:<On>:<Off>         -- distinct on/off actions (zoom in/out)
+#   overlay  + kgaN:A1|A2|A3|...       -- round-robin across N actions (one per
+#                                         call), each invoked twice to toggle.
+#                                         Use for effects with multiple
+#                                         activation modes (windowview's four
+#                                         Expose / ExposeAll / ExposeClass /
+#                                         ExposeClassCurrentDesktop variants)
+#   overlay  + load                    -- plugin load/unload only
+#   winevent + -                       -- spawn + kill xterm (fires add/close
+#                                         signals; covers fade/scale/glide/etc.)
+#   winaction+ kga:<Action>            -- spawn xterm, invoke action on it,
+#                                         then kill (fires the specific window-
+#                                         state signal: maximize/minimize/shade)
+#   twinswap + -                       -- spawn two xterms, swap focus between
+#                                         them (fires windowActivated and
+#                                         stackingOrderChanged -- needed for
+#                                         diminactive and slideback)
+#   blurwin  + <atom_name>             -- spawn xterm, stamp the named X11 atom
+#                                         on it, wait for kwin to react
+#                                         (blur / contrast only allocate when
+#                                         the property is set on a real client)
+#   desktop  + -                       -- super+ctrl+Right then Left
+#   filter   + -                       -- DBus unloadEffect/loadEffect
+#
+# Excluded by intent:
+#   showfps, showpaint           -- debug overlays (every-frame painting)
+#   login, logout, sessionquit   -- session lifecycle, would log user out
+#   kscreen, frozenapp, fullscreen, eyeonscreen, dimscreen, screenedge,
+#   outputlocator, colorpicker, screenshot, systembell, windowaperture,
+#   thumbnailaside (no client window with thumbnail)
+#                                -- internal/system effects, no headless trigger
+#                                   that reliably allocates GPU resources
+#   overview (the legacy V1)     -- "Effect is not supported" on this fork
+#
+# ============================================================================
+# Overlay effects -- fullscreen UI activated via global shortcut
+# ============================================================================
+overviewv2	overlay	kga:Overview	OverviewEffectV2
+windowview	overlay	kgaN:Expose|ExposeAll|ExposeClass|ExposeClassCurrentDesktop	WindowView
+cube	overlay	kga:Cube	Cube
+invert	overlay	kga:Invert	InvertEffect
+zoom	overlay	kga2:view_zoom_in:view_zoom_out	ZoomEffect
+tileseditor	overlay	kga:Edit Tiles	TilesEditorEffect
+mouseclick	overlay	kga:ToggleMouseClick	MouseClickEffect
+trackmouse	overlay	kga:TrackMouse	TrackMouseEffect
+magnifier	overlay	load	MagnifierEffect
+mousemark	overlay	load	MouseMarkEffect
+#
+# ============================================================================
+# Window add/close animations -- fired by spawning + killing xterm
+# ============================================================================
+fade	winevent	-	FadeEffect
+scale	winevent	-	ScaleEffect
+glide	winevent	-	GlideEffect
+fallapart	winevent	-	FallApartEffect
+squash	winevent	-	SquashEffect
+startupfeedback	winevent	-	StartupFeedbackEffect
+# Listed but won't fully animate from xterm spawn alone:
+#   wobblywindows   needs user-driven move/resize (we can't safely enter
+#                   kwin's interactive move mode headless)
+#   dialogparent    needs WM_TRANSIENT_FOR set (real dialog parent)
+#   slidingpopups   needs popup-type windows (tooltips/menus)
+#   fadingpopups    needs popup-type windows
+#   highlightwindow needs explicit org.kde.KWin DBus highlight call
+# Their plugin lifecycle is still tested by the surrounding load/unload.
+wobblywindows	winevent	-	WobblyWindowsEffect
+dialogparent	winevent	-	DialogParentEffect
+slidingpopups	winevent	-	SlidingPopupsEffect
+fadingpopups	winevent	-	FadingPopupsEffect
+highlightwindow	winevent	-	HighlightWindowEffect
+#
+# Focus-driven (need two windows on screen, focus swapping between them)
+diminactive	twinswap	-	DimInactiveEffect
+slideback	twinswap	-	SlideBackEffect
+#
+# ============================================================================
+# Window-action animations -- spawn xterm, invoke action on it, then close
+# (covers maximize/minimize/shade animations that fire on a specific signal)
+# ============================================================================
+maximize	winaction	kga:Window Maximize	MaximizeEffect
+magiclamp	winaction	kga:Window Minimize	MagicLampEffect
+sheet	winaction	kga:Window Shade	SheetEffect
+#
+# ============================================================================
+# Desktop-switch animations
+# ============================================================================
+slide	desktop	-	SlideEffect
+fadedesktop	desktop	-	FadeDesktopEffect
+#
+# ============================================================================
+# Property-driven filters -- only allocate when a window carries the right atom
+# ============================================================================
+blur	blurwin	_KDE_NET_WM_BLUR_BEHIND_REGION	BlurEffect
+contrast	blurwin	_KDE_NET_WM_BACKGROUND_CONTRAST_REGION	ContrastEffect
+#
+# ============================================================================
+# Other filters -- exercised via plugin load/unload (no per-window trigger)
+# ============================================================================
+blendchanges	filter	-	BlendChangesEffect
+colorblindnesscorrection	filter	-	ColorBlindnessCorrectionEffect
+translucency	filter	-	TranslucencyEffect
