@@ -452,6 +452,24 @@ private:
     std::unique_ptr<VulkanRenderPass> m_postPassCompatRenderPass;
     VkFormat m_pipelineColorFormat = VK_FORMAT_UNDEFINED;
 
+    /// SkyBox-mode background pipeline. Reuses the cube-face
+    /// descriptor set layout (one combined-image-sampler) but binds
+    /// the loaded skybox texture instead of an atlas slot. Push
+    /// constants here are inverse(P*V) + opacity, not MVP.
+    VkShaderModule m_skyboxVertModule = VK_NULL_HANDLE;
+    VkShaderModule m_skyboxFragModule = VK_NULL_HANDLE;
+    VkPipelineLayout m_skyboxPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline m_skyboxPipeline = VK_NULL_HANDLE;
+
+    /// Build the skybox pipeline lazily on first activate with a
+    /// valid m_skyboxPath. Same compat-render-pass shape as the
+    /// face pipeline.
+    bool ensureSkyboxPipeline(VulkanContext *ctx, VkFormat colorFormat);
+    void destroySkyboxPipeline();
+    /// Lazy load m_skyboxPath into m_skyboxTexture. Returns true if
+    /// the texture is valid and ready to bind.
+    bool ensureSkyboxTexture();
+
     /// Drop every per-activation GPU resource: atlas slots,
     /// visibility refs, skybox texture, atlas singleton. Pipelines
     /// + descriptor layouts stay (they're cheap to keep, expensive

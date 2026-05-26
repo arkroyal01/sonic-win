@@ -26,6 +26,7 @@
 #include "scene/itemrenderer_vulkan.h"
 #include "scene/workspacescene.h"
 
+#include "shaders/background_skybox_spv.inc"
 #include "shaders/cube_face_spv.inc"
 
 using namespace KWin::CubeEffectV2Shaders;
@@ -223,8 +224,15 @@ void CubeEffectV2::loadConfig()
 
     // MSAA enum: Off / X2 / X4 / X8 → 1 / 2 / 4 / 8 samples. Default
     // Off so existing kwinrc files (which don't have this key) get
-    // the same render path as V1 had. Phase 4 wires this into the
-    // render-pass creation and adds the resolve attachment.
+    // the same render path as V1 had.
+    //
+    // Implementation status: the cube post-pass currently piggybacks
+    // on the renderer's swapchain post-FX render pass, which is fixed
+    // at 1 sample. Honest MSAA requires an offscreen MSAA color
+    // attachment + a resolve attachment, drawn before the renderer's
+    // main pass and composited back. Until that path lands we accept
+    // the config value but log when the user picked > 1x so they
+    // know the request was seen.
     const QString msaa = group.readEntry(QStringLiteral("MSAA"), QStringLiteral("Off"));
     if (msaa == QLatin1String("X2")) {
         m_msaaSamples = 2;
@@ -234,6 +242,12 @@ void CubeEffectV2::loadConfig()
         m_msaaSamples = 8;
     } else {
         m_msaaSamples = 1;
+    }
+    if (m_msaaSamples > 1) {
+        qCWarning(KWIN_CUBE_V2_LOG)
+            << "CubeEffectV2: MSAA=" << m_msaaSamples
+            << "configured, but the offscreen MSAA render path is "
+               "not yet implemented; rendering at 1x for now.";
     }
 }
 
@@ -925,6 +939,7 @@ bool CubeEffectV2::ensureVulkanPipeline(VulkanContext *ctx, VkFormat colorFormat
 
 void CubeEffectV2::destroyVulkanPipeline()
 {
+    destroySkyboxPipeline();
     if (!m_vulkanCtx) {
         // Modules / layouts can't be destroyed without a device, but
         // nothing was created either if m_vulkanCtx is null.
@@ -960,6 +975,193 @@ void CubeEffectV2::destroyVulkanPipeline()
     }
     m_postPassCompatRenderPass.reset();
     m_pipelineColorFormat = VK_FORMAT_UNDEFINED;
+}
+
+// SkyBox push constants — kept layout-compatible with
+// background_skybox.{vert,frag}'s push-constant block.
+struct CubeSkyboxPushConstants
+{
+    float invViewProj[16];
+    float opacity;
+    float _pad[3];
+};
+
+bool CubeEffectV2::ensureSkyboxTexture()
+{
+    if (m_skyboxTexture && m_skyboxTexture->isValid()) {
+        return true;
+    }
+    if (!m_vulkanCtx) {
+        return false;
+    }
+    if (!m_skyboxPath.isValid() || m_skyboxPath.isEmpty()) {
+        return false;
+    }
+    QImage img;
+    const QString local = m_skyboxPath.isLocalFile() ? m_skyboxPath.toLocalFile()
+                                                     : m_skyboxPath.toString();
+    if (!img.load(local)) {
+        qCWarning(KWIN_CUBE_V2_LOG) << "CubeEffectV2: skybox load failed:" << local;
+        return false;
+    }
+    // Convert to premultiplied RGBA — VulkanTexture::upload expects
+    // that for the cube renderer's blend setup
+    // ([[project_vulkan_premultiplied_alpha]]).
+    img = img.convertToFormat(QImage::Format_RGBA8888_Premultiplied);
+    m_skyboxTexture = VulkanTexture::upload(m_vulkanCtx, img);
+    if (!m_skyboxTexture) {
+        qCWarning(KWIN_CUBE_V2_LOG) << "CubeEffectV2: skybox upload failed:" << local;
+        return false;
+    }
+    return true;
+}
+
+bool CubeEffectV2::ensureSkyboxPipeline(VulkanContext *ctx, VkFormat colorFormat)
+{
+    if (m_skyboxPipeline != VK_NULL_HANDLE && m_pipelineColorFormat == colorFormat) {
+        return true;
+    }
+    if (m_skyboxPipeline != VK_NULL_HANDLE) {
+        destroySkyboxPipeline();
+    }
+    if (!ctx || m_vkDescriptorSetLayout == VK_NULL_HANDLE) {
+        // Cube-face pipeline must have built first — we share its
+        // descriptor set layout.
+        return false;
+    }
+    VkDevice device = ctx->backend()->device();
+
+    auto makeModule = [&](const uint32_t *code, size_t byteSize) -> VkShaderModule {
+        VkShaderModuleCreateInfo info{};
+        info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        info.codeSize = byteSize;
+        info.pCode = code;
+        VkShaderModule mod = VK_NULL_HANDLE;
+        vkCreateShaderModule(device, &info, nullptr, &mod);
+        return mod;
+    };
+    m_skyboxVertModule = makeModule(kSkyboxVertSpv, sizeof(kSkyboxVertSpv));
+    m_skyboxFragModule = makeModule(kSkyboxFragSpv, sizeof(kSkyboxFragSpv));
+    if (!m_skyboxVertModule || !m_skyboxFragModule) {
+        destroySkyboxPipeline();
+        return false;
+    }
+
+    VkPushConstantRange pcRange{};
+    pcRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    pcRange.offset = 0;
+    pcRange.size = sizeof(CubeSkyboxPushConstants);
+
+    VkPipelineLayoutCreateInfo plInfo{};
+    plInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    plInfo.setLayoutCount = 1;
+    plInfo.pSetLayouts = &m_vkDescriptorSetLayout;
+    plInfo.pushConstantRangeCount = 1;
+    plInfo.pPushConstantRanges = &pcRange;
+    if (vkCreatePipelineLayout(device, &plInfo, nullptr, &m_skyboxPipelineLayout) != VK_SUCCESS) {
+        destroySkyboxPipeline();
+        return false;
+    }
+
+    if (!m_postPassCompatRenderPass) {
+        return false;
+    }
+
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = m_skyboxVertModule;
+    stages[0].pName = "main";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = m_skyboxFragModule;
+    stages[1].pName = "main";
+
+    VkPipelineVertexInputStateCreateInfo vi{};
+    vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    VkPipelineInputAssemblyStateCreateInfo ia{};
+    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vpState{};
+    vpState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    vpState.viewportCount = 1;
+    vpState.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs{};
+    rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms{};
+    ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineColorBlendAttachmentState cba{};
+    cba.blendEnable = VK_TRUE;
+    cba.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+    cba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    cba.colorBlendOp = VK_BLEND_OP_ADD;
+    cba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    cba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    cba.alphaBlendOp = VK_BLEND_OP_ADD;
+    cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+        | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo cb{};
+    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    cb.attachmentCount = 1;
+    cb.pAttachments = &cba;
+    const VkDynamicState dynStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dyn{};
+    dyn.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dyn.dynamicStateCount = 2;
+    dyn.pDynamicStates = dynStates;
+
+    VkGraphicsPipelineCreateInfo gpInfo{};
+    gpInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    gpInfo.stageCount = 2;
+    gpInfo.pStages = stages;
+    gpInfo.pVertexInputState = &vi;
+    gpInfo.pInputAssemblyState = &ia;
+    gpInfo.pViewportState = &vpState;
+    gpInfo.pRasterizationState = &rs;
+    gpInfo.pMultisampleState = &ms;
+    gpInfo.pColorBlendState = &cb;
+    gpInfo.pDynamicState = &dyn;
+    gpInfo.layout = m_skyboxPipelineLayout;
+    gpInfo.renderPass = m_postPassCompatRenderPass->renderPass();
+    gpInfo.subpass = 0;
+    if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &gpInfo, nullptr, &m_skyboxPipeline) != VK_SUCCESS) {
+        destroySkyboxPipeline();
+        return false;
+    }
+    return true;
+}
+
+void CubeEffectV2::destroySkyboxPipeline()
+{
+    if (!m_vulkanCtx) {
+        m_skyboxVertModule = VK_NULL_HANDLE;
+        m_skyboxFragModule = VK_NULL_HANDLE;
+        m_skyboxPipelineLayout = VK_NULL_HANDLE;
+        m_skyboxPipeline = VK_NULL_HANDLE;
+        return;
+    }
+    VkDevice device = m_vulkanCtx->backend()->device();
+    if (m_skyboxPipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device, m_skyboxPipeline, nullptr);
+        m_skyboxPipeline = VK_NULL_HANDLE;
+    }
+    if (m_skyboxPipelineLayout != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(device, m_skyboxPipelineLayout, nullptr);
+        m_skyboxPipelineLayout = VK_NULL_HANDLE;
+    }
+    if (m_skyboxVertModule != VK_NULL_HANDLE) {
+        vkDestroyShaderModule(device, m_skyboxVertModule, nullptr);
+        m_skyboxVertModule = VK_NULL_HANDLE;
+    }
+    if (m_skyboxFragModule != VK_NULL_HANDLE) {
+        vkDestroyShaderModule(device, m_skyboxFragModule, nullptr);
+        m_skyboxFragModule = VK_NULL_HANDLE;
+    }
 }
 
 QMatrix4x4 CubeEffectV2::faceModelMatrix(int i, int n) const
@@ -1019,6 +1221,80 @@ void CubeEffectV2::onPostPass(VkCommandBuffer cmd, VulkanTexture *sceneCapture,
 
     updateViewProjection(fbSize);
 
+    // Background pass. The renderer's post-FX pass uses LOAD_OP_DONT_CARE
+    // so without this every pixel outside a cube face would be undefined
+    // garbage. Color mode = clear to the configured BackgroundColor;
+    // SkyBox mode draws an equirect sample on top of that clear.
+    const float factor = float(m_activationFactor);
+    {
+        VkClearAttachment clear{};
+        clear.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        clear.colorAttachment = 0;
+        // Premultiplied alpha — the post-FX pass blends with the
+        // scene capture beneath via the renderer's compositing path,
+        // so a partial-opacity activation ramps the background in
+        // alongside the cube faces.
+        clear.clearValue.color.float32[0] =
+            float(m_backgroundColor.redF()) * factor;
+        clear.clearValue.color.float32[1] =
+            float(m_backgroundColor.greenF()) * factor;
+        clear.clearValue.color.float32[2] =
+            float(m_backgroundColor.blueF()) * factor;
+        clear.clearValue.color.float32[3] = factor;
+        VkClearRect clearRect{};
+        clearRect.rect = VkRect2D{
+            {0, 0},
+            {uint32_t(fbSize.width()), uint32_t(fbSize.height())},
+        };
+        clearRect.baseArrayLayer = 0;
+        clearRect.layerCount = 1;
+        vkCmdClearAttachments(cmd, 1, &clear, 1, &clearRect);
+    }
+
+    // SkyBox pass: equirect sample using the view ray. Falls through
+    // to plain Color when the texture isn't loaded (invalid path,
+    // upload failure, etc.) — UX is then "Color background" without
+    // a crash.
+    if (m_backgroundMode == Background::SkyBox
+        && ensureSkyboxPipeline(m_vulkanCtx, colorFormat)
+        && ensureSkyboxTexture()
+        && m_skyboxTexture && m_skyboxTexture->isValid()) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_skyboxPipeline);
+        // The skybox covers the full screen, same viewport+scissor
+        // as the cube faces. Y-flip applied identically.
+        VkViewport sbVp{0.0f, float(fbSize.height()),
+                        float(fbSize.width()), -float(fbSize.height()),
+                        0.0f, 1.0f};
+        vkCmdSetViewport(cmd, 0, 1, &sbVp);
+        VkRect2D sbScissor{{0, 0}, {uint32_t(fbSize.width()), uint32_t(fbSize.height())}};
+        vkCmdSetScissor(cmd, 0, 1, &sbScissor);
+
+        VkDescriptorImageInfo imgInfo{};
+        imgInfo.sampler = m_atlas->sampler();
+        imgInfo.imageView = m_skyboxTexture->imageView();
+        imgInfo.imageLayout = m_skyboxTexture->currentLayout();
+        VkWriteDescriptorSet write{};
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstBinding = 0;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        write.pImageInfo = &imgInfo;
+        pushDescriptor(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_skyboxPipelineLayout, 0, 1, &write);
+
+        CubeSkyboxPushConstants spc{};
+        const QMatrix4x4 invVp = (m_viewProj.projection * m_viewProj.view).inverted();
+        const float *invData = invVp.constData();
+        for (int k = 0; k < 16; ++k) {
+            spc.invViewProj[k] = invData[k];
+        }
+        spc.opacity = factor;
+        vkCmdPushConstants(cmd, m_skyboxPipelineLayout,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                           0, sizeof(spc), &spc);
+        // 3-vert fullscreen triangle.
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+    }
+
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_vkPipeline);
     VkViewport vp{0.0f, float(fbSize.height()),
                   float(fbSize.width()), -float(fbSize.height()),
@@ -1062,7 +1338,6 @@ void CubeEffectV2::onPostPass(VkCommandBuffer cmd, VulkanTexture *sceneCapture,
         return a.cameraZ < b.cameraZ;
     });
 
-    const float opacity = float(m_activationFactor);
     for (const FaceDraw &fd : draws) {
         const auto &ds = m_desktopSlots[fd.desktop];
         if (ds.slot.srgbView == VK_NULL_HANDLE) {
@@ -1100,7 +1375,7 @@ void CubeEffectV2::onPostPass(VkCommandBuffer cmd, VulkanTexture *sceneCapture,
             pc.atlasSlotUv[2] = float(ds.slot.rect.width()) / float(atlasSize);
             pc.atlasSlotUv[3] = float(ds.slot.rect.height()) / float(atlasSize);
         }
-        pc.opacity = opacity;
+        pc.opacity = factor;
         vkCmdPushConstants(cmd, m_vkPipelineLayout,
                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                            0, sizeof(pc), &pc);
