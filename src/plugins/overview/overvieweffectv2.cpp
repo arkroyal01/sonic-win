@@ -33,12 +33,14 @@
 #include <QEasingCurve>
 #include <QFont>
 #include <QFontMetrics>
+#include <QGuiApplication>
 #include <QIcon>
 #include <QImage>
 #include <QKeyEvent>
 #include <QKeySequence>
 #include <QLoggingCategory>
 #include <QPainter>
+#include <QPalette>
 #include <QPixmap>
 
 namespace KWin
@@ -562,71 +564,108 @@ void OverviewEffectV2::reserveSlotsForCurrentDesktop()
 
 void OverviewEffectV2::reserveWallpaperSlot()
 {
-    if (!effects || !m_atlas || !m_vulkanCtx) {
+    // Initialise m_vulkanCtx / m_atlas if they aren't yet — we may be
+    // called before reserveSlotsForCurrentDesktop now that wallpaper
+    // reservation runs first to keep the atlas defragmented.
+    if (!effects || !effects->isVulkanCompositing()) {
         return;
     }
-    // Already reserved (e.g. activity refresh re-entered before
-    // releaseAllSlots ran). Release first so we re-pick the wallpaper
-    // for the new activity / desktop.
-    if (m_wallpaperHandle) {
-        if (m_atlas) {
-            m_atlas->release(m_wallpaperSlot);
+    if (!m_vulkanCtx || !m_atlas) {
+        auto *scene = Compositor::self()->scene();
+        if (!scene) {
+            return;
         }
-        m_wallpaperHandle->unrefOffscreenRendering();
-        m_wallpaperHandle = nullptr;
-        m_wallpaperSlot = VulkanThumbnailAtlas::Slot{};
+        auto *vkRenderer = dynamic_cast<ItemRendererVulkan *>(scene->renderer());
+        if (!vkRenderer) {
+            return;
+        }
+        m_vulkanCtx = vkRenderer->context();
+        if (!m_vulkanCtx) {
+            return;
+        }
+        m_atlas = VulkanThumbnailAtlas::get(m_vulkanCtx);
+        if (!m_atlas) {
+            return;
+        }
     }
+    // Already reserved (activity refresh re-entered before
+    // releaseAllSlots ran). Release all entries first so we re-pick
+    // the wallpapers for the new activity / desktops.
+    for (auto &[handle, slot] : m_wallpaperSlotByHandle) {
+        if (handle) {
+            handle->unrefOffscreenRendering();
+            m_atlas->release(slot);
+        }
+    }
+    m_wallpaperSlotByHandle.clear();
+    m_wallpaperHandleByVd.clear();
+
     const QRect screen = effects->virtualScreenGeometry();
     if (screen.isEmpty()) {
         return;
     }
-    // Pick the first Desktop-type window matching the current
-    // activity and desktop. Plasma renders the wallpaper as a
-    // _NET_WM_WINDOW_TYPE_DESKTOP X11 window; isDesktop() is the
-    // canonical check.
-    auto *currentDesktop = effects->currentDesktop();
-    for (EffectWindow *ew : effects->stackingOrder()) {
-        if (!ew || !ew->isDesktop()) {
+    // Reserve a per-VD wallpaper slot so bar tiles can each sample
+    // their own desktop's wallpaper (matches V1's per-tile DesktopView).
+    // Plasma renders the wallpaper as a _NET_WM_WINDOW_TYPE_DESKTOP
+    // X11 window per VD; isDesktop() + isOnDesktop(vd) is the canonical
+    // pair.
+    for (VirtualDesktop *vd : VirtualDesktopManager::self()->desktops()) {
+        if (!vd) {
             continue;
         }
-        Window *handle = ew->window();
-        if (!handle || !handle->isClient() || !handle->readyForPainting()) {
-            continue;
-        }
-        if (currentDesktop && !ew->isOnDesktop(currentDesktop)) {
-            continue;
-        }
-        if (!ew->isOnCurrentActivity()) {
-            continue;
-        }
-        auto slot = m_atlas->reserve(screen.size());
-        if (!slot.isValid()) {
-            qCWarning(KWIN_OVERVIEW_V2_LOG)
-                << "OverviewEffectV2: wallpaper slot reserve failed" << screen.size();
-            continue;
-        }
-        // Same offscreen-rendering ref pattern as the per-window
-        // slots — keeps the WindowItem's source texture live for the
-        // whole overview lifetime so renderItem produces real pixels
-        // rather than empty atlas regions.
-        handle->refOffscreenRendering();
-        m_wallpaperHandle = handle;
-        m_wallpaperSlot = std::move(slot);
-        connect(handle, &QObject::destroyed, this, [this, handle]() {
-            if (m_wallpaperHandle != handle) {
-                return;
+        for (EffectWindow *ew : effects->stackingOrder()) {
+            if (!ew || !ew->isDesktop()) {
+                continue;
             }
-            if (m_vulkanCtx && m_lastAtlasSubmit.isValid()) {
-                m_vulkanCtx->waitForSubmit(m_lastAtlasSubmit);
-                m_lastAtlasSubmit = VulkanSubmitHandle{};
+            Window *handle = ew->window();
+            if (!handle || !handle->isClient() || !handle->readyForPainting()) {
+                continue;
             }
-            if (m_atlas) {
-                m_atlas->release(m_wallpaperSlot);
+            if (!ew->isOnDesktop(vd)) {
+                continue;
             }
-            m_wallpaperHandle = nullptr;
-            m_wallpaperSlot = VulkanThumbnailAtlas::Slot{};
-        });
-        return;
+            if (!ew->isOnCurrentActivity()) {
+                continue;
+            }
+            // Map VD → handle first; reserve a slot only if this is a
+            // new handle (Plasma's wallpaper window is sticky-on-all-
+            // desktops for users who keep one wallpaper, so the same
+            // Window* serves every VD — no need to allocate N copies).
+            m_wallpaperHandleByVd[vd] = handle;
+            if (m_wallpaperSlotByHandle.count(handle)) {
+                break;
+            }
+            auto slot = m_atlas->reserve(screen.size());
+            if (!slot.isValid()) {
+                qCWarning(KWIN_OVERVIEW_V2_LOG)
+                    << "OverviewEffectV2: wallpaper slot reserve failed" << screen.size();
+                m_wallpaperHandleByVd.erase(vd);
+                continue;
+            }
+            handle->refOffscreenRendering();
+            m_wallpaperSlotByHandle.emplace(handle, std::move(slot));
+            connect(handle, &QObject::destroyed, this, [this, handle]() {
+                auto it = m_wallpaperSlotByHandle.find(handle);
+                if (it == m_wallpaperSlotByHandle.end()) {
+                    return;
+                }
+                if (m_vulkanCtx && m_lastAtlasSubmit.isValid()) {
+                    m_vulkanCtx->waitForSubmit(m_lastAtlasSubmit);
+                    m_lastAtlasSubmit = VulkanSubmitHandle{};
+                }
+                if (m_atlas) {
+                    m_atlas->release(it->second);
+                }
+                m_wallpaperSlotByHandle.erase(it);
+                for (auto vdIt = m_wallpaperHandleByVd.begin();
+                     vdIt != m_wallpaperHandleByVd.end();) {
+                    vdIt = (vdIt->second == handle)
+                        ? m_wallpaperHandleByVd.erase(vdIt)
+                        : std::next(vdIt);
+                }
+            });
+            break;
+        }
     }
 }
 
@@ -742,15 +781,17 @@ void OverviewEffectV2::releaseAllSlots()
             }
             m_atlas->release(slot);
         }
-        if (m_wallpaperHandle) {
-            m_wallpaperHandle->unrefOffscreenRendering();
-            m_atlas->release(m_wallpaperSlot);
+        for (auto &[handle, slot] : m_wallpaperSlotByHandle) {
+            if (handle) {
+                handle->unrefOffscreenRendering();
+            }
+            m_atlas->release(slot);
         }
     }
     m_windowSlots.clear();
     m_barThumbSlots.clear();
-    m_wallpaperHandle = nullptr;
-    m_wallpaperSlot = VulkanThumbnailAtlas::Slot{};
+    m_wallpaperSlotByHandle.clear();
+    m_wallpaperHandleByVd.clear();
     m_barThumbVisRefs.clear();
     m_tileLayout.clear();
     m_barTiles.clear();
@@ -956,35 +997,53 @@ void OverviewEffectV2::renderDesktopBar(VkCommandBuffer cmd, const QSize &fbSize
     // requires a valid binding). Viewport+scissor are also set to the
     // full framebuffer; bar tiles draw at their own NDC rects.
     const float factor = float(std::clamp(m_activationFactor, 0.0, 1.0));
+    const float atlasSize = float(VulkanThumbnailAtlas::kAtlasSize);
     for (const BarTile &b : m_barTiles) {
         OverviewQuadPushConstants pc{};
         pc.quadRectNdc[0] = b.ndcX;
         pc.quadRectNdc[1] = b.ndcY;
         pc.quadRectNdc[2] = b.ndcW;
         pc.quadRectNdc[3] = b.ndcH;
-        // atlasSlotUv unused when tintRgba.a == 1, but keep it sane.
-        pc.atlasSlotUv[0] = 0.0f;
-        pc.atlasSlotUv[1] = 0.0f;
-        pc.atlasSlotUv[2] = 1.0f;
-        pc.atlasSlotUv[3] = 1.0f;
-        // Bright translucent white for the current desktop, dimmer
-        // grey for the rest. The .a field is the tint mix weight
-        // (1.0 = pure solid), not the final alpha — that comes from
-        // pc.opacity below.
-        if (b.isCurrent) {
-            pc.tintRgba[0] = 0.95f;
-            pc.tintRgba[1] = 0.95f;
-            pc.tintRgba[2] = 1.0f;
-        } else {
-            pc.tintRgba[0] = 0.35f;
-            pc.tintRgba[1] = 0.35f;
-            pc.tintRgba[2] = 0.4f;
+        // Sample this VD's wallpaper if its slot is atlas-resident.
+        // All atlas slots share the bound srgbView; only UV differs.
+        // Fallback slots have their own dedicated view, so skip the
+        // wallpaper path and fall back to the solid colour. Mirrors
+        // V1's DesktopView per-tile wallpaper rendering.
+        const VulkanThumbnailAtlas::Slot *wpSlot = nullptr;
+        auto hIt = m_wallpaperHandleByVd.find(b.desktop);
+        if (hIt != m_wallpaperHandleByVd.end()) {
+            auto sIt = m_wallpaperSlotByHandle.find(hIt->second);
+            if (sIt != m_wallpaperSlotByHandle.end()
+                && sIt->second.isValid() && sIt->second.hasContent
+                && !sIt->second.isFallback) {
+                wpSlot = &sIt->second;
+            }
         }
-        pc.tintRgba[3] = 1.0f;
-        // Translucent so the dimmed scene-capture background shows
-        // through; ramps with activation so the bar fades in alongside
-        // the tiles.
-        pc.opacity = (b.isCurrent ? 0.7f : 0.55f) * factor;
+        if (wpSlot) {
+            pc.atlasSlotUv[0] = float(wpSlot->rect.x()) / atlasSize;
+            pc.atlasSlotUv[1] = float(wpSlot->rect.y()) / atlasSize;
+            pc.atlasSlotUv[2] = float(wpSlot->rect.width()) / atlasSize;
+            pc.atlasSlotUv[3] = float(wpSlot->rect.height()) / atlasSize;
+            // tintRgba.a = 0 → pure texture sample, no tint mix.
+            pc.opacity = factor;
+        } else {
+            // Solid-colour fallback (no wallpaper slot available).
+            pc.atlasSlotUv[0] = 0.0f;
+            pc.atlasSlotUv[1] = 0.0f;
+            pc.atlasSlotUv[2] = 1.0f;
+            pc.atlasSlotUv[3] = 1.0f;
+            if (b.isCurrent) {
+                pc.tintRgba[0] = 0.95f;
+                pc.tintRgba[1] = 0.95f;
+                pc.tintRgba[2] = 1.0f;
+            } else {
+                pc.tintRgba[0] = 0.35f;
+                pc.tintRgba[1] = 0.35f;
+                pc.tintRgba[2] = 0.4f;
+            }
+            pc.tintRgba[3] = 1.0f;
+            pc.opacity = (b.isCurrent ? 0.7f : 0.55f) * factor;
+        }
 
         vkCmdPushConstants(cmd, m_vkPipelineLayout,
                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -1029,7 +1088,6 @@ void OverviewEffectV2::renderDesktopBar(VkCommandBuffer cmd, const QSize &fbSize
     if (!effects) {
         return;
     }
-    const float atlasSize = float(VulkanThumbnailAtlas::kAtlasSize);
     constexpr float kBarInnerPad = 0.08f;
     auto *currentDesktop = effects->currentDesktop();
     for (const BarTile &b : m_barTiles) {
@@ -1289,7 +1347,7 @@ void OverviewEffectV2::renderWindowsToAtlas()
     // resources, and the dedicated-allocation work (39cf11b882 +
     // b8d35e7a0b) returns that VRAM to the OS instead of pinning
     // VMA blocks.
-    if (m_windowSlots.empty() && m_barThumbSlots.empty() && !m_wallpaperHandle) {
+    if (m_windowSlots.empty() && m_barThumbSlots.empty() && m_wallpaperSlotByHandle.empty()) {
         return;
     }
 
@@ -1334,9 +1392,14 @@ void OverviewEffectV2::renderWindowsToAtlas()
     };
     findAtlas(m_windowSlots);
     findAtlas(m_barThumbSlots);
-    if (atlasImage == VK_NULL_HANDLE && m_wallpaperHandle && !m_wallpaperSlot.isFallback) {
-        atlasImage = m_wallpaperSlot.image;
-        atlasMipZero = m_wallpaperSlot.mipZeroView;
+    if (atlasImage == VK_NULL_HANDLE) {
+        for (const auto &[handle, slot] : m_wallpaperSlotByHandle) {
+            if (handle && !slot.isFallback) {
+                atlasImage = slot.image;
+                atlasMipZero = slot.mipZeroView;
+                break;
+            }
+        }
     }
     const bool haveAtlasSlots = atlasImage != VK_NULL_HANDLE;
     if (haveAtlasSlots && !m_atlasFramebuffer) {
@@ -1391,8 +1454,10 @@ void OverviewEffectV2::renderWindowsToAtlas()
             }
             m_atlas->prepareForRenderTo(cmd, slot);
         }
-        if (m_wallpaperHandle && !m_wallpaperSlot.isFallback) {
-            m_atlas->prepareForRenderTo(cmd, m_wallpaperSlot);
+        for (auto &[handle, slot] : m_wallpaperSlotByHandle) {
+            if (handle && !slot.isFallback) {
+                m_atlas->prepareForRenderTo(cmd, slot);
+            }
         }
 
         // Single render pass covering all atlas-slot writes. Each
@@ -1457,8 +1522,10 @@ void OverviewEffectV2::renderWindowsToAtlas()
             }
             renderSlot(handle, slot);
         }
-        if (m_wallpaperHandle && !m_wallpaperSlot.isFallback) {
-            renderSlot(m_wallpaperHandle, m_wallpaperSlot);
+        for (auto &[handle, slot] : m_wallpaperSlotByHandle) {
+            if (handle && !slot.isFallback) {
+                renderSlot(handle, slot);
+            }
         }
 
         m_atlasRenderPass->end(cmd);
@@ -1530,8 +1597,10 @@ void OverviewEffectV2::renderWindowsToAtlas()
     for (auto &[handle, slot] : m_windowSlots) {
         renderFallbackSlot(handle, slot);
     }
-    if (m_wallpaperHandle && m_wallpaperSlot.isFallback) {
-        renderFallbackSlot(m_wallpaperHandle, m_wallpaperSlot);
+    for (auto &[handle, slot] : m_wallpaperSlotByHandle) {
+        if (handle && slot.isFallback) {
+            renderFallbackSlot(handle, slot);
+        }
     }
 
     // Mip cascade + publishing barrier for every slot — atlas and
@@ -1544,8 +1613,10 @@ void OverviewEffectV2::renderWindowsToAtlas()
     for (auto &[_handle, slot] : m_barThumbSlots) {
         m_atlas->generateMipsAndPublish(cmd, slot);
     }
-    if (m_wallpaperHandle && m_wallpaperSlot.isValid()) {
-        m_atlas->generateMipsAndPublish(cmd, m_wallpaperSlot);
+    for (auto &[handle, slot] : m_wallpaperSlotByHandle) {
+        if (handle && slot.isValid()) {
+            m_atlas->generateMipsAndPublish(cmd, slot);
+        }
     }
 
     vkRenderer->popOffscreenSlot();
@@ -1560,11 +1631,25 @@ void OverviewEffectV2::renderWindowsToAtlas()
 bool OverviewEffectV2::drawWallpaperBackground(VkCommandBuffer cmd, const QSize &fbSize,
                                                VkFormat colorFormat)
 {
-    if (!m_atlas || !m_vulkanCtx || fbSize.isEmpty()) {
+    if (!m_atlas || !m_vulkanCtx || fbSize.isEmpty() || !effects) {
         return false;
     }
-    if (!m_wallpaperHandle || !m_wallpaperSlot.isValid()
-        || !m_wallpaperSlot.hasContent || m_wallpaperSlot.srgbView == VK_NULL_HANDLE) {
+    // Fullscreen blur backdrop uses the current desktop's wallpaper.
+    auto hIt = m_wallpaperHandleByVd.find(effects->currentDesktop());
+    if (hIt == m_wallpaperHandleByVd.end()) {
+        return false;
+    }
+    auto sIt = m_wallpaperSlotByHandle.find(hIt->second);
+    if (sIt == m_wallpaperSlotByHandle.end()) {
+        return false;
+    }
+    struct
+    {
+        Window *handle;
+        VulkanThumbnailAtlas::Slot slot;
+    } wp{hIt->second, sIt->second};
+    if (!wp.handle || !wp.slot.isValid() || !wp.slot.hasContent
+        || wp.slot.srgbView == VK_NULL_HANDLE) {
         return false;
     }
     if (!ensureVulkanPipeline(m_vulkanCtx, colorFormat)) {
@@ -1580,7 +1665,7 @@ bool OverviewEffectV2::drawWallpaperBackground(VkCommandBuffer cmd, const QSize 
 
     VkDescriptorImageInfo imgInfo{};
     imgInfo.sampler = m_atlas->sampler();
-    imgInfo.imageView = m_wallpaperSlot.srgbView;
+    imgInfo.imageView = wp.slot.srgbView;
     imgInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     if (imgInfo.sampler == VK_NULL_HANDLE) {
         return false;
@@ -1609,16 +1694,16 @@ bool OverviewEffectV2::drawWallpaperBackground(VkCommandBuffer cmd, const QSize 
     pc.quadRectNdc[1] = -1.0f;
     pc.quadRectNdc[2] = 2.0f;
     pc.quadRectNdc[3] = 2.0f;
-    if (m_wallpaperSlot.isFallback) {
+    if (wp.slot.isFallback) {
         pc.atlasSlotUv[0] = 0.0f;
         pc.atlasSlotUv[1] = 0.0f;
         pc.atlasSlotUv[2] = 1.0f;
         pc.atlasSlotUv[3] = 1.0f;
     } else {
-        pc.atlasSlotUv[0] = float(m_wallpaperSlot.rect.x()) / atlasSize;
-        pc.atlasSlotUv[1] = float(m_wallpaperSlot.rect.y()) / atlasSize;
-        pc.atlasSlotUv[2] = float(m_wallpaperSlot.rect.width()) / atlasSize;
-        pc.atlasSlotUv[3] = float(m_wallpaperSlot.rect.height()) / atlasSize;
+        pc.atlasSlotUv[0] = float(wp.slot.rect.x()) / atlasSize;
+        pc.atlasSlotUv[1] = float(wp.slot.rect.y()) / atlasSize;
+        pc.atlasSlotUv[2] = float(wp.slot.rect.width()) / atlasSize;
+        pc.atlasSlotUv[3] = float(wp.slot.rect.height()) / atlasSize;
     }
     // Combined mip-LOD downsample + 13-tap Gaussian in the fragment
     // shader. LOD 2 (4× downsample) keeps enough mid-frequency detail
@@ -1650,6 +1735,64 @@ bool OverviewEffectV2::drawWallpaperBackground(VkCommandBuffer cmd, const QSize 
     vkCmdPushConstants(cmd, m_vkPipelineLayout,
                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                        0, sizeof(wash), &wash);
+    vkCmdDraw(cmd, 4, 1, 0, 0);
+
+    // Pass 3: sharp wallpaper card at the scaled-down grid area.
+    // V1's per-desktop backgroundArea Item renders a second copy of
+    // the same wallpaper inside Kirigami.ShadowedTexture (rounded
+    // corners + drop shadow). The card animates from full-screen
+    // (overviewVal=0) to a screen-aspect rect inside the grid bounds
+    // (overviewVal=1). For V2 the rounded corners + shadow want a
+    // dedicated shader and are deferred; this pass paints the sharp
+    // wallpaper at the animated rect so the user sees the desktop
+    // preview beneath the tile grid.
+    constexpr float kGridTopNdc = -0.78f; // matches kGridTop in rebuildTileLayout
+    constexpr float kGridBottomNdc = 0.8f; // matches kGridBottom
+    const float screenWf = std::max(1.0f, float(fbSize.width()));
+    const float screenHf = std::max(1.0f, float(fbSize.height()));
+    // Settled (factor = 1) card: largest screen-aspect rect that
+    // fits inside the grid bounds, centred. Computed in pixels then
+    // converted back to NDC so the wallpaper aspect is preserved
+    // independent of NDC X / Y scale.
+    const float gridPxW = (1.0f - (-1.0f)) * 0.5f * screenWf;
+    const float gridPxH = (kGridBottomNdc - kGridTopNdc) * 0.5f * screenHf;
+    const float aspect = screenWf / screenHf;
+    const float settledPxH = std::min(gridPxH, gridPxW / aspect);
+    const float settledPxW = settledPxH * aspect;
+    const float settledNdcW = 2.0f * settledPxW / screenWf;
+    const float settledNdcH = 2.0f * settledPxH / screenHf;
+    const float gridCentreX = 0.0f;
+    const float gridCentreY = (kGridTopNdc + kGridBottomNdc) * 0.5f;
+    const float settledLeft = gridCentreX - settledNdcW * 0.5f;
+    const float settledTop = gridCentreY - settledNdcH * 0.5f;
+    const float settledRight = settledLeft + settledNdcW;
+    const float settledBottom = settledTop + settledNdcH;
+    const float cardLeft = -1.0f + (settledLeft - -1.0f) * factor;
+    const float cardTop = -1.0f + (settledTop - -1.0f) * factor;
+    const float cardRight = 1.0f + (settledRight - 1.0f) * factor;
+    const float cardBottom = 1.0f + (settledBottom - 1.0f) * factor;
+    OverviewQuadPushConstants card{};
+    card.quadRectNdc[0] = cardLeft;
+    card.quadRectNdc[1] = cardTop;
+    card.quadRectNdc[2] = cardRight - cardLeft;
+    card.quadRectNdc[3] = cardBottom - cardTop;
+    if (wp.slot.isFallback) {
+        card.atlasSlotUv[0] = 0.0f;
+        card.atlasSlotUv[1] = 0.0f;
+        card.atlasSlotUv[2] = 1.0f;
+        card.atlasSlotUv[3] = 1.0f;
+    } else {
+        card.atlasSlotUv[0] = float(wp.slot.rect.x()) / atlasSize;
+        card.atlasSlotUv[1] = float(wp.slot.rect.y()) / atlasSize;
+        card.atlasSlotUv[2] = float(wp.slot.rect.width()) / atlasSize;
+        card.atlasSlotUv[3] = float(wp.slot.rect.height()) / atlasSize;
+    }
+    card.opacity = factor;
+    // lod stays 0 — the card uses the sharp wallpaper, not the
+    // blurred mip cascade.
+    vkCmdPushConstants(cmd, m_vkPipelineLayout,
+                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                       0, sizeof(card), &card);
     vkCmdDraw(cmd, 4, 1, 0, 0);
     return true;
 }
@@ -1869,37 +2012,91 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
         pushAndDraw(t, 0.0f, 0.0f, 1.0f, 1.0f);
     }
 
-    // Pass 2.5: focus highlight on whichever zone owns keyboard
-    // focus. Overlay a translucent white wash so the user can see what
-    // Enter would activate. Same pipeline, tintRgba.a = 1 → solid
-    // tint; pc.opacity controls the wash strength.
-    auto pushFocusWash = [&](float ndcX, float ndcY, float ndcW, float ndcH) {
-        OverviewQuadPushConstants pc{};
-        pc.quadRectNdc[0] = ndcX;
-        pc.quadRectNdc[1] = ndcY;
-        pc.quadRectNdc[2] = ndcW;
-        pc.quadRectNdc[3] = ndcH;
-        pc.atlasSlotUv[0] = 0.0f;
-        pc.atlasSlotUv[1] = 0.0f;
-        pc.atlasSlotUv[2] = 1.0f;
-        pc.atlasSlotUv[3] = 1.0f;
-        pc.tintRgba[0] = 1.0f;
-        pc.tintRgba[1] = 1.0f;
-        pc.tintRgba[2] = 1.0f;
-        pc.tintRgba[3] = 1.0f;
-        pc.opacity = 0.25f * factor;
-        vkCmdPushConstants(cmd, m_vkPipelineLayout,
-                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                           0, sizeof(pc), &pc);
-        vkCmdDraw(cmd, 4, 1, 0, 0);
+    // Pass 2.5: hover / keyboard-focus outline on grid tiles.
+    // V1's WindowHeapDelegate draws a Rectangle border with
+    // Kirigami.Theme.highlightColor when the tile is hovered or
+    // selected — same predicate here. Four thin solid-colour rects
+    // around the tile rect (top, bottom, left, right) form the
+    // border without needing a rounded-rect shader. Bar focus wash
+    // still draws after the bar pass below.
+    // Theme-driven border colours: highlightColor for active state
+    // (focused / hovered / current / drop-target), text color (with
+    // reduced opacity) for the always-on resting border. Read from
+    // the application palette so the user's KDE colour scheme drives
+    // the outline appearance — no hardcoded RGB.
+    const QColor highlight = qApp->palette().highlight().color();
+    const QColor textColor = qApp->palette().windowText().color();
+    auto pushOutline = [&](float ndcX, float ndcY, float ndcW, float ndcH,
+                           float borderPx, const QColor &c, float alpha) {
+        const float bx = 2.0f * borderPx / screenW;
+        const float by = 2.0f * borderPx / screenH;
+        OverviewQuadPushConstants hl{};
+        hl.atlasSlotUv[0] = 0.0f;
+        hl.atlasSlotUv[1] = 0.0f;
+        hl.atlasSlotUv[2] = 1.0f;
+        hl.atlasSlotUv[3] = 1.0f;
+        hl.tintRgba[0] = float(c.redF());
+        hl.tintRgba[1] = float(c.greenF());
+        hl.tintRgba[2] = float(c.blueF());
+        hl.tintRgba[3] = 1.0f;
+        hl.opacity = alpha * factor;
+        auto drawRect = [&](float x, float y, float w, float h) {
+            hl.quadRectNdc[0] = x;
+            hl.quadRectNdc[1] = y;
+            hl.quadRectNdc[2] = w;
+            hl.quadRectNdc[3] = h;
+            vkCmdPushConstants(cmd, m_vkPipelineLayout,
+                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                               0, sizeof(hl), &hl);
+            vkCmdDraw(cmd, 4, 1, 0, 0);
+        };
+        drawRect(ndcX - bx, ndcY - by, ndcW + 2.0f * bx, by); // top
+        drawRect(ndcX - bx, ndcY + ndcH, ndcW + 2.0f * bx, by); // bottom
+        drawRect(ndcX - bx, ndcY, bx, ndcH); // left
+        drawRect(ndcX + ndcW, ndcY, bx, ndcH); // right
     };
-    if (m_focusZone == FocusZone::Grid && m_focusedIndex >= 0
-        && m_focusedIndex < int(m_tileLayout.size())) {
-        const TileLayout &t = m_tileLayout[m_focusedIndex];
-        pushFocusWash(t.realNdcX + (t.gridNdcX - t.realNdcX) * factor,
-                      t.realNdcY + (t.gridNdcY - t.realNdcY) * factor,
-                      t.realNdcW + (t.gridNdcW - t.realNdcW) * factor,
-                      t.realNdcH + (t.gridNdcH - t.realNdcH) * factor);
+    auto pushHighlight = [&](float ndcX, float ndcY, float ndcW, float ndcH) {
+        // Kirigami.Units.largeSpacing — same width V1's
+        // WindowHeapDelegate uses for the hover/focus border.
+        pushOutline(ndcX, ndcY, ndcW, ndcH, 12.0f, highlight, 1.0f);
+    };
+    for (size_t i = 0; i < m_tileLayout.size(); ++i) {
+        const bool hovered = (int(i) == m_hoveredTileIndex);
+        const bool focused = (m_focusZone == FocusZone::Grid && int(i) == m_focusedIndex);
+        if (!hovered && !focused) {
+            continue;
+        }
+        const TileLayout &t = m_tileLayout[i];
+        if (isDragged(t) || !t.handle) {
+            continue;
+        }
+        // Outline hugs the frame (window + decorations) rather than
+        // the visibleGeometry (which includes the drop-shadow halo)
+        // — without this, the border sits ~shadow-margin pixels off
+        // the visible window edge. Compute the inset ratios from the
+        // window's frame vs visible rect and apply them in tile NDC
+        // space.
+        const float tileNdcX = t.realNdcX + (t.gridNdcX - t.realNdcX) * factor;
+        const float tileNdcY = t.realNdcY + (t.gridNdcY - t.realNdcY) * factor;
+        const float tileNdcW = t.realNdcW + (t.gridNdcW - t.realNdcW) * factor;
+        const float tileNdcH = t.realNdcH + (t.gridNdcH - t.realNdcH) * factor;
+        const QRectF vis = t.handle->visibleGeometry();
+        const QRectF frame = t.handle->frameGeometry();
+        float insetX = 0.0f, insetY = 0.0f, insetW = 0.0f, insetH = 0.0f;
+        if (vis.width() > 0.0 && vis.height() > 0.0) {
+            const float rx = float((frame.x() - vis.x()) / vis.width());
+            const float ry = float((frame.y() - vis.y()) / vis.height());
+            const float rw = float((vis.right() - frame.right()) / vis.width());
+            const float rh = float((vis.bottom() - frame.bottom()) / vis.height());
+            insetX = rx * tileNdcW;
+            insetY = ry * tileNdcH;
+            insetW = rw * tileNdcW;
+            insetH = rh * tileNdcH;
+        }
+        pushHighlight(tileNdcX + insetX,
+                      tileNdcY + insetY,
+                      tileNdcW - insetX - insetW,
+                      tileNdcH - insetY - insetH);
     }
     // Bar-tile focus wash drawn after the bar pass below so it lands
     // on top of the bar tile's own colour.
@@ -1932,32 +2129,28 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
         if (anyView != VK_NULL_HANDLE) {
             pushView(anyView);
             renderDesktopBar(cmd, fbSize);
-            // Bar-tile focus wash, drawn after the bar tiles so it
-            // brightens the focused desktop's tile in place.
-            if (m_focusZone == FocusZone::Bar && m_focusedIndex >= 0
-                && m_focusedIndex < int(m_barTiles.size())) {
-                const BarTile &b = m_barTiles[m_focusedIndex];
-                pushFocusWash(b.ndcX, b.ndcY, b.ndcW, b.ndcH);
-            }
-            // Drop-target wash: while a drag is active, brighten the
-            // bar tile the cursor is currently hovering over so the
-            // user gets visible "I will drop here" feedback. Uses the
-            // same wash as keyboard focus — both indicate "Enter or
-            // release lands here" semantically. Skip if the cursor's
-            // over the current desktop's tile (drop there is a no-op
-            // per the release handler).
-            if (m_dragActive) {
-                if (VirtualDesktop *under = hitTestBar(m_dragCurrentGlobal)) {
-                    if (under != effects->currentDesktop()) {
-                        for (const BarTile &b : m_barTiles) {
-                            if (b.desktop == under) {
-                                pushFocusWash(b.ndcX, b.ndcY, b.ndcW, b.ndcH);
-                                break;
-                            }
-                        }
-                    }
+            // Per-bar-tile outline. V1's DesktopBar.qml draws a 1px
+            // text-color border at rest and a 2px highlight-color
+            // border in the "active" state (current desktop / focused
+            // / drop-target / pressed). Same predicate here, themed
+            // colours from the system palette.
+            VirtualDesktop *dragOver = m_dragActive ? hitTestBar(m_dragCurrentGlobal) : nullptr;
+            for (size_t i = 0; i < m_barTiles.size(); ++i) {
+                const BarTile &b = m_barTiles[i];
+                const bool keyboardFocused = (m_focusZone == FocusZone::Bar
+                                              && int(i) == m_focusedIndex);
+                const bool hovered = (!m_dragActive && int(i) == m_hoveredBarIndex);
+                const bool dropTarget = (dragOver && b.desktop == dragOver
+                                         && dragOver != effects->currentDesktop());
+                const bool active = b.isCurrent || keyboardFocused || hovered || dropTarget;
+                if (active) {
+                    pushOutline(b.ndcX, b.ndcY, b.ndcW, b.ndcH, 3.0f, highlight, 1.0f);
+                } else {
+                    pushOutline(b.ndcX, b.ndcY, b.ndcW, b.ndcH, 1.0f, textColor, 0.5f);
                 }
             }
+            // Drop-target visual feedback is now part of the per-tile
+            // outline above (active = current / focused / drop-target).
         }
     }
 
@@ -2160,9 +2353,15 @@ void OverviewEffectV2::activate()
     effects->startMouseInterception(this, Qt::ArrowCursor);
     m_grabbedKeyboard = effects->grabKeyboard(this);
 #if HAVE_VULKAN
+    // Reserve wallpaper FIRST — it's the largest slot (full screen)
+    // and needs contiguous atlas space. Reserving after the window /
+    // bar-thumb slots fragments the atlas enough that the wallpaper
+    // ends up in a fallback dedicated image, which the bar pass
+    // can't sample because we share one descriptor binding across
+    // all bar tiles.
+    reserveWallpaperSlot();
     reserveSlotsForCurrentDesktop();
     reserveBarThumbs();
-    reserveWallpaperSlot();
     // Live activity refresh: window slots are reserved at activate-
     // time, so an external activity switch (Plasma keybinding, KCM,
     // DBus) would otherwise leave V2 showing an empty grid (old slots
@@ -2176,9 +2375,9 @@ void OverviewEffectV2::activate()
             return;
         }
         releaseAllSlots();
+        reserveWallpaperSlot();
         reserveSlotsForCurrentDesktop();
         reserveBarThumbs();
-        reserveWallpaperSlot();
         effects->addRepaintFull();
     });
     // Subscribe to preFrameRender so the atlas re-renders per frame
@@ -2758,6 +2957,45 @@ void OverviewEffectV2::windowInputMouseEvent(QEvent *event)
                     effects->addRepaint(QRect(screen.x(), barTopPx, screen.width(), barHeightPx));
                 }
             }
+        }
+        // Grid-tile hover: walk m_tileLayout for the cell under the
+        // cursor. Repaint only on transitions to keep stationary
+        // mouse drift cheap.
+        int hoveredNow = -1;
+        if (effects && !m_dragActive) {
+            const QRect screen = effects->virtualScreenGeometry();
+            if (!screen.isEmpty() && screen.contains(pos)) {
+                const float sw = std::max(1.0f, float(screen.width()));
+                const float sh = std::max(1.0f, float(screen.height()));
+                const float mx = (float(pos.x() - screen.x()) / sw) * 2.0f - 1.0f;
+                const float my = (float(pos.y() - screen.y()) / sh) * 2.0f - 1.0f;
+                for (size_t i = 0; i < m_tileLayout.size(); ++i) {
+                    const TileLayout &t = m_tileLayout[i];
+                    if (mx >= t.gridNdcX && mx <= t.gridNdcX + t.gridNdcW
+                        && my >= t.gridNdcY && my <= t.gridNdcY + t.gridNdcH) {
+                        hoveredNow = int(i);
+                        break;
+                    }
+                }
+            }
+        }
+        if (hoveredNow != m_hoveredTileIndex) {
+            m_hoveredTileIndex = hoveredNow;
+            effects->addRepaintFull();
+        }
+        // Bar-tile hover for outline rendering.
+        int barHoveredNow = -1;
+        if (barUnder) {
+            for (size_t i = 0; i < m_barTiles.size(); ++i) {
+                if (m_barTiles[i].desktop == barUnder) {
+                    barHoveredNow = int(i);
+                    break;
+                }
+            }
+        }
+        if (barHoveredNow != m_hoveredBarIndex) {
+            m_hoveredBarIndex = barHoveredNow;
+            effects->addRepaintFull();
         }
 #endif
         if (m_dragCandidate && !m_dragActive) {

@@ -257,6 +257,15 @@ private:
     /// leak state into the next activation.
     bool m_addTileHover = false;
     int m_deleteAffordanceHover = -1; // index into m_barTiles, or -1
+    /// Index into m_tileLayout for the grid tile currently under the
+    /// pointer, or -1 when no tile is hovered. Drives the V1-parity
+    /// highlight outline (Kirigami highlightColor border around the
+    /// tile when hovered or keyboard-focused).
+    int m_hoveredTileIndex = -1;
+    /// Index into m_barTiles for the bar tile currently under the
+    /// pointer. Same V1-parity outline logic as m_hoveredTileIndex
+    /// but for the desktop-bar strip.
+    int m_hoveredBarIndex = -1;
 
     Window *m_dragCandidate = nullptr;
     QPoint m_dragPressGlobal;
@@ -395,16 +404,22 @@ private:
     /// dropped at deactivate.
     std::unordered_map<Window *, VulkanThumbnailAtlas::Slot> m_barThumbSlots;
 
-    /// Single atlas slot holding the desktop wallpaper (Plasma's
-    /// desktop-class window for the current activity / desktop /
-    /// output). Used by drawWallpaperBackground as the bottom layer
-    /// of V2's backdrop — mirrors V1's KWinComponents.DesktopBackground
-    /// pipeline. Re-rendered every frame alongside the other slots so
-    /// wallpaper-slideshow / live wallpapers stay current. Empty when
-    /// no desktop window matches (session start race) — the post-pass
-    /// then falls back to drawSceneCaptureBackground.
-    Window *m_wallpaperHandle = nullptr;
-    VulkanThumbnailAtlas::Slot m_wallpaperSlot;
+    /// Atlas slots holding the desktop wallpaper. Two-level indirection
+    /// so we dedup slots when Plasma uses a single sticky desktop window
+    /// for all virtual desktops (the common case): one slot per unique
+    /// Window* handle, plus a VD→handle map.
+    ///
+    /// - m_wallpaperHandleByVd: which Desktop-class Window* serves a
+    ///   given VD. Multiple VDs may map to the same handle when the
+    ///   wallpaper is shared (isOnDesktop is true for every VD).
+    /// - m_wallpaperSlotByHandle: one atlas slot per unique handle.
+    ///   We refOffscreenRendering once per slot, not per VD entry.
+    ///
+    /// The current desktop's slot drives the fullscreen blur backdrop;
+    /// the bar pass uses the VD→handle→slot lookup per tile so per-VD
+    /// wallpapers (when configured) end up in the right tile.
+    std::unordered_map<VirtualDesktop *, Window *> m_wallpaperHandleByVd;
+    std::unordered_map<Window *, VulkanThumbnailAtlas::Slot> m_wallpaperSlotByHandle;
 
     /// Per-off-desktop-window visibility refs, held for the entire
     /// overview lifetime. Without these, WindowItem::computeVisibility
