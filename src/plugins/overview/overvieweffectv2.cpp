@@ -556,6 +556,76 @@ void OverviewEffectV2::reserveSlotsForCurrentDesktop()
     }
 }
 
+void OverviewEffectV2::reserveWallpaperSlot()
+{
+    if (!effects || !m_atlas || !m_vulkanCtx) {
+        return;
+    }
+    // Already reserved (e.g. activity refresh re-entered before
+    // releaseAllSlots ran). Release first so we re-pick the wallpaper
+    // for the new activity / desktop.
+    if (m_wallpaperHandle) {
+        if (m_atlas) {
+            m_atlas->release(m_wallpaperSlot);
+        }
+        m_wallpaperHandle->unrefOffscreenRendering();
+        m_wallpaperHandle = nullptr;
+        m_wallpaperSlot = VulkanThumbnailAtlas::Slot{};
+    }
+    const QRect screen = effects->virtualScreenGeometry();
+    if (screen.isEmpty()) {
+        return;
+    }
+    // Pick the first Desktop-type window matching the current
+    // activity and desktop. Plasma renders the wallpaper as a
+    // _NET_WM_WINDOW_TYPE_DESKTOP X11 window; isDesktop() is the
+    // canonical check.
+    auto *currentDesktop = effects->currentDesktop();
+    for (EffectWindow *ew : effects->stackingOrder()) {
+        if (!ew || !ew->isDesktop()) {
+            continue;
+        }
+        Window *handle = ew->window();
+        if (!handle || !handle->isClient() || !handle->readyForPainting()) {
+            continue;
+        }
+        if (currentDesktop && !ew->isOnDesktop(currentDesktop)) {
+            continue;
+        }
+        if (!ew->isOnCurrentActivity()) {
+            continue;
+        }
+        auto slot = m_atlas->reserve(screen.size());
+        if (!slot.isValid()) {
+            qCWarning(KWIN_OVERVIEW_V2_LOG)
+                << "OverviewEffectV2: wallpaper slot reserve failed" << screen.size();
+            continue;
+        }
+        // Same offscreen-rendering ref pattern as the per-window
+        // slots — keeps the WindowItem's source texture live for the
+        // whole overview lifetime so renderItem produces real pixels
+        // rather than empty atlas regions.
+        handle->refOffscreenRendering();
+        m_wallpaperHandle = handle;
+        m_wallpaperSlot = std::move(slot);
+        connect(handle, &QObject::destroyed, this, [this, handle]() {
+            if (m_wallpaperHandle != handle) {
+                return;
+            }
+            if (m_vulkanCtx && m_lastAtlasSubmit.isValid()) {
+                m_vulkanCtx->waitForSubmit(m_lastAtlasSubmit);
+                m_lastAtlasSubmit = VulkanSubmitHandle{};
+            }
+            if (m_atlas) {
+                m_atlas->release(m_wallpaperSlot);
+            }
+            m_wallpaperHandle = nullptr;
+            m_wallpaperSlot = VulkanThumbnailAtlas::Slot{};
+        });
+        return;
+    }
+}
+
 void OverviewEffectV2::reserveBarThumbs()
 {
     if (!effects || !m_atlas || !m_vulkanCtx) {
@@ -668,9 +738,15 @@ void OverviewEffectV2::releaseAllSlots()
             }
             m_atlas->release(slot);
         }
+        if (m_wallpaperHandle) {
+            m_wallpaperHandle->unrefOffscreenRendering();
+            m_atlas->release(m_wallpaperSlot);
+        }
     }
     m_windowSlots.clear();
     m_barThumbSlots.clear();
+    m_wallpaperHandle = nullptr;
+    m_wallpaperSlot = VulkanThumbnailAtlas::Slot{};
     m_barThumbVisRefs.clear();
     m_tileLayout.clear();
     m_barTiles.clear();
@@ -1209,7 +1285,7 @@ void OverviewEffectV2::renderWindowsToAtlas()
     // resources, and the dedicated-allocation work (39cf11b882 +
     // b8d35e7a0b) returns that VRAM to the OS instead of pinning
     // VMA blocks.
-    if (m_windowSlots.empty() && m_barThumbSlots.empty()) {
+    if (m_windowSlots.empty() && m_barThumbSlots.empty() && !m_wallpaperHandle) {
         return;
     }
 
@@ -1254,6 +1330,10 @@ void OverviewEffectV2::renderWindowsToAtlas()
     };
     findAtlas(m_windowSlots);
     findAtlas(m_barThumbSlots);
+    if (atlasImage == VK_NULL_HANDLE && m_wallpaperHandle && !m_wallpaperSlot.isFallback) {
+        atlasImage = m_wallpaperSlot.image;
+        atlasMipZero = m_wallpaperSlot.mipZeroView;
+    }
     const bool haveAtlasSlots = atlasImage != VK_NULL_HANDLE;
     if (haveAtlasSlots && !m_atlasFramebuffer) {
         m_atlasFramebuffer = VulkanFramebuffer::create(m_vulkanCtx, m_atlasRenderPass.get(),
@@ -1306,6 +1386,9 @@ void OverviewEffectV2::renderWindowsToAtlas()
                 continue;
             }
             m_atlas->prepareForRenderTo(cmd, slot);
+        }
+        if (m_wallpaperHandle && !m_wallpaperSlot.isFallback) {
+            m_atlas->prepareForRenderTo(cmd, m_wallpaperSlot);
         }
 
         // Single render pass covering all atlas-slot writes. Each
@@ -1370,6 +1453,9 @@ void OverviewEffectV2::renderWindowsToAtlas()
             }
             renderSlot(handle, slot);
         }
+        if (m_wallpaperHandle && !m_wallpaperSlot.isFallback) {
+            renderSlot(m_wallpaperHandle, m_wallpaperSlot);
+        }
 
         m_atlasRenderPass->end(cmd);
     }
@@ -1378,13 +1464,13 @@ void OverviewEffectV2::renderWindowsToAtlas()
     // own framebuffer (cached on m_fallbackFramebuffers) and its own
     // begin/end on the shared render pass. Same Y-flipped viewport
     // convention as the atlas pass.
-    for (auto &[handle, slot] : m_windowSlots) {
+    auto renderFallbackSlot = [&](Window *handle, VulkanThumbnailAtlas::Slot &slot) {
         if (!slot.isFallback || !handle) {
-            continue;
+            return;
         }
         const QRectF windowGeom = handle->visibleGeometry();
         if (windowGeom.isEmpty()) {
-            continue;
+            return;
         }
 
         auto &fb = m_fallbackFramebuffers[handle];
@@ -1396,7 +1482,7 @@ void OverviewEffectV2::renderWindowsToAtlas()
                     << "OverviewEffectV2: fallback framebuffer wrap failed for"
                     << handle->caption().left(40) << slot.rect.size();
                 m_fallbackFramebuffers.erase(handle);
-                continue;
+                return;
             }
             fb->setColorImage(slot.image);
         }
@@ -1436,6 +1522,12 @@ void OverviewEffectV2::renderWindowsToAtlas()
         m_atlasRenderPass->end(cmd);
 
         slot.hasContent = true;
+    };
+    for (auto &[handle, slot] : m_windowSlots) {
+        renderFallbackSlot(handle, slot);
+    }
+    if (m_wallpaperHandle && m_wallpaperSlot.isFallback) {
+        renderFallbackSlot(m_wallpaperHandle, m_wallpaperSlot);
     }
 
     // Mip cascade + publishing barrier for every slot — atlas and
@@ -1448,6 +1540,9 @@ void OverviewEffectV2::renderWindowsToAtlas()
     for (auto &[_handle, slot] : m_barThumbSlots) {
         m_atlas->generateMipsAndPublish(cmd, slot);
     }
+    if (m_wallpaperHandle && m_wallpaperSlot.isValid()) {
+        m_atlas->generateMipsAndPublish(cmd, m_wallpaperSlot);
+    }
 
     vkRenderer->popOffscreenSlot();
 
@@ -1456,6 +1551,98 @@ void OverviewEffectV2::renderWindowsToAtlas()
     // compositor submit on the same queue picks up the atlas writes
     // through the publishing barrier's same-queue visibility.
     m_lastAtlasSubmit = m_vulkanCtx->submitSingleTimeCommandsAsync(cmd);
+}
+
+bool OverviewEffectV2::drawWallpaperBackground(VkCommandBuffer cmd, const QSize &fbSize,
+                                               VkFormat colorFormat)
+{
+    if (!m_atlas || !m_vulkanCtx || fbSize.isEmpty()) {
+        return false;
+    }
+    if (!m_wallpaperHandle || !m_wallpaperSlot.isValid()
+        || !m_wallpaperSlot.hasContent || m_wallpaperSlot.srgbView == VK_NULL_HANDLE) {
+        return false;
+    }
+    if (!ensureVulkanPipeline(m_vulkanCtx, colorFormat)) {
+        return false;
+    }
+    auto *backend = m_vulkanCtx->backend();
+    auto pushDescriptor = backend->cmdPushDescriptorSetKHR();
+    if (!pushDescriptor) {
+        return false;
+    }
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_vkPipeline);
+
+    VkDescriptorImageInfo imgInfo{};
+    imgInfo.sampler = m_atlas->sampler();
+    imgInfo.imageView = m_wallpaperSlot.srgbView;
+    imgInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    if (imgInfo.sampler == VK_NULL_HANDLE) {
+        return false;
+    }
+    VkWriteDescriptorSet write{};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstBinding = 0;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.pImageInfo = &imgInfo;
+    pushDescriptor(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_vkPipelineLayout, 0, 1, &write);
+
+    VkViewport vp{0.0f, 0.0f, float(fbSize.width()), float(fbSize.height()), 0.0f, 1.0f};
+    vkCmdSetViewport(cmd, 0, 1, &vp);
+    VkRect2D scissor{{0, 0}, {uint32_t(fbSize.width()), uint32_t(fbSize.height())}};
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+    // Pass 1: wallpaper texture, fullscreen NDC quad. Atlas-resident
+    // slots sample the slot's sub-rect in atlas-space UVs; fallback
+    // slots have a dedicated image of exactly slot.rect.size, so they
+    // sample the full [0,1] texture range.
+    const float atlasSize = float(VulkanThumbnailAtlas::kAtlasSize);
+    const float factor = float(std::clamp(m_activationFactor, 0.0, 1.0));
+    OverviewQuadPushConstants pc{};
+    pc.quadRectNdc[0] = -1.0f;
+    pc.quadRectNdc[1] = -1.0f;
+    pc.quadRectNdc[2] = 2.0f;
+    pc.quadRectNdc[3] = 2.0f;
+    if (m_wallpaperSlot.isFallback) {
+        pc.atlasSlotUv[0] = 0.0f;
+        pc.atlasSlotUv[1] = 0.0f;
+        pc.atlasSlotUv[2] = 1.0f;
+        pc.atlasSlotUv[3] = 1.0f;
+    } else {
+        pc.atlasSlotUv[0] = float(m_wallpaperSlot.rect.x()) / atlasSize;
+        pc.atlasSlotUv[1] = float(m_wallpaperSlot.rect.y()) / atlasSize;
+        pc.atlasSlotUv[2] = float(m_wallpaperSlot.rect.width()) / atlasSize;
+        pc.atlasSlotUv[3] = float(m_wallpaperSlot.rect.height()) / atlasSize;
+    }
+    pc.opacity = factor;
+    vkCmdPushConstants(cmd, m_vkPipelineLayout,
+                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                       0, sizeof(pc), &pc);
+    vkCmdDraw(cmd, 4, 1, 0, 0);
+
+    // Pass 2: dark wash on top. V1's QML uses a translucent
+    // theme.backgroundColor Rectangle at opacity 0.7 to soften the
+    // wallpaper and emphasise the foreground UI. Constant black for
+    // now; future change to follow Kirigami theme.
+    constexpr float kDarkWashAlpha = 0.7f;
+    OverviewQuadPushConstants wash{};
+    wash.quadRectNdc[0] = -1.0f;
+    wash.quadRectNdc[1] = -1.0f;
+    wash.quadRectNdc[2] = 2.0f;
+    wash.quadRectNdc[3] = 2.0f;
+    wash.atlasSlotUv[0] = 0.0f;
+    wash.atlasSlotUv[1] = 0.0f;
+    wash.atlasSlotUv[2] = 1.0f;
+    wash.atlasSlotUv[3] = 1.0f;
+    wash.tintRgba[3] = 1.0f; // solid tint, RGB stays 0 → black
+    wash.opacity = kDarkWashAlpha * factor;
+    vkCmdPushConstants(cmd, m_vkPipelineLayout,
+                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                       0, sizeof(wash), &wash);
+    vkCmdDraw(cmd, 4, 1, 0, 0);
+    return true;
 }
 
 void OverviewEffectV2::drawSceneCaptureBackground(VkCommandBuffer cmd, VulkanTexture *sceneCapture,
@@ -1966,6 +2153,7 @@ void OverviewEffectV2::activate()
 #if HAVE_VULKAN
     reserveSlotsForCurrentDesktop();
     reserveBarThumbs();
+    reserveWallpaperSlot();
     // Live activity refresh: window slots are reserved at activate-
     // time, so an external activity switch (Plasma keybinding, KCM,
     // DBus) would otherwise leave V2 showing an empty grid (old slots
@@ -1981,6 +2169,7 @@ void OverviewEffectV2::activate()
         releaseAllSlots();
         reserveSlotsForCurrentDesktop();
         reserveBarThumbs();
+        reserveWallpaperSlot();
         effects->addRepaintFull();
     });
     // Subscribe to preFrameRender so the atlas re-renders per frame
@@ -2014,10 +2203,16 @@ void OverviewEffectV2::activate()
                     : VK_FORMAT_UNDEFINED;
                 // Background pass first: the post-FX render pass uses
                 // LOAD_OP_DONT_CARE so every pixel outside a tile rect
-                // would be undefined garbage. Sample the scene capture
-                // fullscreen via the same pipeline (texture changes,
-                // shader doesn't).
-                drawSceneCaptureBackground(cmd, sceneCapture, fbSize, fmt);
+                // would be undefined garbage. Prefer the wallpaper
+                // slot — that's V1's behaviour (the underlying scene
+                // with windows isn't shown through V2's backdrop). If
+                // the wallpaper slot isn't populated yet (first frame
+                // after activate, or no Desktop-class window matched)
+                // fall back to dimming the scene capture so we still
+                // paint a valid background.
+                if (!drawWallpaperBackground(cmd, fbSize, fmt)) {
+                    drawSceneCaptureBackground(cmd, sceneCapture, fbSize, fmt);
+                }
                 renderTilesPostPass(cmd, fbSize, fmt);
             });
         }

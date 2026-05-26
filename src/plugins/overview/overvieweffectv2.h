@@ -359,6 +359,18 @@ private:
     /// push constants differ.
     void drawSceneCaptureBackground(VkCommandBuffer cmd, VulkanTexture *sceneCapture,
                                     const QSize &fbSize, VkFormat colorFormat);
+    /// Sample the desktop wallpaper from m_wallpaperSlot and draw it as
+    /// a fullscreen backdrop, then a dark wash on top. Bottom of V2's
+    /// layer stack — windows in the live scene aren't visible because
+    /// only the wallpaper is rendered. Returns false (caller should
+    /// fall back to drawSceneCaptureBackground) when the slot isn't
+    /// populated yet (first frame after activate, or no Desktop-type
+    /// window found).
+    bool drawWallpaperBackground(VkCommandBuffer cmd, const QSize &fbSize, VkFormat colorFormat);
+    /// Find the Plasma wallpaper window for the current desktop /
+    /// activity / output and reserve a single atlas slot for it.
+    /// Called from activate() and from the live activity-change hook.
+    void reserveWallpaperSlot();
 
     VulkanContext *m_vulkanCtx = nullptr;
     VkFormat m_pipelineColorFormat = VK_FORMAT_UNDEFINED;
@@ -382,6 +394,17 @@ private:
     /// allocation work (39cf11b882 + b8d35e7a0b) once the refs are
     /// dropped at deactivate.
     std::unordered_map<Window *, VulkanThumbnailAtlas::Slot> m_barThumbSlots;
+
+    /// Single atlas slot holding the desktop wallpaper (Plasma's
+    /// desktop-class window for the current activity / desktop /
+    /// output). Used by drawWallpaperBackground as the bottom layer
+    /// of V2's backdrop — mirrors V1's KWinComponents.DesktopBackground
+    /// pipeline. Re-rendered every frame alongside the other slots so
+    /// wallpaper-slideshow / live wallpapers stay current. Empty when
+    /// no desktop window matches (session start race) — the post-pass
+    /// then falls back to drawSceneCaptureBackground.
+    Window *m_wallpaperHandle = nullptr;
+    VulkanThumbnailAtlas::Slot m_wallpaperSlot;
 
     /// Per-off-desktop-window visibility refs, held for the entire
     /// overview lifetime. Without these, WindowItem::computeVisibility
