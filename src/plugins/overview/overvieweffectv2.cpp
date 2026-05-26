@@ -1741,7 +1741,8 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
     // there's more than one desktop (the last one can't be removed).
     // Uses its own image view; the icon texture is shared with the
     // Add-VD pass via ensureBarIconTextures (called below).
-    if (m_deleteAffordanceHover >= 0 && m_deleteAffordanceHover < int(m_barTiles.size())
+    if (!m_dragActive
+        && m_deleteAffordanceHover >= 0 && m_deleteAffordanceHover < int(m_barTiles.size())
         && m_barTiles.size() > 1) {
         ensureBarIconTextures();
         if (m_deleteIconTexture && m_deleteIconTexture->isValid()) {
@@ -2651,15 +2652,26 @@ void OverviewEffectV2::windowInputMouseEvent(QEvent *event)
 #if HAVE_VULKAN
 QRectF OverviewEffectV2::deleteAffordanceNdc(float ndcX, float ndcY, float ndcW, float ndcH) const
 {
-    // Top-right corner of the bar tile, scaled to kDeleteAffordanceFrac
-    // of the tile's height. The "×" texture is square so width == height
-    // even though NDC X and Y have different pixel scales — the texture
-    // itself is rendered to look correct on either basis, and the
-    // affordance only needs to be roughly tile-corner-sized rather than
-    // pixel-perfect.
-    const float side = ndcH * kDeleteAffordanceFrac;
-    const float pad = ndcH * 0.06f; // small inset from corner
-    return QRectF(ndcX + ndcW - side - pad, ndcY + pad, side, side);
+    // Top-right corner of the bar tile, sized to keep the square "×"
+    // texture square on screen. The tile's NDC height drives the
+    // pixel size we want; convert back to NDC for both axes through
+    // the per-axis framebuffer scale so we don't stretch on widescreen.
+    if (!effects) {
+        const float side = ndcH * kDeleteAffordanceFrac;
+        const float pad = ndcH * 0.06f;
+        return QRectF(ndcX + ndcW - side - pad, ndcY + pad, side, side);
+    }
+    const QRect screen = effects->virtualScreenGeometry();
+    const float screenWf = std::max(1.0f, float(screen.width()));
+    const float screenHf = std::max(1.0f, float(screen.height()));
+    const float tilePxH = ndcH * 0.5f * screenHf;
+    const float sidePx = tilePxH * kDeleteAffordanceFrac;
+    const float padPx = tilePxH * 0.06f;
+    const float ndcSideW = 2.0f * sidePx / screenWf;
+    const float ndcSideH = 2.0f * sidePx / screenHf;
+    const float ndcPadW = 2.0f * padPx / screenWf;
+    const float ndcPadH = 2.0f * padPx / screenHf;
+    return QRectF(ndcX + ndcW - ndcSideW - ndcPadW, ndcY + ndcPadH, ndcSideW, ndcSideH);
 }
 
 int OverviewEffectV2::hitTestDeleteAffordance(const QPoint &globalPos) const
