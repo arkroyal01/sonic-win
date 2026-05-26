@@ -103,6 +103,20 @@ Edge::Edge(ScreenEdges *parent)
     , m_output(nullptr)
     , m_gesture(std::make_unique<SwipeGesture>())
 {
+    m_dwellTimer = new QTimer(this);
+    m_dwellTimer->setSingleShot(true);
+    connect(m_dwellTimer, &QTimer::timeout, this, [this]() {
+        // Dwell time has elapsed without further motion events. If the
+        // cursor is still inside the trigger geometry, fire a synthetic
+        // check() so canActivate's dwell condition can pass without
+        // requiring the user to wiggle the mouse.
+        const QPoint pos = Cursors::self()->mouse()->pos().toPoint();
+        if (m_geometry.contains(pos)) {
+            using namespace std::chrono;
+            const auto now = duration_cast<microseconds>(steady_clock::now().time_since_epoch());
+            check(pos, now, false);
+        }
+    });
     m_gesture->setMinimumFingerCount(1);
     m_gesture->setMaximumFingerCount(1);
     connect(
@@ -334,6 +348,9 @@ bool Edge::check(const QPoint &cursorPos, const std::chrono::microseconds &trigg
         if ((cursorPos - m_triggeredPoint).manhattanLength() > DISTANCE_RESET) {
             m_lastReset.reset();
         }
+        if (m_dwellTimer) {
+            m_dwellTimer->stop();
+        }
         return false;
     }
     if (m_lastTrigger.has_value() && // still in cooldown
@@ -382,6 +399,17 @@ bool Edge::canActivate(const QPoint &cursorPos, const std::chrono::microseconds 
     // either condition means that "this is the first event in a new attempt"
     if (!m_lastReset.has_value() || (triggerTime - m_lastReset.value()) > edges()->reActivationThreshold()) {
         m_lastReset = triggerTime;
+        // Edge::check is only invoked on pointer-motion events. A
+        // perfectly still cursor parked in the corner produces no
+        // motion events and so never reaches the dwell threshold —
+        // the action would only fire when natural mouse jitter
+        // happens to deliver another event before m_lastReset goes
+        // stale (350 ms reActivationThreshold). Arm a single-shot
+        // timer so a re-check fires after timeThreshold even when
+        // motion is silent.
+        if (m_dwellTimer) {
+            m_dwellTimer->start(edges()->timeThreshold() + std::chrono::milliseconds(5));
+        }
         return false;
     }
     if (m_lastTrigger.has_value() && (triggerTime - m_lastTrigger.value()) < edges()->reActivationThreshold() - edges()->timeThreshold()) {

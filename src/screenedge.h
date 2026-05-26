@@ -24,7 +24,9 @@
 // Qt
 #include <QList>
 #include <QObject>
+#include <QPointer>
 #include <QRect>
+#include <QTimer>
 
 #include <memory>
 #include <xcb/xcb.h>
@@ -171,6 +173,13 @@ private:
     Output *m_output;
     std::unique_ptr<SwipeGesture> m_gesture;
     QList<TouchCallback> m_touchCallbacks;
+    // Dwell-completion timer: motion events drive Edge::check, so a
+    // perfectly still cursor never reaches the timeThreshold mark. When
+    // the first dwell sample fires we arm this timer for timeThreshold
+    // (+ small margin) ms; on fire it calls check() with the current
+    // cursor — if still inside the corner geometry it now completes
+    // the dwell. Cancelled when the cursor leaves the trigger geometry.
+    QTimer *m_dwellTimer = nullptr;
     friend class ScreenEdges;
 };
 
