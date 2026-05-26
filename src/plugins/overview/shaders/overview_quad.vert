@@ -24,6 +24,11 @@ layout(push_constant) uniform PC {
     vec4 tintRgba;
     // Per-frame uniform alpha for the slide-in animation.
     float opacity;
+    // Padding to keep the vertex push-constant range matching the
+    // fragment one: the fragment shader reads `lod` for mipmap
+    // sampling (textureLod) and Vulkan requires the two stages'
+    // push-constant ranges to overlap exactly for any shared part.
+    float lod;
 } pc;
 
 layout(location = 0) out vec2 fragUv;

@@ -76,8 +76,12 @@ struct OverviewQuadPushConstants
     float atlasSlotUv[4];
     float tintRgba[4];
     float opacity;
+    // Explicit mip LOD for textureLod sampling. 0 = use implicit
+    // texture() (LOD 0 for a fullscreen quad). Higher values produce
+    // a mipmap-based blur — see overview_quad.frag.
+    float lod;
 };
-static_assert(sizeof(OverviewQuadPushConstants) == 52,
+static_assert(sizeof(OverviewQuadPushConstants) == 56,
               "Push-constant layout must match shaders/overview_quad.{vert,frag}");
 } // namespace
 
@@ -1616,6 +1620,11 @@ bool OverviewEffectV2::drawWallpaperBackground(VkCommandBuffer cmd, const QSize 
         pc.atlasSlotUv[2] = float(m_wallpaperSlot.rect.width()) / atlasSize;
         pc.atlasSlotUv[3] = float(m_wallpaperSlot.rect.height()) / atlasSize;
     }
+    // Combined mip-LOD downsample + 13-tap Gaussian in the fragment
+    // shader. LOD 2 (4× downsample) keeps enough mid-frequency detail
+    // that the Gaussian taps blend smoothly; the LOD 4 blocky-mosaic
+    // pass from the previous iteration is gone.
+    pc.lod = 2.0f;
     pc.opacity = factor;
     vkCmdPushConstants(cmd, m_vkPipelineLayout,
                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
