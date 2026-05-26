@@ -792,6 +792,8 @@ void OverviewEffectV2::releaseAllSlots()
     m_barThumbSlots.clear();
     m_wallpaperSlotByHandle.clear();
     m_wallpaperHandleByVd.clear();
+    m_barScrollX = 0.0f;
+    m_barStripWidthNdc = 0.0f;
     m_barThumbVisRefs.clear();
     m_tileLayout.clear();
     m_barTiles.clear();
@@ -968,7 +970,21 @@ void OverviewEffectV2::rebuildBarLayout(const QSize &fbSize)
     const float tileW = kBarHeight; // → screen aspect in pixel space
     const int totalSlots = n + 1; // desktop tiles + Add tile
     const float stripW = totalSlots * tileW + (totalSlots - 1) * kGutter;
-    const float stripLeft = -stripW * 0.5f;
+    m_barStripWidthNdc = stripW;
+    // When the strip fits the viewport, centre it (V1 Flickable centres
+    // its content via leftMargin); when it overflows, shift by the user's
+    // scroll offset clamped so the leading / trailing edge can't
+    // overshoot the viewport. Matches V1's HorizontalFlick behaviour.
+    constexpr float kViewportW = 2.0f;
+    float stripLeft;
+    if (stripW <= kViewportW) {
+        m_barScrollX = 0.0f;
+        stripLeft = -stripW * 0.5f;
+    } else {
+        const float overflow = (stripW - kViewportW) * 0.5f;
+        m_barScrollX = std::clamp(m_barScrollX, -overflow, overflow);
+        stripLeft = -stripW * 0.5f + m_barScrollX;
+    }
 
     m_barTiles.reserve(n);
     for (int i = 0; i < n; ++i) {
@@ -2896,6 +2912,45 @@ void OverviewEffectV2::grabbedKeyboardEvent(QKeyEvent *event)
 void OverviewEffectV2::windowInputMouseEvent(QEvent *event)
 {
     if (!m_visible) {
+        return;
+    }
+    // Wheel over the desktop-bar zone scrolls the strip horizontally
+    // when it overflows the viewport (many VDs). Mirrors V1's
+    // Flickable.HorizontalFlick. We respond to both vertical and
+    // horizontal wheel input — a normal mouse wheel maps to angleDelta.y,
+    // touchpad horizontal-swipe to angleDelta.x.
+    if (auto *wheel = dynamic_cast<QWheelEvent *>(event)) {
+        if (m_barStripWidthNdc <= 2.0f) {
+            return;
+        }
+        if (!effects) {
+            return;
+        }
+        const QRect screen = effects->virtualScreenGeometry();
+        if (screen.isEmpty()) {
+            return;
+        }
+        const QPoint pos = wheel->globalPosition().toPoint();
+        // Bar zone: top ~9% of the screen (kBarTop=-0.96, kBarHeight=0.16
+        // → 2% to ~18% of screen height). Wheel only counts when the
+        // cursor is over the bar strip.
+        const int barTopPx = screen.y() + int(0.02 * screen.height());
+        const int barBottomPx = barTopPx + int(0.16 * screen.height());
+        if (pos.y() < barTopPx || pos.y() > barBottomPx) {
+            return;
+        }
+        const QPoint angle = wheel->angleDelta();
+        const float delta = float(angle.y() + angle.x());
+        if (qFuzzyIsNull(delta)) {
+            return;
+        }
+        // Translate wheel notches (120 per detent) into a comfortable
+        // step in NDC X. ~0.2 NDC per detent ≈ a tile-and-a-bit per
+        // scroll click.
+        m_barScrollX += delta / 120.0f * 0.2f;
+        const float overflow = (m_barStripWidthNdc - 2.0f) * 0.5f;
+        m_barScrollX = std::clamp(m_barScrollX, -overflow, overflow);
+        effects->addRepaintFull();
         return;
     }
     auto *mouseEvent = dynamic_cast<QMouseEvent *>(event);

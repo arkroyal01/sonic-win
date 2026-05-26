@@ -266,6 +266,19 @@ private:
     /// pointer. Same V1-parity outline logic as m_hoveredTileIndex
     /// but for the desktop-bar strip.
     int m_hoveredBarIndex = -1;
+    /// Horizontal scroll offset for the desktop bar, in NDC X units.
+    /// Matches V1's Flickable horizontal flick: when the strip is
+    /// wider than the viewport (many VDs), wheel input over the bar
+    /// shifts tiles left/right so off-screen ones become reachable.
+    /// Clamped to keep the strip's leading/trailing edge from
+    /// overshooting the viewport. Applied during rebuildBarLayout
+    /// so hit-tests and rendering both see the scrolled positions.
+    /// Reset on deactivate.
+    float m_barScrollX = 0.0f;
+    /// Strip width (sum of tile widths + gutters) in NDC X units.
+    /// Computed in rebuildBarLayout; used to clamp m_barScrollX and
+    /// to gate wheel input (don't react if the strip fits).
+    float m_barStripWidthNdc = 0.0f;
 
     Window *m_dragCandidate = nullptr;
     QPoint m_dragPressGlobal;
