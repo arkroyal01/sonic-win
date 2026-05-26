@@ -322,6 +322,14 @@ private:
     QColor m_backgroundColor{0x21, 0x24, 0x27};
     QUrl m_skyboxPath;
 
+    /// V2-only knob: MSAA sample count for the cube post-FX pass.
+    /// Off (1) means no MSAA. V1 has no equivalent setting; the
+    /// scripted cube renders through QtQuick3D and inherits whatever
+    /// the SceneGraph default is. Stored as VkSampleCountFlagBits-
+    /// compatible int (1, 2, 4, or 8) so Phase 4's renderpass code
+    /// can feed it straight to vkCreateRenderPass without remapping.
+    int m_msaaSamples = 1;
+
     static constexpr qreal kMaxPitchDeg = 30.0;
     static constexpr qreal kMinPitchDeg = -30.0;
     /// Pixels the cursor must travel before a press becomes a drag
