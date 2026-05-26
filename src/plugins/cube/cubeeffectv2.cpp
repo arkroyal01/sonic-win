@@ -391,6 +391,34 @@ void CubeEffectV2::deactivate()
     if (effects) {
         effects->stopMouseInterception(this);
     }
+
+    // Camera-side deactivation: target the close preset so the cube
+    // visually zooms in alongside the alpha fade-out, matching V1's
+    // ScreenView state transition "distant -> close" on deactivate.
+    // Yaw snaps to the centred desktop so the user lands on the
+    // tile they were inspecting, not whatever angle the camera
+    // happened to be at.
+    if (effects) {
+        const auto desktops = effects->desktops();
+        const int n = int(desktops.size());
+        const qreal angleTickDeg = (n > 0) ? (360.0 / n) : 0.0;
+        VirtualDesktop *target = centredDesktop();
+        int targetIndex = 0;
+        for (int i = 0; i < n; ++i) {
+            if (desktops[i] == target) {
+                targetIndex = i;
+                break;
+            }
+        }
+        const qreal faceDist = faceDistance(n);
+        const qreal fovHalfRad = qDegreesToRadians(45.0 * 0.5);
+        const qreal closeRadius = faceDist
+            + (effects->virtualScreenSize().height() * 0.5) / std::tan(fovHalfRad);
+        m_cameraTarget.yawDeg = angleTickDeg * targetIndex;
+        m_cameraTarget.pitchDeg = 0.0;
+        m_cameraTarget.radius = closeRadius;
+    }
+
     m_animation.setDirection(QVariantAnimation::Backward);
     m_animation.setDuration(m_animationDuration);
     m_animation.start();
