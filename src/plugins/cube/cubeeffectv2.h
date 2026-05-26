@@ -377,6 +377,46 @@ private:
     /// so the renderer doesn't try to sample dropped slots.
     int m_postPassId = -1;
 
+    /// Shared atlas render-pass + framebuffer wrapper, lazily built
+    /// on first renderDesktopsToAtlas. The atlas image stays in
+    /// GENERAL layout (see VulkanRenderPass::createForAtlasWrite),
+    /// so all desktop slots share one framebuffer; per-slot
+    /// viewport+scissor restricts each renderItem call to its
+    /// slot's atlas rect. Mirrors OverviewEffectV2's pattern.
+    std::unique_ptr<VulkanFramebuffer> m_atlasFramebuffer;
+    std::unique_ptr<VulkanRenderPass> m_atlasRenderPass;
+
+    /// Per-desktop dedicated framebuffer when the atlas reserve
+    /// returns a fallback slot (slot.isFallback). Fallback slots
+    /// own their image; each needs its own framebuffer because
+    /// the render pass is parameterised on image view. Keyed by
+    /// the desktop pointer so we can drop them alongside the
+    /// matching DesktopSlot in releaseAllResources.
+    std::unordered_map<VirtualDesktop *, std::unique_ptr<VulkanFramebuffer>> m_fallbackFramebuffers;
+
+    /// preFrameRender connection so each frame triggers a fresh
+    /// desktop composition pass before the swapchain frame is
+    /// recorded. Disconnected in releaseAllResources.
+    QMetaObject::Connection m_preFrameConnection;
+
+    /// Last frame's atlas-write submit handle. Used to fence the
+    /// next frame's overwrite against the previous frame's read
+    /// (same race-condition guard Overview V2 uses).
+    VulkanSubmitHandle m_lastAtlasSubmit;
+
+    /// Reserve one atlas slot per virtual desktop (sized to the
+    /// compositor framebuffer), and acquire EffectWindowVisibleRefs
+    /// for every window on a non-current desktop so its WindowItem
+    /// renders content during renderDesktopsToAtlas. Idempotent —
+    /// safe to call once per activate(). Bails if the renderer
+    /// isn't Vulkan (the cube V2 has no GL path yet).
+    void reserveDesktopSlots();
+
+    /// Composite each desktop's window stack into its atlas slot.
+    /// Connected to WorkspaceScene::preFrameRender from activate()
+    /// so every paint sees fresh per-desktop captures.
+    void renderDesktopsToAtlas();
+
     /// Build the cube-face graphics pipeline. Same shape as the
     /// overview pipeline: combined-image-sampler binding 0, push
     /// constants carrying per-face model matrix + atlas UV rect.
@@ -385,13 +425,6 @@ private:
     /// 3 lands the actual SPIR-V.
     bool ensureVulkanPipeline(VulkanContext *ctx, VkFormat colorFormat);
     void destroyVulkanPipeline();
-
-    /// Render every desktop into its atlas slot. Called from the
-    /// scene preFrameRender so the slots are populated before the
-    /// post-pass tries to sample them. Mirrors
-    /// OverviewEffectV2::renderWindowsToAtlas but at the desktop
-    /// granularity. Phase 2.
-    void renderDesktopsToAtlas();
 
     /// Drop every per-activation GPU resource: atlas slots,
     /// visibility refs, skybox texture, atlas singleton. Pipelines

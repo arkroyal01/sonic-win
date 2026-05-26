@@ -10,9 +10,19 @@
 #include "effect/effectwindow.h"
 
 #include "virtualdesktops.h"
+#include "window.h"
 
 #if HAVE_VULKAN
+#include "compositor.h"
+#include "core/renderviewport.h"
+#include "platformsupport/scenes/vulkan/vulkanbackend.h"
+#include "platformsupport/scenes/vulkan/vulkancontext.h"
+#include "platformsupport/scenes/vulkan/vulkanframebuffer.h"
+#include "platformsupport/scenes/vulkan/vulkanrenderpass.h"
 #include "platformsupport/scenes/vulkan/vulkantexture.h"
+#include "platformsupport/scenes/vulkan/vulkanthumbnailatlas.h"
+#include "scene/itemrenderer_vulkan.h"
+#include "scene/workspacescene.h"
 #endif
 
 #include <KConfigGroup>
@@ -304,6 +314,17 @@ void CubeEffectV2::activate()
     // windows behind the cube.
     effects->startMouseInterception(this, Qt::ArrowCursor);
     m_grabbedKeyboard = effects->grabKeyboard(this);
+
+#if HAVE_VULKAN
+    // Phase 2: reserve per-desktop atlas slots + hold off-current-
+    // desktop visibility refs, then start composing each desktop
+    // into its slot every frame via preFrameRender.
+    reserveDesktopSlots();
+    if (auto *scene = Compositor::self()->scene()) {
+        m_preFrameConnection = connect(scene, &WorkspaceScene::preFrameRender,
+                                       this, &CubeEffectV2::renderDesktopsToAtlas);
+    }
+#endif
 
     if (m_animation.state() == QVariantAnimation::Running
         && m_animation.direction() == QVariantAnimation::Backward) {
@@ -666,37 +687,316 @@ void CubeEffectV2::destroyVulkanPipeline()
     // Phase 3.
 }
 
+void CubeEffectV2::reserveDesktopSlots()
+{
+    if (!effects || !effects->isVulkanCompositing()) {
+        return;
+    }
+    auto *scene = Compositor::self()->scene();
+    if (!scene) {
+        return;
+    }
+    auto *vkRenderer = dynamic_cast<ItemRendererVulkan *>(scene->renderer());
+    if (!vkRenderer) {
+        return;
+    }
+    m_vulkanCtx = vkRenderer->context();
+    if (!m_vulkanCtx) {
+        return;
+    }
+    m_atlas = VulkanThumbnailAtlas::get(m_vulkanCtx);
+    if (!m_atlas) {
+        return;
+    }
+
+    const QSize fbSize = effects->virtualScreenSize();
+    if (fbSize.isEmpty()) {
+        return;
+    }
+
+    // One slot per desktop, sized to the full framebuffer. Atlas
+    // returns an in-atlas rect if the size fits (multiple slots
+    // can share the 4096² atlas image) or a dedicated fallback
+    // image if not. For 1080p that means up to ~6 desktops share
+    // the atlas; for 4K each desktop falls back to its own image.
+    const auto desktops = effects->desktops();
+    for (VirtualDesktop *vd : desktops) {
+        if (!vd) {
+            continue;
+        }
+        auto slot = m_atlas->reserve(fbSize);
+        if (!slot.isValid()) {
+            qCWarning(KWIN_CUBE_V2_LOG)
+                << "CubeEffectV2: atlas reserve failed for desktop"
+                << vd->x11DesktopNumber() << "size" << fbSize;
+            continue;
+        }
+        m_desktopSlots.emplace(vd, DesktopSlot{std::move(slot), false});
+    }
+
+    // Hold an EffectWindowVisibleRef for every window on a non-
+    // current desktop. Without these, WindowItem::computeVisibility
+    // returns false for off-desktop windows and renderItem produces
+    // empty content. The refs drop in releaseAllResources, at which
+    // point the X11 suspend hook + dedicated-memory work return the
+    // associated per-window VRAM to the OS.
+    auto *currentDesktop = effects->currentDesktop();
+    for (EffectWindow *ew : effects->stackingOrder()) {
+        if (!ew) {
+            continue;
+        }
+        if (currentDesktop && ew->isOnDesktop(currentDesktop)) {
+            continue;
+        }
+        Window *handle = ew->window();
+        if (!handle || !handle->isClient() || !handle->isNormalWindow()) {
+            continue;
+        }
+        // Same conservative filter Overview V2 uses; documented at
+        // length there. Catches OSD popups, notifications, tooltips
+        // etc. that mustn't appear in the cube faces.
+        if (handle->skipSwitcher() || handle->isOnScreenDisplay()
+            || handle->isNotification() || handle->isCriticalNotification()
+            || handle->isTooltip() || handle->isComboBox()
+            || handle->isDNDIcon() || handle->isPopupWindow()
+            || !handle->readyForPainting()) {
+            continue;
+        }
+        m_visibilityRefs.emplace_back(ew, EffectWindow::PAINT_DISABLED_BY_DESKTOP);
+    }
+}
+
 void CubeEffectV2::renderDesktopsToAtlas()
 {
-    // Phase 2. Per-desktop full-framebuffer-size atlas slot, rendered
-    // via ItemRendererVulkan into the slot's framebuffer view. Walk
-    // every desktop, render each desktop's window stack into its own
-    // slot. Hold EffectWindowVisibleRefs across the active phase so
-    // off-current-desktop windows actually have content; the suspend
-    // hook + dedicated-memory work already in place ensure the VRAM
-    // is returned on deactivate.
+    if (!m_atlas || !m_vulkanCtx || m_desktopSlots.empty()) {
+        return;
+    }
+    auto *scene = Compositor::self()->scene();
+    if (!scene) {
+        return;
+    }
+    auto *vkRenderer = dynamic_cast<ItemRendererVulkan *>(scene->renderer());
+    if (!vkRenderer) {
+        return;
+    }
+
+    constexpr VkFormat kAtlasFormat = VK_FORMAT_R8G8B8A8_SRGB;
+    if (!m_atlasRenderPass) {
+        m_atlasRenderPass = VulkanRenderPass::createForAtlasWrite(m_vulkanCtx, kAtlasFormat);
+        if (!m_atlasRenderPass) {
+            qCWarning(KWIN_CUBE_V2_LOG)
+                << "CubeEffectV2: createForAtlasWrite failed";
+            return;
+        }
+    }
+
+    // Locate any atlas-resident slot to learn the shared image+view.
+    // If every slot ended up as a fallback (e.g. 4K + many desktops)
+    // we skip the shared atlas pass and render straight into each
+    // fallback framebuffer below.
+    VkImage atlasImage = VK_NULL_HANDLE;
+    VkImageView atlasMipZero = VK_NULL_HANDLE;
+    for (const auto &[_vd, ds] : m_desktopSlots) {
+        if (!ds.slot.isFallback) {
+            atlasImage = ds.slot.image;
+            atlasMipZero = ds.slot.mipZeroView;
+            break;
+        }
+    }
+    const bool haveAtlasSlots = atlasImage != VK_NULL_HANDLE;
+    if (haveAtlasSlots && !m_atlasFramebuffer) {
+        m_atlasFramebuffer = VulkanFramebuffer::create(m_vulkanCtx, m_atlasRenderPass.get(),
+                                                       atlasMipZero,
+                                                       QSize(VulkanThumbnailAtlas::kAtlasSize,
+                                                             VulkanThumbnailAtlas::kAtlasSize));
+        if (!m_atlasFramebuffer) {
+            qCWarning(KWIN_CUBE_V2_LOG)
+                << "CubeEffectV2: atlas framebuffer wrap failed";
+            return;
+        }
+        m_atlasFramebuffer->setColorImage(atlasImage);
+    }
+
+    // Wait on the previous frame's atlas submit so the streaming-
+    // buffer region we're about to reuse is GPU-finished.
+    if (m_lastAtlasSubmit.isValid()) {
+        m_vulkanCtx->waitForSubmit(m_lastAtlasSubmit);
+        m_lastAtlasSubmit = VulkanSubmitHandle{};
+    }
+
+    VkCommandBuffer cmd = m_vulkanCtx->beginSingleTimeCommands();
+    if (cmd == VK_NULL_HANDLE) {
+        return;
+    }
+    vkRenderer->pushOffscreenSlot();
+
+    // Composite one desktop's window stack into its slot. Shared by
+    // the in-atlas and fallback paths; the caller sets up the active
+    // render pass + framebuffer, then calls renderDesktopSlot for
+    // each desktop with the right viewport/scissor.
+    auto renderDesktopSlot = [&](VirtualDesktop *vd, const QRect &slotRect,
+                                 VulkanFramebuffer *fb) {
+        VkClearAttachment clearAtt{};
+        clearAtt.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        clearAtt.colorAttachment = 0;
+        // Clear the slot rect before drawing this desktop's windows
+        // so a previous frame's content (or a different desktop's
+        // residue when the atlas reuses a rect) doesn't show through
+        // transparent areas. vkCmdClearAttachments respects the
+        // current scissor — but we pass an explicit clear rect to
+        // be unambiguous.
+        VkClearRect clearRect{};
+        clearRect.rect = VkRect2D{
+            {int32_t(slotRect.x()), int32_t(slotRect.y())},
+            {uint32_t(slotRect.width()), uint32_t(slotRect.height())},
+        };
+        clearRect.baseArrayLayer = 0;
+        clearRect.layerCount = 1;
+        vkCmdClearAttachments(cmd, 1, &clearAtt, 1, &clearRect);
+
+        VkViewport vp{};
+        vp.x = float(slotRect.x());
+        vp.y = float(slotRect.y() + slotRect.height());
+        vp.width = float(slotRect.width());
+        vp.height = -float(slotRect.height()); // Y-flip for top-down mip-0
+        vp.minDepth = 0.0f;
+        vp.maxDepth = 1.0f;
+        vkCmdSetViewport(cmd, 0, 1, &vp);
+
+        VkRect2D scissor{
+            {int32_t(slotRect.x()), int32_t(slotRect.y())},
+            {uint32_t(slotRect.width()), uint32_t(slotRect.height())},
+        };
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+        auto vkRT = std::make_unique<VulkanRenderTarget>(fb);
+        vkRT->setCommandBuffer(cmd);
+        RenderTarget atlasTarget(vkRT.get());
+
+        // Render every window on this desktop in stacking order so
+        // higher-z windows occlude lower ones. Apply the same
+        // conservative window-type filter as reservation — keeps
+        // OSDs and tooltips out of the captured face.
+        const QRectF screenGeom = effects->virtualScreenGeometry();
+        RenderViewport viewport(screenGeom, 1.0, atlasTarget);
+        for (EffectWindow *ew : effects->stackingOrder()) {
+            if (!ew || !ew->isOnDesktop(vd)) {
+                continue;
+            }
+            Window *handle = ew->window();
+            if (!handle || !handle->isClient() || !handle->isNormalWindow()) {
+                continue;
+            }
+            if (handle->skipSwitcher() || handle->isOnScreenDisplay()
+                || handle->isNotification() || handle->isCriticalNotification()
+                || handle->isTooltip() || handle->isComboBox()
+                || handle->isDNDIcon() || handle->isPopupWindow()
+                || !handle->readyForPainting()) {
+                continue;
+            }
+            vkRenderer->renderItem(atlasTarget, viewport, handle->windowItem(),
+                                   Scene::PAINT_WINDOW_TRANSFORMED, infiniteRegion(),
+                                   WindowPaintData{});
+        }
+        m_desktopSlots[vd].hasContent = true;
+    };
+
+    VkClearValue clearVal{};
+    if (haveAtlasSlots) {
+        // Pre-pass memory barriers — atlas stays in GENERAL so this
+        // is a memory barrier, not a layout transition.
+        for (auto &[_vd, ds] : m_desktopSlots) {
+            if (!ds.slot.isFallback) {
+                m_atlas->prepareForRenderTo(cmd, ds.slot);
+            }
+        }
+        const VkRect2D fullArea{
+            {0, 0},
+            {uint32_t(VulkanThumbnailAtlas::kAtlasSize), uint32_t(VulkanThumbnailAtlas::kAtlasSize)},
+        };
+        m_atlasRenderPass->begin(cmd, m_atlasFramebuffer->framebuffer(), fullArea, &clearVal, 1);
+        for (auto &[vd, ds] : m_desktopSlots) {
+            if (ds.slot.isFallback || !vd) {
+                continue;
+            }
+            renderDesktopSlot(vd, ds.slot.rect, m_atlasFramebuffer.get());
+        }
+        m_atlasRenderPass->end(cmd);
+    }
+
+    // Fallback slots — one dedicated image per desktop. Each gets
+    // its own framebuffer + render-pass instance.
+    for (auto &[vd, ds] : m_desktopSlots) {
+        if (!ds.slot.isFallback || !vd) {
+            continue;
+        }
+        auto fbIt = m_fallbackFramebuffers.find(vd);
+        VulkanFramebuffer *fb = nullptr;
+        if (fbIt == m_fallbackFramebuffers.end()) {
+            auto created = VulkanFramebuffer::create(m_vulkanCtx, m_atlasRenderPass.get(),
+                                                     ds.slot.mipZeroView, ds.slot.rect.size());
+            if (!created) {
+                continue;
+            }
+            created->setColorImage(ds.slot.image);
+            fb = created.get();
+            m_fallbackFramebuffers.emplace(vd, std::move(created));
+        } else {
+            fb = fbIt->second.get();
+        }
+        m_atlas->prepareForRenderTo(cmd, ds.slot);
+        const VkRect2D fbArea{
+            {0, 0},
+            {uint32_t(ds.slot.rect.width()), uint32_t(ds.slot.rect.height())},
+        };
+        m_atlasRenderPass->begin(cmd, fb->framebuffer(), fbArea, &clearVal, 1);
+        renderDesktopSlot(vd, QRect(QPoint(0, 0), ds.slot.rect.size()), fb);
+        m_atlasRenderPass->end(cmd);
+    }
+
+    // Generate mips + publish (transitions all mips to SHADER_READ_ONLY
+    // for the upcoming face-draw pass to sample). One mip cascade per
+    // slot.
+    for (auto &[_vd, ds] : m_desktopSlots) {
+        if (ds.hasContent) {
+            m_atlas->generateMipsAndPublish(cmd, ds.slot);
+        }
+    }
+
+    vkRenderer->popOffscreenSlot();
+    m_lastAtlasSubmit = m_vulkanCtx->submitSingleTimeCommandsAsync(cmd);
 }
 
 void CubeEffectV2::releaseAllResources()
 {
-    if (m_vulkanCtx) {
-        // Wait on any in-flight per-desktop atlas submit. Same
-        // pattern OverviewEffectV2::releaseAllSlots uses — without
-        // this the freed slot rects could get handed back to a
-        // fresh consumer mid-flight.
+    QObject::disconnect(m_preFrameConnection);
+    m_preFrameConnection = QMetaObject::Connection();
+
+    if (m_vulkanCtx && m_lastAtlasSubmit.isValid()) {
+        // Wait on the most recent atlas write so the slot rects we're
+        // about to return to the atlas's free list are GPU-finished.
+        // Without this the rect could be handed back to a fresh
+        // consumer (e.g. Overview V2) mid-flight.
+        m_vulkanCtx->waitForSubmit(m_lastAtlasSubmit);
+        m_lastAtlasSubmit = VulkanSubmitHandle{};
     }
     if (m_atlas) {
-        for (auto &[desktop, ds] : m_desktopSlots) {
+        for (auto &[_desktop, ds] : m_desktopSlots) {
             m_atlas->release(ds.slot);
         }
     }
     m_desktopSlots.clear();
+    m_fallbackFramebuffers.clear();
+    m_atlasFramebuffer.reset();
+    m_atlasRenderPass.reset();
     m_visibilityRefs.clear();
     m_skyboxTexture.reset();
-    // Atlas singleton drop — same hand-off as Overview V2. If a
-    // future consumer ends up sharing this, switch to ref counting.
+    // Atlas singleton hand-off — same as Overview V2. The atlas
+    // image is ~85 MB so holding it across activations would defeat
+    // the rewrite's primary goal. If a future cube consumer shares
+    // the atlas with overview, replace this with proper ref counting.
     if (m_atlas) {
-        // VulkanThumbnailAtlas::dropForContext(m_vulkanCtx); // Phase 2.
+        VulkanThumbnailAtlas::dropForContext(m_vulkanCtx);
         m_atlas = nullptr;
     }
     m_postPassId = -1;
