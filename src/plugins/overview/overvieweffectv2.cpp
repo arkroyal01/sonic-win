@@ -1395,28 +1395,6 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
         pushAndDraw(t, 0.0f, 0.0f, 1.0f, 1.0f);
     }
 
-    // The dragged grid tile, drawn after every other grid tile so it
-    // floats on top of them regardless of natural iteration order.
-    if (m_dragActive) {
-        for (const TileLayout &t : m_tileLayout) {
-            if (t.handle != m_dragCandidate) {
-                continue;
-            }
-            if (t.slot.isFallback) {
-                pushView(t.slot.srgbView);
-                pushAndDraw(t, 0.0f, 0.0f, 1.0f, 1.0f);
-            } else if (atlasSrgbView != VK_NULL_HANDLE) {
-                pushView(atlasSrgbView);
-                pushAndDraw(t,
-                            float(t.slot.rect.x()) / atlasSize,
-                            float(t.slot.rect.y()) / atlasSize,
-                            float(t.slot.rect.width()) / atlasSize,
-                            float(t.slot.rect.height()) / atlasSize);
-            }
-            break;
-        }
-    }
-
     // Pass 2.5: focus highlight on whichever zone owns keyboard
     // focus. Overlay a translucent white wash so the user can see what
     // Enter would activate. Same pipeline, tintRgba.a = 1 → solid
@@ -1487,6 +1465,30 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
                 const BarTile &b = m_barTiles[m_focusedIndex];
                 pushFocusWash(b.ndcX, b.ndcY, b.ndcW, b.ndcH);
             }
+        }
+    }
+
+    // The dragged grid tile, drawn last so it floats above every
+    // other grid tile and the desktop bar — the user always sees what
+    // they're holding, even when the cursor crosses into the bar
+    // zone to drop on a different desktop's tile.
+    if (m_dragActive) {
+        for (const TileLayout &t : m_tileLayout) {
+            if (t.handle != m_dragCandidate) {
+                continue;
+            }
+            if (t.slot.isFallback) {
+                pushView(t.slot.srgbView);
+                pushAndDraw(t, 0.0f, 0.0f, 1.0f, 1.0f);
+            } else if (atlasSrgbView != VK_NULL_HANDLE) {
+                pushView(atlasSrgbView);
+                pushAndDraw(t,
+                            float(t.slot.rect.x()) / atlasSize,
+                            float(t.slot.rect.y()) / atlasSize,
+                            float(t.slot.rect.width()) / atlasSize,
+                            float(t.slot.rect.height()) / atlasSize);
+            }
+            break;
         }
     }
 }
