@@ -110,7 +110,13 @@ OverviewEffectV2::OverviewEffectV2()
         effects->addRepaintFull();
     });
     connect(&m_animation, &QVariantAnimation::finished, this, [this]() {
-        if (qFuzzyCompare(m_activationFactor, 0.0)) {
+        // Only the slide-out finish should release resources. Use the
+        // animation direction rather than the activation-factor value;
+        // qFuzzyCompare against 0.0 is unreliable — Qt's epsilon is
+        // relative, so a value of 5e-17 from float rounding fails the
+        // compare and leaves m_visible = true forever, which makes the
+        // next corner / shortcut trigger no-op as if V2 were still up.
+        if (m_animation.direction() == QVariantAnimation::Backward) {
             m_visible = false;
 #if HAVE_VULKAN
             // Stop drawing tiles, then release atlas slots. Order
