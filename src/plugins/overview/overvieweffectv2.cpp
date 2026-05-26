@@ -33,11 +33,13 @@
 #include <QEasingCurve>
 #include <QFont>
 #include <QFontMetrics>
+#include <QIcon>
 #include <QImage>
 #include <QKeyEvent>
 #include <QKeySequence>
 #include <QLoggingCategory>
 #include <QPainter>
+#include <QPixmap>
 
 namespace KWin
 {
@@ -1019,23 +1021,36 @@ void OverviewEffectV2::ensureBarIconTextures()
         return;
     }
     if (!m_addIconTexture) {
+        // Use the same "list-add" theme icon as V1's QML
+        // DesktopBar.qml so the affordance matches across versions.
         const int sidePx = 64;
+        const QIcon icon = QIcon::fromTheme(QStringLiteral("list-add"));
         QImage img(sidePx, sidePx, QImage::Format_RGBA8888_Premultiplied);
         img.fill(Qt::transparent);
-        QPainter p(&img);
-        p.setRenderHint(QPainter::Antialiasing);
-        // Thin "+" centred. White with the same tone as the bar
-        // tile labels so the affordance reads as a control, not as
-        // window content.
-        QPen pen(QColor(255, 255, 255, 230));
-        pen.setWidthF(sidePx * 0.10f);
-        pen.setCapStyle(Qt::RoundCap);
-        p.setPen(pen);
-        const float half = sidePx * 0.5f;
-        const float arm = sidePx * 0.28f;
-        p.drawLine(QPointF(half - arm, half), QPointF(half + arm, half));
-        p.drawLine(QPointF(half, half - arm), QPointF(half, half + arm));
-        p.end();
+        bool haveThemeIcon = false;
+        if (!icon.isNull()) {
+            const QPixmap pm = icon.pixmap(sidePx, sidePx);
+            if (!pm.isNull()) {
+                QPainter p(&img);
+                p.drawPixmap(0, 0, pm);
+                p.end();
+                haveThemeIcon = true;
+            }
+        }
+        if (!haveThemeIcon) {
+            // Theme icon missing — fall back to a hand-drawn "+".
+            QPainter p(&img);
+            p.setRenderHint(QPainter::Antialiasing);
+            QPen pen(QColor(255, 255, 255, 230));
+            pen.setWidthF(sidePx * 0.10f);
+            pen.setCapStyle(Qt::RoundCap);
+            p.setPen(pen);
+            const float half = sidePx * 0.5f;
+            const float arm = sidePx * 0.28f;
+            p.drawLine(QPointF(half - arm, half), QPointF(half + arm, half));
+            p.drawLine(QPointF(half, half - arm), QPointF(half, half + arm));
+            p.end();
+        }
         m_addIconTexture = VulkanTexture::upload(m_vulkanCtx, img);
         if (!m_addIconTexture) {
             qCWarning(KWIN_OVERVIEW_V2_LOG)
@@ -1700,11 +1715,19 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
     ensureBarIconTextures();
     if (!m_addTileNdc.isEmpty() && m_addIconTexture && m_addIconTexture->isValid()) {
         pushView(m_addIconTexture->imageView());
-        // Inset the icon inside the tile so the "+" doesn't sit edge-
-        // to-edge. ~55% of the smaller tile dimension, centred.
+        // Square icon (theme "list-add" rendered at 64×64). The tile
+        // rect is square in NDC but rectangular in pixels because NDC
+        // X and Y scale by different framebuffer half-extents — fit
+        // the icon to the smaller pixel dimension so it stays square
+        // on screen instead of stretching horizontally.
         const float iconFrac = 0.55f;
-        const float iconNdcW = float(m_addTileNdc.width()) * iconFrac;
-        const float iconNdcH = float(m_addTileNdc.height()) * iconFrac;
+        const float screenWf = std::max(1.0f, float(fbSize.width()));
+        const float screenHf = std::max(1.0f, float(fbSize.height()));
+        const float tilePxW = float(m_addTileNdc.width()) * 0.5f * screenWf;
+        const float tilePxH = float(m_addTileNdc.height()) * 0.5f * screenHf;
+        const float iconPx = iconFrac * std::min(tilePxW, tilePxH);
+        const float iconNdcW = 2.0f * iconPx / screenWf;
+        const float iconNdcH = 2.0f * iconPx / screenHf;
         const float iconNdcX = float(m_addTileNdc.x())
             + (float(m_addTileNdc.width()) - iconNdcW) * 0.5f;
         const float iconNdcY = float(m_addTileNdc.y())
