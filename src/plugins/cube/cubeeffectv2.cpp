@@ -36,6 +36,7 @@
 #include <QKeySequence>
 #include <QLoggingCategory>
 #include <QMouseEvent>
+#include <QSet>
 #include <QWheelEvent>
 #include <QtMath>
 
@@ -768,8 +769,40 @@ void CubeEffectV2::reserveDesktopSlots()
 
 void CubeEffectV2::renderDesktopsToAtlas()
 {
-    if (!m_atlas || !m_vulkanCtx || m_desktopSlots.empty()) {
+    if (!effects || !m_atlas || !m_vulkanCtx || m_desktopSlots.empty()) {
         return;
+    }
+    // Skip composition during the slide-out tail. Once the cube is
+    // mostly invisible (alpha < 0.05) the on-screen pass blends
+    // captured content to near-zero anyway — refreshing the atlas
+    // would burn ~1ms of GPU per frame for nothing.
+    if (m_activationFactor < 0.05 && m_animation.direction() == QVariantAnimation::Backward) {
+        return;
+    }
+    // Defensive: drop any slot whose VirtualDesktop has been removed
+    // since reservation. The VDM doesn't fire a callback we listen
+    // to in this draft (Phase 5 will hook desktopRemoved); checking
+    // membership against the live list catches the dangling pointer
+    // case without crashing.
+    {
+        const auto liveDesktops = effects->desktops();
+        const QSet<VirtualDesktop *> liveSet(liveDesktops.begin(), liveDesktops.end());
+        for (auto it = m_desktopSlots.begin(); it != m_desktopSlots.end();) {
+            if (!liveSet.contains(it->first)) {
+                if (m_vulkanCtx && m_lastAtlasSubmit.isValid()) {
+                    m_vulkanCtx->waitForSubmit(m_lastAtlasSubmit);
+                    m_lastAtlasSubmit = VulkanSubmitHandle{};
+                }
+                m_atlas->release(it->second.slot);
+                m_fallbackFramebuffers.erase(it->first);
+                it = m_desktopSlots.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        if (m_desktopSlots.empty()) {
+            return;
+        }
     }
     auto *scene = Compositor::self()->scene();
     if (!scene) {
