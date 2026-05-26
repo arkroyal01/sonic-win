@@ -1054,10 +1054,7 @@ void CubeEffectV2::onPostPass(VkCommandBuffer cmd, VulkanTexture *sceneCapture,
             continue;
         }
         const QMatrix4x4 model = faceModelMatrix(i, n);
-        const QVector4D originCam = m_viewProj.view * QVector4D(0, 0, 0, 1) * 0
-            + m_viewProj.view * model * QVector4D(0, 0, 0, 1);
-        Q_UNUSED(originCam);
-        // Compute camera-space Z of the face's centre for sort.
+        // Camera-space Z of the face's centre for the painter sort.
         const QVector4D centreCam = m_viewProj.view * (model * QVector4D(0, 0, 0, 1));
         draws.push_back({vd, i, centreCam.z(), viewProj * model});
     }
@@ -1088,10 +1085,21 @@ void CubeEffectV2::onPostPass(VkCommandBuffer cmd, VulkanTexture *sceneCapture,
         for (int k = 0; k < 16; ++k) {
             pc.mvp[k] = mvpData[k];
         }
-        pc.atlasSlotUv[0] = float(ds.slot.rect.x()) / float(atlasSize);
-        pc.atlasSlotUv[1] = float(ds.slot.rect.y()) / float(atlasSize);
-        pc.atlasSlotUv[2] = float(ds.slot.rect.width()) / float(atlasSize);
-        pc.atlasSlotUv[3] = float(ds.slot.rect.height()) / float(atlasSize);
+        if (ds.slot.isFallback) {
+            // Fallback slots own their entire dedicated image — the
+            // srgbView is a view of the whole image, so UV space is
+            // [0, 1]² regardless of slot.rect (which carries the
+            // dedicated image's pixel size, not an atlas-space offset).
+            pc.atlasSlotUv[0] = 0.0f;
+            pc.atlasSlotUv[1] = 0.0f;
+            pc.atlasSlotUv[2] = 1.0f;
+            pc.atlasSlotUv[3] = 1.0f;
+        } else {
+            pc.atlasSlotUv[0] = float(ds.slot.rect.x()) / float(atlasSize);
+            pc.atlasSlotUv[1] = float(ds.slot.rect.y()) / float(atlasSize);
+            pc.atlasSlotUv[2] = float(ds.slot.rect.width()) / float(atlasSize);
+            pc.atlasSlotUv[3] = float(ds.slot.rect.height()) / float(atlasSize);
+        }
         pc.opacity = opacity;
         vkCmdPushConstants(cmd, m_vkPipelineLayout,
                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
