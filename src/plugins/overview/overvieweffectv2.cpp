@@ -94,10 +94,10 @@ namespace KWin
 
 bool OverviewEffectV2::supported()
 {
-    // Gate strictly on the env var so the existing OverviewEffect stays
-    // the default. When the user opts in, this V2 effect takes over the
-    // same shortcut and OverviewEffect::supported() refuses to load.
-    if (qEnvironmentVariableIntValue("KWIN_OVERVIEW_V2") == 0) {
+    // V2 is the default for dogfooding; the QML OverviewEffect only
+    // takes the shortcut back when the user sets KWIN_OVERVIEW_V2=0
+    // (mirrored gate in ../main.cpp).
+    if (qEnvironmentVariable("KWIN_OVERVIEW_V2", QStringLiteral("1")).toInt() == 0) {
         return false;
     }
     // Compositor check matches the existing plugin's predicate; V2 will

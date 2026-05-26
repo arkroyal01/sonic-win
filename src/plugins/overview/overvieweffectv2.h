@@ -70,12 +70,12 @@ public:
     OverviewEffectV2();
     ~OverviewEffectV2() override;
 
-    /// Plugin gate: this effect only loads when `KWIN_OVERVIEW_V2=1`.
-    /// The existing OverviewEffect mirrors this check so the two never
-    /// run at the same time and don't fight over the same global
-    /// shortcut. Phase 1b wiring; later phases may also require
-    /// `effects->isVulkanCompositing()` once the renderer path is
-    /// committed to Vulkan-only.
+    /// Plugin gate: V2 is now the default; this loads unless the user
+    /// sets `KWIN_OVERVIEW_V2=0` to fall back to the QML OverviewEffect.
+    /// The QML plugin mirrors the same check so the two never run at
+    /// the same time and don't fight over the same global shortcut.
+    /// Later phases may also require `effects->isVulkanCompositing()`
+    /// once the renderer path is committed to Vulkan-only.
     static bool supported();
 
     /// Activate the effect: starts the slide-in animation.
