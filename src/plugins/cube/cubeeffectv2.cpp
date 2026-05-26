@@ -164,10 +164,11 @@ CubeEffectV2::~CubeEffectV2()
         for (const ElectricBorder border : std::as_const(m_borderActivate)) {
             effects->unreserveElectricBorder(border, this);
         }
-        // Touch borders are bound to QActions (registerTouchBorder),
-        // not directly to the Effect. Phase 5 will wire that path so
-        // V1's TouchBorderActivate config carries over; for the
-        // draft only pointer hot-corners and gesture swipes activate.
+        for (const ElectricBorder border : std::as_const(m_touchBorderActivate)) {
+            if (m_toggleAction) {
+                effects->unregisterTouchBorder(border, m_toggleAction);
+            }
+        }
     }
 #if HAVE_VULKAN
     releaseAllResources();
@@ -192,6 +193,14 @@ void CubeEffectV2::loadConfig()
         for (const ElectricBorder border : std::as_const(m_borderActivate)) {
             effects->unreserveElectricBorder(border, this);
         }
+        // Touch borders are bound to a QAction (registerTouchBorder).
+        // We reuse m_toggleAction so a touch swipe in from a configured
+        // edge fires the same Activate/Deactivate as Meta+C.
+        for (const ElectricBorder border : std::as_const(m_touchBorderActivate)) {
+            if (m_toggleAction) {
+                effects->unregisterTouchBorder(border, m_toggleAction);
+            }
+        }
     }
     m_borderActivate.clear();
     m_touchBorderActivate.clear();
@@ -204,12 +213,12 @@ void CubeEffectV2::loadConfig()
             m_borderActivate.append(eb);
             effects->reserveElectricBorder(eb, this);
         }
-        // TouchBorderActivate: deferred to Phase 5 (registerTouchBorder
-        // takes a QAction, not the effect; needs per-border bookkeeping
-        // since each border binding wants its own QAction). Store the
-        // configured list so the eventual wiring path has it ready.
         for (const int border : touchBorders) {
-            m_touchBorderActivate.append(ElectricBorder(border));
+            const ElectricBorder eb = ElectricBorder(border);
+            m_touchBorderActivate.append(eb);
+            if (m_toggleAction) {
+                effects->registerTouchBorder(eb, m_toggleAction);
+            }
         }
     }
 

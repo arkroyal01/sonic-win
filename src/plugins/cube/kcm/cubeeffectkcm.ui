@@ -223,7 +223,25 @@
      </item>
     </layout>
    </item>
-   <item row="5" column="0" colspan="2">
+   <item row="5" column="0">
+    <widget class="QLabel" name="label_MSAA">
+     <property name="text">
+      <string>Anti-aliasing (MSAA):</string>
+     </property>
+     <property name="toolTip">
+      <string>Multi-sample anti-aliasing for the cube faces. Higher values trade VRAM and per-frame GPU cost for smoother silhouettes, especially with few desktops (sharp 90°/120° edges). C++ rewrite only — no effect on the legacy QtQuick3D cube.</string>
+     </property>
+    </widget>
+   </item>
+   <item row="5" column="1">
+    <widget class="QComboBox" name="kcfg_MSAA">
+     <item><property name="text"><string>Off</string></property></item>
+     <item><property name="text"><string>2x</string></property></item>
+     <item><property name="text"><string>4x</string></property></item>
+     <item><property name="text"><string>8x</string></property></item>
+    </widget>
+   </item>
+   <item row="6" column="0" colspan="2">
     <widget class="KShortcutsEditor" name="shortcutsEditor" native="true">
      <property name="sizePolicy">
       <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
