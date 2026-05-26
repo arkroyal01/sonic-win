@@ -203,6 +203,21 @@ void CubeEffectV2::loadConfig()
     const QString bg = group.readEntry(QStringLiteral("Background"), QStringLiteral("Color"));
     m_backgroundMode = (bg == QLatin1String("SkyBox")) ? Background::SkyBox : Background::Color;
     m_backgroundColor = group.readEntry(QStringLiteral("BackgroundColor"), QColor(0x21, 0x24, 0x27));
+
+    // MSAA enum: Off / X2 / X4 / X8 → 1 / 2 / 4 / 8 samples. Default
+    // Off so existing kwinrc files (which don't have this key) get
+    // the same render path as V1 had. Phase 4 wires this into the
+    // render-pass creation and adds the resolve attachment.
+    const QString msaa = group.readEntry(QStringLiteral("MSAA"), QStringLiteral("Off"));
+    if (msaa == QLatin1String("X2")) {
+        m_msaaSamples = 2;
+    } else if (msaa == QLatin1String("X4")) {
+        m_msaaSamples = 4;
+    } else if (msaa == QLatin1String("X8")) {
+        m_msaaSamples = 8;
+    } else {
+        m_msaaSamples = 1;
+    }
 }
 
 bool CubeEffectV2::borderActivated(ElectricBorder border)
