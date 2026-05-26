@@ -1621,23 +1621,72 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
     // The dragged grid tile, drawn last so it floats above every
     // other grid tile, the desktop bar, and the search bar — the user
     // always sees what they're holding, even when the cursor crosses
-    // into the bar zone to drop on a different desktop's tile.
+    // into the bar zone to drop on a different desktop's tile. Shrinks
+    // toward the bar as the cursor approaches it so drop-target wash
+    // on bar tiles stays visible — matches V1's targetScale (the QML
+    // overview's main.qml:662-675).
     if (m_dragActive) {
+        // Shrink is the ratio of the cursor's remaining distance to
+        // the bar over the original press distance. At press position
+        // scale = 1; at the bar bottom scale clamps to 0.1 so the
+        // tile stays visible. The press point on the tile follows the
+        // cursor so what the user grabbed stays under their finger.
+        const QRect screen = effects ? effects->virtualScreenGeometry() : QRect();
+        float dragScale = 1.0f;
+        float cursorNdcX = 0.0f;
+        float cursorNdcY = 0.0f;
+        float pressXNdc = 0.0f;
+        float pressYNdc = 0.0f;
+        if (screen.height() > 0 && screen.width() > 0) {
+            const float barBottomPx = float(screen.y()) + 0.10f * float(screen.height());
+            const float localPress = std::max(1.0f, float(m_dragPressGlobal.y()) - barBottomPx);
+            const float localPos = float(m_dragCurrentGlobal.y()) - barBottomPx;
+            dragScale = std::clamp(localPos / localPress, 0.1f, 1.0f);
+            cursorNdcX = -1.0f + 2.0f * float(m_dragCurrentGlobal.x() - screen.x()) / screenW;
+            cursorNdcY = -1.0f + 2.0f * float(m_dragCurrentGlobal.y() - screen.y()) / screenH;
+            pressXNdc = -1.0f + 2.0f * float(m_dragPressGlobal.x() - screen.x()) / screenW;
+            pressYNdc = -1.0f + 2.0f * float(m_dragPressGlobal.y() - screen.y()) / screenH;
+        }
         for (const TileLayout &t : m_tileLayout) {
             if (t.handle != m_dragCandidate) {
                 continue;
             }
+            const float naturalX = t.realNdcX + (t.gridNdcX - t.realNdcX) * factor;
+            const float naturalY = t.realNdcY + (t.gridNdcY - t.realNdcY) * factor;
+            const float naturalW = t.realNdcW + (t.gridNdcW - t.realNdcW) * factor;
+            const float naturalH = t.realNdcH + (t.gridNdcH - t.realNdcH) * factor;
+            const float pressOnTileX = pressXNdc - naturalX;
+            const float pressOnTileY = pressYNdc - naturalY;
+            const float w = naturalW * dragScale;
+            const float h = naturalH * dragScale;
+            const float x = cursorNdcX - pressOnTileX * dragScale;
+            const float y = cursorNdcY - pressOnTileY * dragScale;
+            float uvX = 0.0f, uvY = 0.0f, uvW = 1.0f, uvH = 1.0f;
             if (t.slot.isFallback) {
                 pushView(t.slot.srgbView);
-                pushAndDraw(t, 0.0f, 0.0f, 1.0f, 1.0f);
             } else if (atlasSrgbView != VK_NULL_HANDLE) {
                 pushView(atlasSrgbView);
-                pushAndDraw(t,
-                            float(t.slot.rect.x()) / atlasSize,
-                            float(t.slot.rect.y()) / atlasSize,
-                            float(t.slot.rect.width()) / atlasSize,
-                            float(t.slot.rect.height()) / atlasSize);
+                uvX = float(t.slot.rect.x()) / atlasSize;
+                uvY = float(t.slot.rect.y()) / atlasSize;
+                uvW = float(t.slot.rect.width()) / atlasSize;
+                uvH = float(t.slot.rect.height()) / atlasSize;
+            } else {
+                break;
             }
+            OverviewQuadPushConstants pc{};
+            pc.quadRectNdc[0] = x;
+            pc.quadRectNdc[1] = y;
+            pc.quadRectNdc[2] = w;
+            pc.quadRectNdc[3] = h;
+            pc.atlasSlotUv[0] = uvX;
+            pc.atlasSlotUv[1] = uvY;
+            pc.atlasSlotUv[2] = uvW;
+            pc.atlasSlotUv[3] = uvH;
+            pc.opacity = factor;
+            vkCmdPushConstants(cmd, m_vkPipelineLayout,
+                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                               0, sizeof(pc), &pc);
+            vkCmdDraw(cmd, 4, 1, 0, 0);
             break;
         }
     }
