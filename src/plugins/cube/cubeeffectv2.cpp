@@ -528,12 +528,27 @@ void CubeEffectV2::paintScreen(const RenderTarget &renderTarget,
                                const RenderViewport &viewport, int mask,
                                const QRegion &region, Output *screen)
 {
-    // Phase 1: no rendering yet. The wrapped chain still paints the
-    // windows behind us; we'll draw the cube on top once the Vulkan
-    // pipeline lands in Phase 3. Until then, an active CubeEffectV2
-    // is visually a no-op — but mouse/keyboard grab, gestures, and
-    // animation lifecycle still work end-to-end. Phase 1 acceptance
-    // = activate, drag, release, deactivate cycle without crashes.
+    // Scene cull (V1 parity). V1's QuickSceneEffect::paintScreen
+    // never chains to effects->paintScreen, so the windows on the
+    // current desktop are never composited while the cube is up —
+    // the post-pass + skybox/color background cover the whole
+    // screen. We do the same once the cube is fully visible AND
+    // the background is opaque (no see-through to the scene).
+    //
+    // During the slide-in / slide-out animation the user wants to
+    // see windows fading behind the cube, so we chain through for
+    // any activation factor below the cull threshold. 0.95 chosen
+    // to match the input-grab settle threshold elsewhere in this
+    // file — once tiles snap, the scene is no longer needed.
+    constexpr qreal kSceneCullFactor = 0.95;
+    const bool cullScene = m_visible
+        && m_activationFactor >= kSceneCullFactor
+        && (m_backgroundMode == Background::Color
+            || (m_backgroundMode == Background::SkyBox
+                && m_skyboxTexture && m_skyboxTexture->isValid()));
+    if (cullScene) {
+        return;
+    }
     effects->paintScreen(renderTarget, viewport, mask, region, screen);
 }
 
