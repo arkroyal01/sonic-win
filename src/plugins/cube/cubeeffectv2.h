@@ -323,12 +323,25 @@ private:
     QUrl m_skyboxPath;
 
     /// V2-only knob: MSAA sample count for the cube post-FX pass.
-    /// Off (1) means no MSAA. V1 has no equivalent setting; the
-    /// scripted cube renders through QtQuick3D and inherits whatever
-    /// the SceneGraph default is. Stored as VkSampleCountFlagBits-
-    /// compatible int (1, 2, 4, or 8) so Phase 4's renderpass code
-    /// can feed it straight to vkCreateRenderPass without remapping.
+    /// Off (1) means no MSAA — the cube is drawn straight into the
+    /// renderer's single-sample swapchain post-FX pass. 2/4/8 enable
+    /// the offscreen AA path: render into an N-sample VkImage, resolve
+    /// to single-sample, composite onto the swapchain.
     int m_msaaSamples = 1;
+
+    /// AA dispatch enum. Off is the direct render path; the rest go
+    /// through the offscreen AA helpers (m_offscreenAa). MSAA is the
+    /// first mode implemented; FXAA / TAA / SSAA slot into the same
+    /// offscreen path with different composite shaders or jitter
+    /// patterns. Enum kept distinct from m_msaaSamples so a future
+    /// "FXAA on top of MSAA 4x" is a one-line extension.
+    enum class AaMode {
+        Off,
+        MSAA2x,
+        MSAA4x,
+        MSAA8x,
+    };
+    AaMode m_aaMode = AaMode::Off;
 
     static constexpr qreal kMaxPitchDeg = 30.0;
     static constexpr qreal kMinPitchDeg = -30.0;
@@ -469,6 +482,82 @@ private:
     /// Lazy load m_skyboxPath into m_skyboxTexture. Returns true if
     /// the texture is valid and ready to bind.
     bool ensureSkyboxTexture();
+
+    /// Offscreen anti-aliasing resources. Built when m_aaMode != Off
+    /// and torn down on deactivate. Generalises beyond MSAA: the
+    /// resolveColor image is the universal "what we composite onto
+    /// the swapchain" target, so future AA modes (FXAA in the
+    /// composite shader, TAA with a history buffer, SSAA via larger
+    /// fbSize) plug into the same scaffold.
+    ///
+    /// Render flow when active:
+    ///   1. recordOffscreenAaPass(cmd) — render skybox + cube faces
+    ///      into msaaColor (multisample) via msaaRenderPass.
+    ///   2. vkCmdResolveImage from msaaColor to resolveColor (skipped
+    ///      when samples == 1; SSAA path uses a blit + downscale here).
+    ///   3. Transition resolveColor → SHADER_READ_ONLY_OPTIMAL.
+    ///   4. composeOffscreenAaToSwapchain(cmd, …) inside the renderer
+    ///      post-FX pass samples resolveColor as a fullscreen quad
+    ///      via the existing cube-face pipeline (identity-ish MVP +
+    ///      full UV) — this is where a future FXAA shader would
+    ///      replace the pipeline.
+    struct OffscreenAa
+    {
+        VkImage msaaColorImage = VK_NULL_HANDLE;
+        // Hand-rolled VkDeviceMemory for the multisample image —
+        // VulkanTexture's VMA path doesn't expose sample count, and
+        // a one-off allocation per activation is cheap enough that
+        // we don't need pool sharing. Direct vkAllocateMemory keeps
+        // the VMA include out of the plugin.
+        VkDeviceMemory msaaColorMemory = VK_NULL_HANDLE;
+        VkImageView msaaColorView = VK_NULL_HANDLE;
+        VkImageLayout msaaColorLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+        // Single-sample resolved target, sampled by the composite
+        // pass. Wraps a VulkanTexture so VRAM lifetime cleanly
+        // follows the same hand-back-on-deactivate rule as the
+        // atlas singleton.
+        std::unique_ptr<VulkanTexture> resolveColor;
+
+        std::unique_ptr<VulkanRenderPass> renderPass;
+        std::unique_ptr<VulkanFramebuffer> framebuffer;
+
+        VkPipeline facePipeline = VK_NULL_HANDLE;
+        VkPipeline skyboxPipeline = VK_NULL_HANDLE;
+
+        QSize size;
+        VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
+        VkFormat colorFormat = VK_FORMAT_UNDEFINED;
+    };
+    OffscreenAa m_offscreenAa;
+
+    /// Map m_msaaSamples → AaMode. Single source of truth for the
+    /// "what mode are we in" decision; loadConfig calls it after
+    /// reading the kwinrc value.
+    static AaMode aaModeForSamples(int samples);
+
+    /// Build everything in m_offscreenAa for the requested mode. No-op
+    /// when m_aaMode == Off. Idempotent — safe to call from activate
+    /// multiple times; tears down + rebuilds on format/size change.
+    bool ensureOffscreenAa(VulkanContext *ctx, VkFormat colorFormat, const QSize &fbSize);
+    void destroyOffscreenAa();
+
+    /// Record the skybox + face draws into m_offscreenAa.framebuffer.
+    /// Called once per frame from the preFrameRender callback after
+    /// renderDesktopsToAtlas. After the pass ends, explicit barrier +
+    /// vkCmdResolveImage hand the result over to resolveColor in
+    /// SHADER_READ_ONLY_OPTIMAL layout for the composite below.
+    void recordOffscreenAaPass(VkCommandBuffer cmd);
+
+    /// Composite m_offscreenAa.resolveColor onto the swapchain target.
+    /// Runs inside the renderer's post-FX pass via onPostPass when
+    /// m_aaMode != Off; replaces the direct face draws. Reuses the
+    /// single-sample cube-face pipeline (set to draw a screen-filling
+    /// quad with identity MVP + UV(0,0,1,1)) so we don't need a
+    /// dedicated blit pipeline yet — slot in an FXAA shader by
+    /// branching here when that mode lands.
+    void composeOffscreenAaToSwapchain(VkCommandBuffer cmd,
+                                       const QSize &fbSize);
 
     /// Drop every per-activation GPU resource: atlas slots,
     /// visibility refs, skybox texture, atlas singleton. Pipelines

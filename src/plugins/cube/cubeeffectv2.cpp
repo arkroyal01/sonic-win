@@ -231,17 +231,9 @@ void CubeEffectV2::loadConfig()
     m_backgroundMode = (bg == QLatin1String("SkyBox")) ? Background::SkyBox : Background::Color;
     m_backgroundColor = group.readEntry(QStringLiteral("BackgroundColor"), QColor(0x21, 0x24, 0x27));
 
-    // MSAA enum: Off / X2 / X4 / X8 → 1 / 2 / 4 / 8 samples. Default
-    // Off so existing kwinrc files (which don't have this key) get
-    // the same render path as V1 had.
-    //
-    // Implementation status: the cube post-pass currently piggybacks
-    // on the renderer's swapchain post-FX render pass, which is fixed
-    // at 1 sample. Honest MSAA requires an offscreen MSAA color
-    // attachment + a resolve attachment, drawn before the renderer's
-    // main pass and composited back. Until that path lands we accept
-    // the config value but log when the user picked > 1x so they
-    // know the request was seen.
+    // MSAA enum: Off / X2 / X4 / X8 → 1 / 2 / 4 / 8 samples.
+    // Default Off keeps the direct render path active. > 1 routes
+    // through the offscreen AA pass (m_offscreenAa).
     const QString msaa = group.readEntry(QStringLiteral("MSAA"), QStringLiteral("Off"));
     if (msaa == QLatin1String("X2")) {
         m_msaaSamples = 2;
@@ -252,11 +244,20 @@ void CubeEffectV2::loadConfig()
     } else {
         m_msaaSamples = 1;
     }
-    if (m_msaaSamples > 1) {
-        qCWarning(KWIN_CUBE_V2_LOG)
-            << "CubeEffectV2: MSAA=" << m_msaaSamples
-            << "configured, but the offscreen MSAA render path is "
-               "not yet implemented; rendering at 1x for now.";
+    m_aaMode = aaModeForSamples(m_msaaSamples);
+}
+
+CubeEffectV2::AaMode CubeEffectV2::aaModeForSamples(int samples)
+{
+    switch (samples) {
+    case 2:
+        return AaMode::MSAA2x;
+    case 4:
+        return AaMode::MSAA4x;
+    case 8:
+        return AaMode::MSAA8x;
+    default:
+        return AaMode::Off;
     }
 }
 
@@ -1206,6 +1207,598 @@ void CubeEffectV2::destroySkyboxPipeline()
     }
 }
 
+namespace
+{
+uint32_t findMemoryType(VkPhysicalDevice phys, uint32_t typeBits, VkMemoryPropertyFlags wanted)
+{
+    VkPhysicalDeviceMemoryProperties props{};
+    vkGetPhysicalDeviceMemoryProperties(phys, &props);
+    for (uint32_t i = 0; i < props.memoryTypeCount; ++i) {
+        if ((typeBits & (1u << i))
+            && (props.memoryTypes[i].propertyFlags & wanted) == wanted) {
+            return i;
+        }
+    }
+    return UINT32_MAX;
+}
+} // namespace
+
+bool CubeEffectV2::ensureOffscreenAa(VulkanContext *ctx, VkFormat colorFormat, const QSize &fbSize)
+{
+    if (m_aaMode == AaMode::Off || !ctx || fbSize.isEmpty()) {
+        return false;
+    }
+    const VkSampleCountFlagBits samples = [&]() {
+        switch (m_aaMode) {
+        case AaMode::MSAA2x:
+            return VK_SAMPLE_COUNT_2_BIT;
+        case AaMode::MSAA4x:
+            return VK_SAMPLE_COUNT_4_BIT;
+        case AaMode::MSAA8x:
+            return VK_SAMPLE_COUNT_8_BIT;
+        default:
+            return VK_SAMPLE_COUNT_1_BIT;
+        }
+    }();
+
+    // Rebuild from scratch if any axis changed (format, size, samples).
+    // Per-activation cost is fine — these allocations are dropped on
+    // deactivate per the V2 active-memory rule.
+    if (m_offscreenAa.msaaColorImage != VK_NULL_HANDLE
+        && (m_offscreenAa.colorFormat != colorFormat
+            || m_offscreenAa.size != fbSize
+            || m_offscreenAa.samples != samples)) {
+        destroyOffscreenAa();
+    }
+    if (m_offscreenAa.msaaColorImage != VK_NULL_HANDLE) {
+        return true; // already built for these params
+    }
+
+    VkDevice device = ctx->backend()->device();
+    VkPhysicalDevice phys = ctx->backend()->physicalDevice();
+
+    // Validate that the hardware supports this sample count for our
+    // attachment format. Vulkan guarantees 1 sample everywhere; 4 is
+    // very common; 2/8 can be missing on some HW. Fall back to a
+    // lower-but-supported count rather than failing outright so the
+    // user gets *some* anti-aliasing.
+    VkPhysicalDeviceProperties devProps{};
+    vkGetPhysicalDeviceProperties(phys, &devProps);
+    const VkSampleCountFlags supported = devProps.limits.framebufferColorSampleCounts;
+    VkSampleCountFlagBits chosen = samples;
+    if ((supported & chosen) == 0) {
+        for (VkSampleCountFlagBits candidate : {VK_SAMPLE_COUNT_8_BIT,
+                                                VK_SAMPLE_COUNT_4_BIT,
+                                                VK_SAMPLE_COUNT_2_BIT,
+                                                VK_SAMPLE_COUNT_1_BIT}) {
+            if (candidate <= samples && (supported & candidate)) {
+                chosen = candidate;
+                break;
+            }
+        }
+        if (chosen != samples) {
+            qCWarning(KWIN_CUBE_V2_LOG) << "CubeEffectV2: requested MSAA"
+                                        << samples << "unsupported; using" << chosen;
+        }
+    }
+
+    // Multisample colour attachment. usage = COLOR_ATTACHMENT (target
+    // of the offscreen pass) + TRANSFER_SRC (source of the explicit
+    // vkCmdResolveImage). No SAMPLED — multisample textures can't be
+    // sampled in shaders this way (and we don't need to; the resolve
+    // image is what the composite shader reads).
+    VkImageCreateInfo imgInfo{};
+    imgInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imgInfo.imageType = VK_IMAGE_TYPE_2D;
+    imgInfo.extent.width = uint32_t(fbSize.width());
+    imgInfo.extent.height = uint32_t(fbSize.height());
+    imgInfo.extent.depth = 1;
+    imgInfo.mipLevels = 1;
+    imgInfo.arrayLayers = 1;
+    imgInfo.format = colorFormat;
+    imgInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imgInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    imgInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    imgInfo.samples = chosen;
+    imgInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateImage(device, &imgInfo, nullptr, &m_offscreenAa.msaaColorImage) != VK_SUCCESS) {
+        qCWarning(KWIN_CUBE_V2_LOG) << "CubeEffectV2: vkCreateImage (msaa) failed";
+        destroyOffscreenAa();
+        return false;
+    }
+    VkMemoryRequirements memReqs{};
+    vkGetImageMemoryRequirements(device, m_offscreenAa.msaaColorImage, &memReqs);
+    const uint32_t memTypeIdx = findMemoryType(phys, memReqs.memoryTypeBits,
+                                               VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (memTypeIdx == UINT32_MAX) {
+        qCWarning(KWIN_CUBE_V2_LOG) << "CubeEffectV2: no DEVICE_LOCAL memory for MSAA image";
+        destroyOffscreenAa();
+        return false;
+    }
+    VkMemoryAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocInfo.allocationSize = memReqs.size;
+    allocInfo.memoryTypeIndex = memTypeIdx;
+    if (vkAllocateMemory(device, &allocInfo, nullptr, &m_offscreenAa.msaaColorMemory) != VK_SUCCESS) {
+        qCWarning(KWIN_CUBE_V2_LOG) << "CubeEffectV2: vkAllocateMemory (msaa) failed";
+        destroyOffscreenAa();
+        return false;
+    }
+    if (vkBindImageMemory(device, m_offscreenAa.msaaColorImage,
+                          m_offscreenAa.msaaColorMemory, 0)
+        != VK_SUCCESS) {
+        qCWarning(KWIN_CUBE_V2_LOG) << "CubeEffectV2: vkBindImageMemory (msaa) failed";
+        destroyOffscreenAa();
+        return false;
+    }
+
+    VkImageViewCreateInfo viewInfo{};
+    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    viewInfo.image = m_offscreenAa.msaaColorImage;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = colorFormat;
+    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewInfo.subresourceRange.levelCount = 1;
+    viewInfo.subresourceRange.layerCount = 1;
+    if (vkCreateImageView(device, &viewInfo, nullptr, &m_offscreenAa.msaaColorView) != VK_SUCCESS) {
+        qCWarning(KWIN_CUBE_V2_LOG) << "CubeEffectV2: vkCreateImageView (msaa) failed";
+        destroyOffscreenAa();
+        return false;
+    }
+
+    // Single-sample resolve target. VulkanTexture::createRenderTarget
+    // gives COLOR_ATTACHMENT | SAMPLED | TRANSFER_SRC | TRANSFER_DST —
+    // we use TRANSFER_DST for vkCmdResolveImage and SAMPLED for the
+    // composite pass. The dedicated-memory + suspend-hook work covers
+    // VRAM return on deactivate automatically.
+    m_offscreenAa.resolveColor = VulkanTexture::createRenderTarget(ctx, fbSize, colorFormat);
+    if (!m_offscreenAa.resolveColor) {
+        qCWarning(KWIN_CUBE_V2_LOG) << "CubeEffectV2: resolve target alloc failed";
+        destroyOffscreenAa();
+        return false;
+    }
+
+    // Offscreen render pass: N-sample colour attachment. loadOp=CLEAR
+    // because we paint the entire screen every frame (background +
+    // cube faces); finalLayout=TRANSFER_SRC so the vkCmdResolveImage
+    // can read straight from it without an extra barrier.
+    VulkanRenderPass::Config cfg{};
+    cfg.colorFormat = colorFormat;
+    cfg.samples = chosen;
+    cfg.colorLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    cfg.colorStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
+    cfg.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    cfg.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    m_offscreenAa.renderPass = VulkanRenderPass::create(ctx, cfg);
+    if (!m_offscreenAa.renderPass) {
+        qCWarning(KWIN_CUBE_V2_LOG) << "CubeEffectV2: offscreen render pass build failed";
+        destroyOffscreenAa();
+        return false;
+    }
+
+    m_offscreenAa.framebuffer = VulkanFramebuffer::create(ctx, m_offscreenAa.renderPass.get(),
+                                                          m_offscreenAa.msaaColorView, fbSize);
+    if (!m_offscreenAa.framebuffer) {
+        qCWarning(KWIN_CUBE_V2_LOG) << "CubeEffectV2: offscreen framebuffer build failed";
+        destroyOffscreenAa();
+        return false;
+    }
+
+    // Pipeline rebuild — same setup as the off-path face/skybox
+    // pipelines except rasterizationSamples = chosen and the renderpass
+    // points at our offscreen pass. Sharing m_vkDescriptorSetLayout +
+    // m_vkPipelineLayout (built by ensureVulkanPipeline) means the
+    // composite shader-side push constants stay identical.
+    if (m_vkDescriptorSetLayout == VK_NULL_HANDLE || m_vkPipelineLayout == VK_NULL_HANDLE
+        || m_skyboxPipelineLayout == VK_NULL_HANDLE) {
+        qCWarning(KWIN_CUBE_V2_LOG) << "CubeEffectV2: off-path pipeline layouts not built yet";
+        destroyOffscreenAa();
+        return false;
+    }
+
+    auto buildAaPipeline = [&](const uint32_t *vertSpv, size_t vertSize,
+                               const uint32_t *fragSpv, size_t fragSize,
+                               VkPipelineLayout layout,
+                               VkPrimitiveTopology topology) -> VkPipeline {
+        VkShaderModule vertMod = VK_NULL_HANDLE;
+        VkShaderModule fragMod = VK_NULL_HANDLE;
+        auto make = [&](const uint32_t *code, size_t bytes, VkShaderModule *out) {
+            VkShaderModuleCreateInfo i{};
+            i.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+            i.codeSize = bytes;
+            i.pCode = code;
+            return vkCreateShaderModule(device, &i, nullptr, out) == VK_SUCCESS;
+        };
+        if (!make(vertSpv, vertSize, &vertMod) || !make(fragSpv, fragSize, &fragMod)) {
+            if (vertMod) {
+                vkDestroyShaderModule(device, vertMod, nullptr);
+            }
+            if (fragMod) {
+                vkDestroyShaderModule(device, fragMod, nullptr);
+            }
+            return VK_NULL_HANDLE;
+        }
+        VkPipelineShaderStageCreateInfo stages[2]{};
+        stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+        stages[0].module = vertMod;
+        stages[0].pName = "main";
+        stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        stages[1].module = fragMod;
+        stages[1].pName = "main";
+
+        VkPipelineVertexInputStateCreateInfo vi{};
+        vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+        VkPipelineInputAssemblyStateCreateInfo ia{};
+        ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+        ia.topology = topology;
+        VkPipelineViewportStateCreateInfo vpState{};
+        vpState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+        vpState.viewportCount = 1;
+        vpState.scissorCount = 1;
+        VkPipelineRasterizationStateCreateInfo rs{};
+        rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        rs.polygonMode = VK_POLYGON_MODE_FILL;
+        rs.cullMode = VK_CULL_MODE_NONE;
+        rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        rs.lineWidth = 1.0f;
+        VkPipelineMultisampleStateCreateInfo ms{};
+        ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+        ms.rasterizationSamples = chosen;
+        VkPipelineColorBlendAttachmentState cba{};
+        cba.blendEnable = VK_TRUE;
+        cba.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+        cba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        cba.colorBlendOp = VK_BLEND_OP_ADD;
+        cba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        cba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        cba.alphaBlendOp = VK_BLEND_OP_ADD;
+        cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+            | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        VkPipelineColorBlendStateCreateInfo cb{};
+        cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+        cb.attachmentCount = 1;
+        cb.pAttachments = &cba;
+        const VkDynamicState dynStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+        VkPipelineDynamicStateCreateInfo dyn{};
+        dyn.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+        dyn.dynamicStateCount = 2;
+        dyn.pDynamicStates = dynStates;
+        VkGraphicsPipelineCreateInfo gp{};
+        gp.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        gp.stageCount = 2;
+        gp.pStages = stages;
+        gp.pVertexInputState = &vi;
+        gp.pInputAssemblyState = &ia;
+        gp.pViewportState = &vpState;
+        gp.pRasterizationState = &rs;
+        gp.pMultisampleState = &ms;
+        gp.pColorBlendState = &cb;
+        gp.pDynamicState = &dyn;
+        gp.layout = layout;
+        gp.renderPass = m_offscreenAa.renderPass->renderPass();
+        gp.subpass = 0;
+        VkPipeline pipe = VK_NULL_HANDLE;
+        const VkResult r = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &gp, nullptr, &pipe);
+        vkDestroyShaderModule(device, vertMod, nullptr);
+        vkDestroyShaderModule(device, fragMod, nullptr);
+        return (r == VK_SUCCESS) ? pipe : VK_NULL_HANDLE;
+    };
+
+    m_offscreenAa.facePipeline = buildAaPipeline(kVertSpv, sizeof(kVertSpv),
+                                                 kFragSpv, sizeof(kFragSpv),
+                                                 m_vkPipelineLayout,
+                                                 VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP);
+    if (m_offscreenAa.facePipeline == VK_NULL_HANDLE) {
+        qCWarning(KWIN_CUBE_V2_LOG) << "CubeEffectV2: MSAA face pipeline build failed";
+        destroyOffscreenAa();
+        return false;
+    }
+    m_offscreenAa.skyboxPipeline = buildAaPipeline(kSkyboxVertSpv, sizeof(kSkyboxVertSpv),
+                                                   kSkyboxFragSpv, sizeof(kSkyboxFragSpv),
+                                                   m_skyboxPipelineLayout,
+                                                   VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+    // Skybox pipeline failure is non-fatal — Color mode still works.
+
+    m_offscreenAa.size = fbSize;
+    m_offscreenAa.samples = chosen;
+    m_offscreenAa.colorFormat = colorFormat;
+    m_offscreenAa.msaaColorLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    return true;
+}
+
+void CubeEffectV2::destroyOffscreenAa()
+{
+    if (!m_vulkanCtx) {
+        // Nothing was created without a context — but reset state.
+        m_offscreenAa = OffscreenAa{};
+        return;
+    }
+    VkDevice device = m_vulkanCtx->backend()->device();
+    if (m_offscreenAa.facePipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device, m_offscreenAa.facePipeline, nullptr);
+    }
+    if (m_offscreenAa.skyboxPipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device, m_offscreenAa.skyboxPipeline, nullptr);
+    }
+    m_offscreenAa.framebuffer.reset();
+    m_offscreenAa.renderPass.reset();
+    m_offscreenAa.resolveColor.reset();
+    if (m_offscreenAa.msaaColorView != VK_NULL_HANDLE) {
+        vkDestroyImageView(device, m_offscreenAa.msaaColorView, nullptr);
+    }
+    if (m_offscreenAa.msaaColorImage != VK_NULL_HANDLE) {
+        vkDestroyImage(device, m_offscreenAa.msaaColorImage, nullptr);
+    }
+    if (m_offscreenAa.msaaColorMemory != VK_NULL_HANDLE) {
+        vkFreeMemory(device, m_offscreenAa.msaaColorMemory, nullptr);
+    }
+    m_offscreenAa = OffscreenAa{};
+}
+
+void CubeEffectV2::recordOffscreenAaPass(VkCommandBuffer cmd)
+{
+    if (m_aaMode == AaMode::Off || !m_offscreenAa.renderPass || !m_offscreenAa.framebuffer) {
+        return;
+    }
+    if (!effects || m_desktopSlots.empty()) {
+        return;
+    }
+    const QSize fbSize = m_offscreenAa.size;
+    if (fbSize.isEmpty()) {
+        return;
+    }
+    updateViewProjection(fbSize);
+
+    const float factor = float(m_activationFactor);
+    VkClearValue clearVal{};
+    clearVal.color.float32[0] = float(m_backgroundColor.redF()) * factor;
+    clearVal.color.float32[1] = float(m_backgroundColor.greenF()) * factor;
+    clearVal.color.float32[2] = float(m_backgroundColor.blueF()) * factor;
+    clearVal.color.float32[3] = factor;
+    const VkRect2D area{{0, 0}, {uint32_t(fbSize.width()), uint32_t(fbSize.height())}};
+    m_offscreenAa.renderPass->begin(cmd, m_offscreenAa.framebuffer->framebuffer(), area, &clearVal, 1);
+
+    VkViewport vp{0.0f, float(fbSize.height()),
+                  float(fbSize.width()), -float(fbSize.height()),
+                  0.0f, 1.0f};
+    vkCmdSetViewport(cmd, 0, 1, &vp);
+    VkRect2D scissor{{0, 0}, {uint32_t(fbSize.width()), uint32_t(fbSize.height())}};
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+    auto *backend = m_vulkanCtx->backend();
+    auto pushDescriptor = backend ? backend->cmdPushDescriptorSetKHR() : nullptr;
+    if (!pushDescriptor) {
+        m_offscreenAa.renderPass->end(cmd);
+        return;
+    }
+
+    // Skybox pass (mode == SkyBox + pipeline + texture all valid).
+    if (m_backgroundMode == Background::SkyBox
+        && m_offscreenAa.skyboxPipeline != VK_NULL_HANDLE
+        && ensureSkyboxTexture()
+        && m_skyboxTexture && m_skyboxTexture->isValid() && m_atlas) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_offscreenAa.skyboxPipeline);
+        VkDescriptorImageInfo imgInfo{};
+        imgInfo.sampler = m_atlas->sampler();
+        imgInfo.imageView = m_skyboxTexture->imageView();
+        imgInfo.imageLayout = m_skyboxTexture->currentLayout();
+        VkWriteDescriptorSet write{};
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstBinding = 0;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        write.pImageInfo = &imgInfo;
+        pushDescriptor(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_skyboxPipelineLayout, 0, 1, &write);
+
+        CubeSkyboxPushConstants spc{};
+        const QMatrix4x4 invVp = (m_viewProj.projection * m_viewProj.view).inverted();
+        const float *invData = invVp.constData();
+        for (int k = 0; k < 16; ++k) {
+            spc.invViewProj[k] = invData[k];
+        }
+        const qreal theta = qDegreesToRadians(m_cameraCurrent.pitchDeg + 90.0);
+        const qreal phi = qDegreesToRadians(m_cameraCurrent.yawDeg);
+        const qreal r = m_cameraCurrent.radius;
+        spc.cameraPosW[0] = float(r * std::sin(phi) * std::sin(theta));
+        spc.cameraPosW[1] = float(r * std::cos(theta));
+        spc.cameraPosW[2] = float(r * std::cos(phi) * std::sin(theta));
+        spc.cameraPosW[3] = 0.0f;
+        spc.opacity = factor;
+        vkCmdPushConstants(cmd, m_skyboxPipelineLayout,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                           0, sizeof(spc), &spc);
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+    }
+
+    // Face pass — same painter sort, push constants identical to the
+    // off-path. Only difference is the bound pipeline (multisampled).
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_offscreenAa.facePipeline);
+    const auto desktops = effects->desktops();
+    const int n = int(desktops.size());
+    const qreal atlasSize = qreal(VulkanThumbnailAtlas::kAtlasSize);
+    const QMatrix4x4 viewProj = m_viewProj.projection * m_viewProj.view;
+    struct FaceDraw
+    {
+        VirtualDesktop *desktop;
+        float cameraZ;
+        QMatrix4x4 mvp;
+    };
+    std::vector<FaceDraw> draws;
+    draws.reserve(n);
+    for (int i = 0; i < n; ++i) {
+        VirtualDesktop *vd = desktops[i];
+        auto it = m_desktopSlots.find(vd);
+        if (it == m_desktopSlots.end() || !it->second.hasContent) {
+            continue;
+        }
+        const QMatrix4x4 model = faceModelMatrix(i, n);
+        const QVector4D cam = m_viewProj.view * (model * QVector4D(0, 0, 0, 1));
+        draws.push_back({vd, cam.z(), viewProj * model});
+    }
+    std::sort(draws.begin(), draws.end(), [](const FaceDraw &a, const FaceDraw &b) {
+        return a.cameraZ < b.cameraZ;
+    });
+    for (const FaceDraw &fd : draws) {
+        const auto &ds = m_desktopSlots[fd.desktop];
+        if (ds.slot.srgbView == VK_NULL_HANDLE) {
+            continue;
+        }
+        VkDescriptorImageInfo imgInfo{};
+        imgInfo.sampler = m_atlas->sampler();
+        imgInfo.imageView = ds.slot.srgbView;
+        imgInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkWriteDescriptorSet write{};
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstBinding = 0;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        write.pImageInfo = &imgInfo;
+        pushDescriptor(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_vkPipelineLayout, 0, 1, &write);
+
+        CubePushConstants pc{};
+        const float *mvpData = fd.mvp.constData();
+        for (int k = 0; k < 16; ++k) {
+            pc.mvp[k] = mvpData[k];
+        }
+        if (ds.slot.isFallback) {
+            pc.atlasSlotUv[0] = 0.0f;
+            pc.atlasSlotUv[1] = 0.0f;
+            pc.atlasSlotUv[2] = 1.0f;
+            pc.atlasSlotUv[3] = 1.0f;
+        } else {
+            pc.atlasSlotUv[0] = float(ds.slot.rect.x()) / float(atlasSize);
+            pc.atlasSlotUv[1] = float(ds.slot.rect.y()) / float(atlasSize);
+            pc.atlasSlotUv[2] = float(ds.slot.rect.width()) / float(atlasSize);
+            pc.atlasSlotUv[3] = float(ds.slot.rect.height()) / float(atlasSize);
+        }
+        pc.opacity = factor;
+        vkCmdPushConstants(cmd, m_vkPipelineLayout,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                           0, sizeof(pc), &pc);
+        vkCmdDraw(cmd, 4, 1, 0, 0);
+    }
+
+    m_offscreenAa.renderPass->end(cmd);
+    // The renderpass finalLayout transitioned msaaColor to TRANSFER_SRC.
+
+    // Resolve to the single-sample image. Layout transitions:
+    //  - resolve target: UNDEFINED → TRANSFER_DST_OPTIMAL (one-time)
+    //  - source: already in TRANSFER_SRC_OPTIMAL via the renderpass.
+    VkImage resolveImg = m_offscreenAa.resolveColor->image();
+    {
+        VkImageMemoryBarrier barr{};
+        barr.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barr.oldLayout = m_offscreenAa.resolveColor->currentLayout();
+        barr.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barr.image = resolveImg;
+        barr.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barr.subresourceRange.levelCount = 1;
+        barr.subresourceRange.layerCount = 1;
+        barr.srcAccessMask = 0;
+        barr.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd,
+                             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &barr);
+        m_offscreenAa.resolveColor->setCurrentLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    }
+    VkImageResolve region{};
+    region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.srcSubresource.layerCount = 1;
+    region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.dstSubresource.layerCount = 1;
+    region.extent.width = uint32_t(fbSize.width());
+    region.extent.height = uint32_t(fbSize.height());
+    region.extent.depth = 1;
+    vkCmdResolveImage(cmd, m_offscreenAa.msaaColorImage,
+                      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                      resolveImg,
+                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                      1, &region);
+    {
+        VkImageMemoryBarrier barr{};
+        barr.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barr.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barr.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        barr.image = resolveImg;
+        barr.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barr.subresourceRange.levelCount = 1;
+        barr.subresourceRange.layerCount = 1;
+        barr.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barr.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &barr);
+        m_offscreenAa.resolveColor->setCurrentLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+    m_offscreenAa.msaaColorLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+}
+
+void CubeEffectV2::composeOffscreenAaToSwapchain(VkCommandBuffer cmd, const QSize &fbSize)
+{
+    if (!m_offscreenAa.resolveColor || !m_offscreenAa.resolveColor->isValid()) {
+        return;
+    }
+    if (!m_vulkanCtx || m_vkPipeline == VK_NULL_HANDLE || m_vkPipelineLayout == VK_NULL_HANDLE) {
+        return;
+    }
+    auto *backend = m_vulkanCtx->backend();
+    auto pushDescriptor = backend ? backend->cmdPushDescriptorSetKHR() : nullptr;
+    if (!pushDescriptor) {
+        return;
+    }
+    // Composite: reuse the single-sample face pipeline. Bind the
+    // resolved image as the sampler, push an MVP that maps the unit
+    // model quad (-0.5..0.5)^2 to NDC (-1..1)^2 (i.e. diag(2, 2, 1)),
+    // push full UV. Y-flipped viewport identical to the face draws.
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_vkPipeline);
+    VkViewport vp{0.0f, float(fbSize.height()),
+                  float(fbSize.width()), -float(fbSize.height()),
+                  0.0f, 1.0f};
+    vkCmdSetViewport(cmd, 0, 1, &vp);
+    VkRect2D scissor{{0, 0}, {uint32_t(fbSize.width()), uint32_t(fbSize.height())}};
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+    VkDescriptorImageInfo imgInfo{};
+    imgInfo.sampler = m_atlas ? m_atlas->sampler() : VK_NULL_HANDLE;
+    imgInfo.imageView = m_offscreenAa.resolveColor->imageView();
+    imgInfo.imageLayout = m_offscreenAa.resolveColor->currentLayout();
+    if (imgInfo.sampler == VK_NULL_HANDLE || imgInfo.imageView == VK_NULL_HANDLE) {
+        return;
+    }
+    VkWriteDescriptorSet write{};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstBinding = 0;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.pImageInfo = &imgInfo;
+    pushDescriptor(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_vkPipelineLayout, 0, 1, &write);
+
+    CubePushConstants pc{};
+    // MVP = diag(2, 2, 1) so the unit quad (-0.5..0.5) maps to
+    // NDC (-1..1). Identity rotation/translation: the quad is
+    // already in clip space.
+    pc.mvp[0] = 2.0f;
+    pc.mvp[5] = 2.0f;
+    pc.mvp[10] = 1.0f;
+    pc.mvp[15] = 1.0f;
+    pc.atlasSlotUv[0] = 0.0f;
+    pc.atlasSlotUv[1] = 0.0f;
+    pc.atlasSlotUv[2] = 1.0f;
+    pc.atlasSlotUv[3] = 1.0f;
+    // The offscreen pass already baked m_activationFactor into the
+    // background clear + face draws. Composite at full opacity so
+    // the resolved image goes through unchanged.
+    pc.opacity = 1.0f;
+    vkCmdPushConstants(cmd, m_vkPipelineLayout,
+                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                       0, sizeof(pc), &pc);
+    vkCmdDraw(cmd, 4, 1, 0, 0);
+}
+
 QMatrix4x4 CubeEffectV2::faceModelMatrix(int i, int n) const
 {
     if (n <= 0 || !effects) {
@@ -1262,6 +1855,17 @@ void CubeEffectV2::onPostPass(VkCommandBuffer cmd, VulkanTexture *sceneCapture,
     }
 
     updateViewProjection(fbSize);
+
+    // Offscreen AA path: everything (background + skybox + cube
+    // faces) was rendered in renderDesktopsToAtlas's same command
+    // buffer and resolved to m_offscreenAa.resolveColor. Composite
+    // that texture onto the swapchain target and return — skips the
+    // direct background/skybox/face draws below.
+    if (m_aaMode != AaMode::Off
+        && m_offscreenAa.resolveColor && m_offscreenAa.resolveColor->isValid()) {
+        composeOffscreenAaToSwapchain(cmd, fbSize);
+        return;
+    }
 
     // Background pass. The renderer's post-FX pass uses LOAD_OP_DONT_CARE
     // so without this every pixel outside a cube face would be undefined
@@ -1743,6 +2347,22 @@ void CubeEffectV2::renderDesktopsToAtlas()
     }
 
     vkRenderer->popOffscreenSlot();
+
+    // If the offscreen AA path is active, record the MSAA cube pass
+    // straight into the same command buffer — the atlas slots are
+    // SHADER_READ_ONLY after generateMipsAndPublish, so the cube
+    // faces can sample them inside the same submit. Saves a fence
+    // round-trip vs a separate command buffer.
+    if (m_aaMode != AaMode::Off) {
+        const VkFormat colorFormat = m_vulkanCtx->backend()
+            ? m_vulkanCtx->backend()->colorFormat()
+            : VK_FORMAT_B8G8R8A8_UNORM;
+        const QSize fbSize = effects->virtualScreenSize();
+        if (ensureOffscreenAa(m_vulkanCtx, colorFormat, fbSize)) {
+            recordOffscreenAaPass(cmd);
+        }
+    }
+
     m_lastAtlasSubmit = m_vulkanCtx->submitSingleTimeCommandsAsync(cmd);
 }
 
@@ -1778,6 +2398,7 @@ void CubeEffectV2::releaseAllResources()
     m_atlasRenderPass.reset();
     m_visibilityRefs.clear();
     m_skyboxTexture.reset();
+    destroyOffscreenAa();
     // Atlas singleton hand-off — same as Overview V2. The atlas
     // image is ~85 MB so holding it across activations would defeat
     // the rewrite's primary goal. If a future cube consumer shares
