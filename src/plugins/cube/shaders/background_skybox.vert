@@ -15,6 +15,12 @@ layout(push_constant) uniform PC {
     // Inverse(P * V) — used to compute the corner direction in
     // world space at the far plane (NDC z = 1).
     mat4 invViewProj;
+    // Eye position in world space. The fragment subtracts this from
+    // the interpolated far-plane point to get the actual view ray
+    // direction (without it the panorama would only line up when
+    // the camera sits at the world origin, which our orbital
+    // camera never does).
+    vec4 cameraPosW;
     float opacity;
 } pc;
 
@@ -31,9 +37,9 @@ void main()
     vec2 pos = vec2((gl_VertexIndex & 1) << 2, (gl_VertexIndex & 2) << 1) - vec2(1.0);
     gl_Position = vec4(pos, 1.0, 1.0);
 
-    // World-space view-ray at the far plane for this vertex.
-    // Interpolation across the triangle gives a smoothly-varying
-    // direction the fragment can normalize.
+    // World-space point at the far plane for this vertex. The
+    // fragment computes the actual view direction as
+    // (this - cameraPosW) and normalizes.
     vec4 farH = pc.invViewProj * vec4(pos, 1.0, 1.0);
     viewRayWorld = farH.xyz / farH.w;
     fragOpacity = pc.opacity;

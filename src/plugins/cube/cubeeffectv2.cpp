@@ -978,10 +978,15 @@ void CubeEffectV2::destroyVulkanPipeline()
 }
 
 // SkyBox push constants — kept layout-compatible with
-// background_skybox.{vert,frag}'s push-constant block.
+// background_skybox.{vert,frag}'s push-constant block. cameraPosW
+// is the camera eye in world coordinates; the fragment subtracts
+// it from the interpolated far-plane point to get the true view
+// direction (otherwise the panorama only lines up when the camera
+// sits at the world origin, which our orbital camera never does).
 struct CubeSkyboxPushConstants
 {
     float invViewProj[16];
+    float cameraPosW[4];
     float opacity;
     float _pad[3];
 };
@@ -1287,6 +1292,15 @@ void CubeEffectV2::onPostPass(VkCommandBuffer cmd, VulkanTexture *sceneCapture,
         for (int k = 0; k < 16; ++k) {
             spc.invViewProj[k] = invData[k];
         }
+        // Reconstruct the eye position from the current camera state
+        // (same spherical-coords formula as updateViewProjection).
+        const qreal theta = qDegreesToRadians(m_cameraCurrent.pitchDeg + 90.0);
+        const qreal phi = qDegreesToRadians(m_cameraCurrent.yawDeg);
+        const qreal r = m_cameraCurrent.radius;
+        spc.cameraPosW[0] = float(r * std::sin(phi) * std::sin(theta));
+        spc.cameraPosW[1] = float(r * std::cos(theta));
+        spc.cameraPosW[2] = float(r * std::cos(phi) * std::sin(theta));
+        spc.cameraPosW[3] = 0.0f;
         spc.opacity = factor;
         vkCmdPushConstants(cmd, m_skyboxPipelineLayout,
                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,

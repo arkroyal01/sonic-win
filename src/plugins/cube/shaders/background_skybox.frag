@@ -19,6 +19,7 @@
 
 layout(push_constant) uniform PC {
     mat4 invViewProj;
+    vec4 cameraPosW;
     float opacity;
 } pc;
 
@@ -34,7 +35,7 @@ const float kInvPi = 0.3183098861837907;       // 1 / pi
 
 void main()
 {
-    vec3 dir = normalize(viewRayWorld);
+    vec3 dir = normalize(viewRayWorld - pc.cameraPosW.xyz);
     float u = atan(dir.x, dir.z) * kInvTwoPi + 0.5;
     float v = asin(clamp(dir.y, -1.0, 1.0)) * kInvPi + 0.5;
     vec4 sampled = texture(skybox, vec2(u, v));
