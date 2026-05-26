@@ -1363,10 +1363,16 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
             break;
         }
     }
+    // The dragged tile is skipped in both passes and re-drawn last so
+    // it lands on top of every other grid tile regardless of natural
+    // iteration order.
+    auto isDragged = [&](const TileLayout &t) {
+        return m_dragActive && t.handle == m_dragCandidate;
+    };
     if (atlasSrgbView != VK_NULL_HANDLE) {
         pushView(atlasSrgbView);
         for (const TileLayout &t : m_tileLayout) {
-            if (t.slot.isFallback) {
+            if (t.slot.isFallback || isDragged(t)) {
                 continue;
             }
             pushAndDraw(t,
@@ -1382,11 +1388,33 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
     // slot owns the entire image). With typical fallback counts in the
     // single digits the per-tile descriptor switch is negligible.
     for (const TileLayout &t : m_tileLayout) {
-        if (!t.slot.isFallback) {
+        if (!t.slot.isFallback || isDragged(t)) {
             continue;
         }
         pushView(t.slot.srgbView);
         pushAndDraw(t, 0.0f, 0.0f, 1.0f, 1.0f);
+    }
+
+    // The dragged grid tile, drawn after every other grid tile so it
+    // floats on top of them regardless of natural iteration order.
+    if (m_dragActive) {
+        for (const TileLayout &t : m_tileLayout) {
+            if (t.handle != m_dragCandidate) {
+                continue;
+            }
+            if (t.slot.isFallback) {
+                pushView(t.slot.srgbView);
+                pushAndDraw(t, 0.0f, 0.0f, 1.0f, 1.0f);
+            } else if (atlasSrgbView != VK_NULL_HANDLE) {
+                pushView(atlasSrgbView);
+                pushAndDraw(t,
+                            float(t.slot.rect.x()) / atlasSize,
+                            float(t.slot.rect.y()) / atlasSize,
+                            float(t.slot.rect.width()) / atlasSize,
+                            float(t.slot.rect.height()) / atlasSize);
+            }
+            break;
+        }
     }
 
     // Pass 2.5: focus highlight on whichever zone owns keyboard
