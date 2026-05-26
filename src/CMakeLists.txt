@@ -101,6 +101,7 @@ target_sources(kwin PRIVATE
     effect/effecttogglablestate.cpp
     effect/effectwindow.cpp
     effect/logging.cpp
+    effect/multioutputcoords.cpp
     effect/offscreeneffect.cpp
     effect/offscreenquickview.cpp
     effect/quickeffect.cpp
@@ -540,6 +541,8 @@ install(FILES
     effect/effecttogglablestate.h
     effect/effectwindow.h
     effect/globals.h
+    effect/multioutputcoords.h
+    effect/multioutputstate.h
     effect/offscreeneffect.h
     effect/offscreenquickview.h
     effect/quickeffect.h
