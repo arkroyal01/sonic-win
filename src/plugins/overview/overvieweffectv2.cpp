@@ -1990,9 +1990,21 @@ void OverviewEffectV2::activate()
         }
     }
 #endif
-    m_animation.stop();
-    m_animation.setDirection(QVariantAnimation::Forward);
-    m_animation.start();
+    // Smooth-reverse from any in-flight slide-out: setDirection on a
+    // running animation lets Qt continue from currentTime back the
+    // other way without restarting from 0. stop()+start() snaps to
+    // the endpoint first, which feels like a jump at slow durations.
+    if (m_animation.state() == QAbstractAnimation::Running) {
+        if (m_animation.direction() == QVariantAnimation::Backward) {
+            m_animation.setDirection(QVariantAnimation::Forward);
+        }
+        // Already going Forward — let it finish; spam-pressing the
+        // toggle must not stop+restart and snap to the start frame.
+    } else {
+        m_animation.stop();
+        m_animation.setDirection(QVariantAnimation::Forward);
+        m_animation.start();
+    }
 }
 
 void OverviewEffectV2::deactivate()
@@ -2015,9 +2027,19 @@ void OverviewEffectV2::deactivate()
         effects->ungrabKeyboard();
         m_grabbedKeyboard = false;
     }
-    m_animation.stop();
-    m_animation.setDirection(QVariantAnimation::Backward);
-    m_animation.start();
+    // Smooth-reverse from any in-flight slide-in: see activate() for
+    // why we avoid stop()+start() when already running.
+    if (m_animation.state() == QAbstractAnimation::Running) {
+        if (m_animation.direction() == QVariantAnimation::Forward) {
+            m_animation.setDirection(QVariantAnimation::Backward);
+        }
+        // Already going Backward — let it finish; spam-pressing
+        // must not stop+restart and snap to fully-open before sliding.
+    } else {
+        m_animation.stop();
+        m_animation.setDirection(QVariantAnimation::Backward);
+        m_animation.start();
+    }
 }
 
 void OverviewEffectV2::teardownImmediate()
@@ -2093,14 +2115,15 @@ void OverviewEffectV2::reconfigure(ReconfigureFlags flags)
     // reserveBarThumbs and rebuildTileLayout. Default false matches V1.
     m_ignoreMinimized = group.readEntry(QStringLiteral("IgnoreMinimized"), false);
 
-    // V1 parity knob: animation duration in ms. V1 advertises a
-    // QProperty backed by kwincompositing's animationTime() (default
-    // 400). Read the same Effect-overview key; clamp to 0 (instant)
-    // so a user with reduced-motion preferences set via the kcm
-    // gets snappy activations without code changes. Setting on the
-    // running QVariantAnimation lets a reconfigure take effect on
-    // the next activate without waiting for a kwin restart.
-    const int duration = group.readEntry(QStringLiteral("AnimationDuration"), 400);
+    // V1 parity knob: animation duration in ms. Effect::animationTime
+    // reads the kwinrc key directly and only applies the user's global
+    // animation-speed factor when the key is unset (matches V1 behavior
+    // exactly — explicit user override wins, otherwise the global
+    // slider scales the default). Clamp to 0 so a negative value reads
+    // as instant. Setting on the running QVariantAnimation lets a
+    // reconfigure take effect on the next activate without a restart.
+    using namespace std::chrono_literals;
+    const int duration = int(animationTime(group, QStringLiteral("AnimationDuration"), 400ms));
     m_animationDuration = std::max(0, duration);
     m_animation.setDuration(m_animationDuration);
 }
