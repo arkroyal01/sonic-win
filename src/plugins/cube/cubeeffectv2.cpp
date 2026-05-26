@@ -14,15 +14,21 @@
 
 #if HAVE_VULKAN
 #include "compositor.h"
+#include "core/rendertarget.h"
 #include "core/renderviewport.h"
 #include "platformsupport/scenes/vulkan/vulkanbackend.h"
 #include "platformsupport/scenes/vulkan/vulkancontext.h"
 #include "platformsupport/scenes/vulkan/vulkanframebuffer.h"
 #include "platformsupport/scenes/vulkan/vulkanrenderpass.h"
+#include "platformsupport/scenes/vulkan/vulkanrendertarget.h"
 #include "platformsupport/scenes/vulkan/vulkantexture.h"
 #include "platformsupport/scenes/vulkan/vulkanthumbnailatlas.h"
 #include "scene/itemrenderer_vulkan.h"
 #include "scene/workspacescene.h"
+
+#include "shaders/cube_face_spv.inc"
+
+using namespace KWin::CubeEffectV2Shaders;
 #endif
 
 #include <KConfigGroup>
@@ -319,11 +325,20 @@ void CubeEffectV2::activate()
 #if HAVE_VULKAN
     // Phase 2: reserve per-desktop atlas slots + hold off-current-
     // desktop visibility refs, then start composing each desktop
-    // into its slot every frame via preFrameRender.
+    // into its slot every frame via preFrameRender. Phase 3: also
+    // register the on-screen face draw as a fullscreen post-pass.
     reserveDesktopSlots();
     if (auto *scene = Compositor::self()->scene()) {
         m_preFrameConnection = connect(scene, &WorkspaceScene::preFrameRender,
                                        this, &CubeEffectV2::renderDesktopsToAtlas);
+        if (auto *vkRenderer = dynamic_cast<ItemRendererVulkan *>(scene->renderer())) {
+            m_postPassId = vkRenderer->registerFullscreenPostPass(
+                [this](VkCommandBuffer cmd, VulkanTexture *sceneCapture,
+                       const RenderTarget &target,
+                       const RenderViewport &viewport) {
+                onPostPass(cmd, sceneCapture, target, viewport);
+            });
+        }
     }
 #endif
 
@@ -562,14 +577,71 @@ VirtualDesktop *CubeEffectV2::centredDesktop() const
 
 int CubeEffectV2::hitTestFace(const QPoint &cursorViewport, const QSize &fbSize) const
 {
-    Q_UNUSED(cursorViewport);
-    Q_UNUSED(fbSize);
-    // Phase 3 will implement true ray/plane intersection in camera
-    // space. For Phase 1 we fall back to the centred-desktop
-    // approximation: any click counts as "switch to currently
-    // centred face", which matches V1's MouseArea-onClicked when
-    // the picker misses.
-    return -1;
+    if (!effects || fbSize.isEmpty()) {
+        return -1;
+    }
+    const auto desktops = effects->desktops();
+    const int n = int(desktops.size());
+    if (n == 0) {
+        return -1;
+    }
+    // Cursor → NDC. The post-pass viewport is Y-flipped (we set vp.y
+    // = fbH, vp.height = -fbH in onPostPass), so the NDC mapping for
+    // hit tests has to match: NDC.y = -1 at screen top, +1 at screen
+    // bottom in flipped Y space; with our flip the picker computes
+    // NDC as if Y goes up on screen.
+    const float ndcX = (float(cursorViewport.x()) / float(fbSize.width())) * 2.0f - 1.0f;
+    const float ndcY = 1.0f - (float(cursorViewport.y()) / float(fbSize.height())) * 2.0f;
+
+    // Inverse projection-view → ray in world space. Use two NDC z
+    // depths (-1 = near, +1 = far) and inverse-transform to world.
+    const QMatrix4x4 invVp = (m_viewProj.projection * m_viewProj.view).inverted();
+    QVector4D nearH = invVp * QVector4D(ndcX, ndcY, -1.0f, 1.0f);
+    QVector4D farH = invVp * QVector4D(ndcX, ndcY, +1.0f, 1.0f);
+    if (nearH.w() == 0.0f || farH.w() == 0.0f) {
+        return -1;
+    }
+    const QVector3D nearW(nearH.x() / nearH.w(), nearH.y() / nearH.w(), nearH.z() / nearH.w());
+    const QVector3D farW(farH.x() / farH.w(), farH.y() / farH.w(), farH.z() / farH.w());
+    const QVector3D rayOrigin = nearW;
+    const QVector3D rayDir = (farW - nearW).normalized();
+
+    // Intersect against each face's plane (a unit-quad transformed by
+    // faceModelMatrix). Then check whether the hit point lies inside
+    // the quad's local extent [-0.5, +0.5]² before scaling.
+    int bestIndex = -1;
+    float bestT = std::numeric_limits<float>::max();
+    for (int i = 0; i < n; ++i) {
+        const QMatrix4x4 model = faceModelMatrix(i, n);
+        bool invertible = false;
+        const QMatrix4x4 invModel = model.inverted(&invertible);
+        if (!invertible) {
+            continue;
+        }
+        // Ray in face-local space (where the quad is the unit square
+        // at z=0). Intersect with z=0 plane.
+        const QVector4D localOriginH = invModel * QVector4D(rayOrigin, 1.0f);
+        const QVector4D localDirH = invModel * QVector4D(rayDir, 0.0f);
+        const QVector3D localOrigin(localOriginH.x(), localOriginH.y(), localOriginH.z());
+        const QVector3D localDir(localDirH.x(), localDirH.y(), localDirH.z());
+        if (std::abs(localDir.z()) < 1e-6f) {
+            continue;
+        }
+        const float t = -localOrigin.z() / localDir.z();
+        if (t <= 0.0f) {
+            continue; // behind the camera
+        }
+        const float hx = localOrigin.x() + t * localDir.x();
+        const float hy = localOrigin.y() + t * localDir.y();
+        if (hx < -0.5f || hx > 0.5f || hy < -0.5f || hy > 0.5f) {
+            continue; // outside the quad
+        }
+        if (t < bestT) {
+            bestT = t;
+            bestIndex = i;
+        }
+    }
+    return bestIndex;
 }
 
 void CubeEffectV2::windowInputMouseEvent(QEvent *event)
@@ -647,7 +719,12 @@ void CubeEffectV2::windowInputMouseEvent(QEvent *event)
         if (!wasDrag && effects) {
             // Click without drag → switch to the picked face, or
             // to the currently centred desktop if the picker misses.
-            int faceIdx = hitTestFace(pos, effects->virtualScreenSize());
+            // hitTestFace expects cursor in compositor-fb pixel space;
+            // global mouse position needs the virtual-screen offset
+            // subtracted (multi-monitor setups have non-zero origin).
+            const QRect screen = effects->virtualScreenGeometry();
+            const QPoint cursorFb = pos - screen.topLeft();
+            int faceIdx = hitTestFace(cursorFb, effects->virtualScreenSize());
             VirtualDesktop *target = nullptr;
             const auto desktops = effects->desktops();
             if (faceIdx >= 0 && faceIdx < int(desktops.size())) {
@@ -664,28 +741,363 @@ void CubeEffectV2::windowInputMouseEvent(QEvent *event)
 }
 
 #if HAVE_VULKAN
+
+// Push-constant layout: must match cube_face.{vert,frag}'s layout
+// block exactly (mat4 + vec4 + float = 84 bytes, packed to 96 with
+// std140 vec4 alignment for the trailing scalar). 128 bytes is the
+// guaranteed Vulkan minimum so this fits comfortably.
+struct CubePushConstants
+{
+    float mvp[16];
+    float atlasSlotUv[4];
+    float opacity;
+    float _pad[3];
+};
+
 bool CubeEffectV2::ensureVulkanPipeline(VulkanContext *ctx, VkFormat colorFormat)
 {
-    Q_UNUSED(ctx);
-    Q_UNUSED(colorFormat);
-    // Phase 3. Mirror OverviewEffectV2::ensureVulkanPipeline:
-    //   - VkShaderModule from SPIR-V (per-face quad with model MVP
-    //     in push constants, fragment samples binding=0).
-    //   - VkDescriptorSetLayout: combined-image-sampler.
-    //   - VkPipelineLayout: layout + push constants for model
-    //     matrix + atlas UV rect + per-face index.
-    //   - VkRenderPass compat with kwin's post-FX pass (LOAD_OP_LOAD
-    //     so the rendered scene shows through transparent /
-    //     skybox-masked areas).
-    //   - VkGraphicsPipeline: triangle list (4 verts → 2 tris,
-    //     indexed or strip; overview uses strip), depth test off
-    //     (painter's algorithm), blend over premultiplied alpha.
-    return false;
+    if (m_vkPipeline != VK_NULL_HANDLE && m_pipelineColorFormat == colorFormat) {
+        return true;
+    }
+    if (m_vkPipeline != VK_NULL_HANDLE) {
+        // Color format flipped (e.g. switched outputs at different
+        // depths). Tear down and rebuild against the new format.
+        destroyVulkanPipeline();
+    }
+    if (!ctx) {
+        return false;
+    }
+
+    VkDevice device = ctx->backend()->device();
+
+    auto makeModule = [&](const uint32_t *code, size_t byteSize) -> VkShaderModule {
+        VkShaderModuleCreateInfo info{};
+        info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        info.codeSize = byteSize;
+        info.pCode = code;
+        VkShaderModule mod = VK_NULL_HANDLE;
+        vkCreateShaderModule(device, &info, nullptr, &mod);
+        return mod;
+    };
+    m_vertModule = makeModule(kVertSpv, sizeof(kVertSpv));
+    m_fragModule = makeModule(kFragSpv, sizeof(kFragSpv));
+    if (!m_vertModule || !m_fragModule) {
+        qCWarning(KWIN_CUBE_V2_LOG) << "CubeEffectV2: shader-module creation failed";
+        destroyVulkanPipeline();
+        return false;
+    }
+
+    // set=0,binding=0 — combined image sampler (atlas slot's SRGB
+    // view + atlas's linear-mipmap sampler). Push-descriptor flag so
+    // each face draw can push its own binding without a per-frame
+    // descriptor pool churn.
+    VkDescriptorSetLayoutBinding dsBinding{};
+    dsBinding.binding = 0;
+    dsBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    dsBinding.descriptorCount = 1;
+    dsBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    VkDescriptorSetLayoutCreateInfo dsLayoutInfo{};
+    dsLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    dsLayoutInfo.bindingCount = 1;
+    dsLayoutInfo.pBindings = &dsBinding;
+    if (ctx->backend() && ctx->backend()->supportsPushDescriptor()) {
+        dsLayoutInfo.flags |= VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+    }
+    if (vkCreateDescriptorSetLayout(device, &dsLayoutInfo, nullptr, &m_vkDescriptorSetLayout) != VK_SUCCESS) {
+        qCWarning(KWIN_CUBE_V2_LOG) << "CubeEffectV2: vkCreateDescriptorSetLayout failed";
+        destroyVulkanPipeline();
+        return false;
+    }
+
+    VkPushConstantRange pcRange{};
+    pcRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    pcRange.offset = 0;
+    pcRange.size = sizeof(CubePushConstants);
+
+    VkPipelineLayoutCreateInfo plInfo{};
+    plInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    plInfo.setLayoutCount = 1;
+    plInfo.pSetLayouts = &m_vkDescriptorSetLayout;
+    plInfo.pushConstantRangeCount = 1;
+    plInfo.pPushConstantRanges = &pcRange;
+    if (vkCreatePipelineLayout(device, &plInfo, nullptr, &m_vkPipelineLayout) != VK_SUCCESS) {
+        qCWarning(KWIN_CUBE_V2_LOG) << "CubeEffectV2: vkCreatePipelineLayout failed";
+        destroyVulkanPipeline();
+        return false;
+    }
+
+    // Compat render pass (matches the renderer's post-FX pass on
+    // attachment format + sample count; pipeline doesn't need the
+    // exact VkRenderPass object).
+    m_postPassCompatRenderPass = VulkanRenderPass::createForSwapchainPostFx(ctx, colorFormat);
+    if (!m_postPassCompatRenderPass) {
+        qCWarning(KWIN_CUBE_V2_LOG) << "CubeEffectV2: compat render pass build failed";
+        destroyVulkanPipeline();
+        return false;
+    }
+
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = m_vertModule;
+    stages[0].pName = "main";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = m_fragModule;
+    stages[1].pName = "main";
+
+    VkPipelineVertexInputStateCreateInfo vi{};
+    vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+
+    VkPipelineInputAssemblyStateCreateInfo ia{};
+    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+
+    VkPipelineViewportStateCreateInfo vpState{};
+    vpState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    vpState.viewportCount = 1;
+    vpState.scissorCount = 1;
+
+    VkPipelineRasterizationStateCreateInfo rs{};
+    rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    // No back-face cull: V1's Material.NoCulling matches; lets us see
+    // the back of the cube while rotating instead of black holes.
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo ms{};
+    ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    // Phase 4 will toggle this to VK_SAMPLE_COUNT_{2,4,8}_BIT based on
+    // m_msaaSamples; for Phase 3 we stay at 1x. Render-pass sample
+    // count + pipeline sample count must match.
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineColorBlendAttachmentState cba{};
+    cba.blendEnable = VK_TRUE;
+    cba.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+    cba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    cba.colorBlendOp = VK_BLEND_OP_ADD;
+    cba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    cba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    cba.alphaBlendOp = VK_BLEND_OP_ADD;
+    cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+        | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+
+    VkPipelineColorBlendStateCreateInfo cb{};
+    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    cb.attachmentCount = 1;
+    cb.pAttachments = &cba;
+
+    const VkDynamicState dynStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dyn{};
+    dyn.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dyn.dynamicStateCount = 2;
+    dyn.pDynamicStates = dynStates;
+
+    VkGraphicsPipelineCreateInfo gpInfo{};
+    gpInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    gpInfo.stageCount = 2;
+    gpInfo.pStages = stages;
+    gpInfo.pVertexInputState = &vi;
+    gpInfo.pInputAssemblyState = &ia;
+    gpInfo.pViewportState = &vpState;
+    gpInfo.pRasterizationState = &rs;
+    gpInfo.pMultisampleState = &ms;
+    gpInfo.pColorBlendState = &cb;
+    gpInfo.pDynamicState = &dyn;
+    gpInfo.layout = m_vkPipelineLayout;
+    gpInfo.renderPass = m_postPassCompatRenderPass->renderPass();
+    gpInfo.subpass = 0;
+
+    const bool ok = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &gpInfo,
+                                              nullptr, &m_vkPipeline)
+        == VK_SUCCESS;
+    if (!ok) {
+        qCWarning(KWIN_CUBE_V2_LOG) << "CubeEffectV2: vkCreateGraphicsPipelines failed";
+        destroyVulkanPipeline();
+        return false;
+    }
+    m_pipelineColorFormat = colorFormat;
+    return true;
 }
 
 void CubeEffectV2::destroyVulkanPipeline()
 {
-    // Phase 3.
+    if (!m_vulkanCtx) {
+        // Modules / layouts can't be destroyed without a device, but
+        // nothing was created either if m_vulkanCtx is null.
+        m_vertModule = VK_NULL_HANDLE;
+        m_fragModule = VK_NULL_HANDLE;
+        m_vkDescriptorSetLayout = VK_NULL_HANDLE;
+        m_vkPipelineLayout = VK_NULL_HANDLE;
+        m_vkPipeline = VK_NULL_HANDLE;
+        m_postPassCompatRenderPass.reset();
+        m_pipelineColorFormat = VK_FORMAT_UNDEFINED;
+        return;
+    }
+    VkDevice device = m_vulkanCtx->backend()->device();
+    if (m_vkPipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device, m_vkPipeline, nullptr);
+        m_vkPipeline = VK_NULL_HANDLE;
+    }
+    if (m_vkPipelineLayout != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(device, m_vkPipelineLayout, nullptr);
+        m_vkPipelineLayout = VK_NULL_HANDLE;
+    }
+    if (m_vkDescriptorSetLayout != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(device, m_vkDescriptorSetLayout, nullptr);
+        m_vkDescriptorSetLayout = VK_NULL_HANDLE;
+    }
+    if (m_vertModule != VK_NULL_HANDLE) {
+        vkDestroyShaderModule(device, m_vertModule, nullptr);
+        m_vertModule = VK_NULL_HANDLE;
+    }
+    if (m_fragModule != VK_NULL_HANDLE) {
+        vkDestroyShaderModule(device, m_fragModule, nullptr);
+        m_fragModule = VK_NULL_HANDLE;
+    }
+    m_postPassCompatRenderPass.reset();
+    m_pipelineColorFormat = VK_FORMAT_UNDEFINED;
+}
+
+QMatrix4x4 CubeEffectV2::faceModelMatrix(int i, int n) const
+{
+    if (n <= 0 || !effects) {
+        return QMatrix4x4();
+    }
+    const qreal angleTickDeg = 360.0 / qreal(n);
+    const QSize fb = effects->virtualScreenSize();
+    const qreal faceW = qreal(fb.width());
+    const qreal faceH = qreal(fb.height());
+    const qreal dist = faceDistance(n);
+
+    // M = Ry(angleTick * i) * T(0, 0, faceDistance) * S(faceW, faceH, 1)
+    // (right-to-left composition; rightmost transform applies first
+    // to the unit quad).
+    QMatrix4x4 m;
+    m.setToIdentity();
+    m.rotate(float(angleTickDeg * i), 0.0f, 1.0f, 0.0f);
+    m.translate(0.0f, 0.0f, float(dist));
+    m.scale(float(faceW), float(faceH), 1.0f);
+    return m;
+}
+
+void CubeEffectV2::onPostPass(VkCommandBuffer cmd, VulkanTexture *sceneCapture,
+                              const RenderTarget &renderTarget,
+                              const RenderViewport &viewport)
+{
+    Q_UNUSED(sceneCapture);
+    Q_UNUSED(viewport);
+    if (!effects || !m_atlas || !m_vulkanCtx || m_desktopSlots.empty()) {
+        return;
+    }
+    auto *vkTarget = renderTarget.vulkanTarget();
+    if (!vkTarget) {
+        return;
+    }
+    const QSize fbSize = renderTarget.size();
+    if (fbSize.isEmpty()) {
+        return;
+    }
+    // Pull swapchain colour format from the backend (overview V2 uses
+    // the same accessor); pipeline format must match the active
+    // render pass.
+    const VkFormat colorFormat = m_vulkanCtx->backend()
+        ? m_vulkanCtx->backend()->colorFormat()
+        : VK_FORMAT_B8G8R8A8_UNORM;
+    if (!ensureVulkanPipeline(m_vulkanCtx, colorFormat)) {
+        return;
+    }
+
+    auto *backend = m_vulkanCtx->backend();
+    auto pushDescriptor = backend ? backend->cmdPushDescriptorSetKHR() : nullptr;
+    if (!pushDescriptor) {
+        return;
+    }
+
+    updateViewProjection(fbSize);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_vkPipeline);
+    VkViewport vp{0.0f, float(fbSize.height()),
+                  float(fbSize.width()), -float(fbSize.height()),
+                  0.0f, 1.0f};
+    vkCmdSetViewport(cmd, 0, 1, &vp);
+    VkRect2D scissor{{0, 0}, {uint32_t(fbSize.width()), uint32_t(fbSize.height())}};
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+    const auto desktops = effects->desktops();
+    const int n = int(desktops.size());
+    if (n == 0) {
+        return;
+    }
+    const qreal atlasSize = qreal(VulkanThumbnailAtlas::kAtlasSize);
+
+    // Painter's algorithm: sort faces by camera-space Z, draw farthest
+    // first. Camera-space Z = (view * model_origin).z. More negative
+    // means farther away in Vulkan's right-handed view space.
+    struct FaceDraw
+    {
+        VirtualDesktop *desktop;
+        int index;
+        float cameraZ; // sort key
+        QMatrix4x4 mvp;
+    };
+    std::vector<FaceDraw> draws;
+    draws.reserve(n);
+    const QMatrix4x4 viewProj = m_viewProj.projection * m_viewProj.view;
+    for (int i = 0; i < n; ++i) {
+        VirtualDesktop *vd = desktops[i];
+        auto it = m_desktopSlots.find(vd);
+        if (it == m_desktopSlots.end() || !it->second.hasContent) {
+            continue;
+        }
+        const QMatrix4x4 model = faceModelMatrix(i, n);
+        const QVector4D originCam = m_viewProj.view * QVector4D(0, 0, 0, 1) * 0
+            + m_viewProj.view * model * QVector4D(0, 0, 0, 1);
+        Q_UNUSED(originCam);
+        // Compute camera-space Z of the face's centre for sort.
+        const QVector4D centreCam = m_viewProj.view * (model * QVector4D(0, 0, 0, 1));
+        draws.push_back({vd, i, centreCam.z(), viewProj * model});
+    }
+    std::sort(draws.begin(), draws.end(), [](const FaceDraw &a, const FaceDraw &b) {
+        return a.cameraZ < b.cameraZ;
+    });
+
+    const float opacity = float(m_activationFactor);
+    for (const FaceDraw &fd : draws) {
+        const auto &ds = m_desktopSlots[fd.desktop];
+        if (ds.slot.srgbView == VK_NULL_HANDLE) {
+            continue;
+        }
+        VkDescriptorImageInfo imgInfo{};
+        imgInfo.sampler = m_atlas->sampler();
+        imgInfo.imageView = ds.slot.srgbView;
+        imgInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkWriteDescriptorSet write{};
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstBinding = 0;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        write.pImageInfo = &imgInfo;
+        pushDescriptor(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_vkPipelineLayout, 0, 1, &write);
+
+        CubePushConstants pc{};
+        const float *mvpData = fd.mvp.constData();
+        for (int k = 0; k < 16; ++k) {
+            pc.mvp[k] = mvpData[k];
+        }
+        pc.atlasSlotUv[0] = float(ds.slot.rect.x()) / float(atlasSize);
+        pc.atlasSlotUv[1] = float(ds.slot.rect.y()) / float(atlasSize);
+        pc.atlasSlotUv[2] = float(ds.slot.rect.width()) / float(atlasSize);
+        pc.atlasSlotUv[3] = float(ds.slot.rect.height()) / float(atlasSize);
+        pc.opacity = opacity;
+        vkCmdPushConstants(cmd, m_vkPipelineLayout,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                           0, sizeof(pc), &pc);
+        vkCmdDraw(cmd, 4, 1, 0, 0);
+    }
 }
 
 void CubeEffectV2::reserveDesktopSlots()
@@ -1005,6 +1417,14 @@ void CubeEffectV2::releaseAllResources()
     QObject::disconnect(m_preFrameConnection);
     m_preFrameConnection = QMetaObject::Connection();
 
+    if (m_postPassId != -1) {
+        if (auto *scene = Compositor::self()->scene()) {
+            if (auto *vkRenderer = dynamic_cast<ItemRendererVulkan *>(scene->renderer())) {
+                vkRenderer->unregisterFullscreenPostPass(m_postPassId);
+            }
+        }
+        m_postPassId = -1;
+    }
     if (m_vulkanCtx && m_lastAtlasSubmit.isValid()) {
         // Wait on the most recent atlas write so the slot rects we're
         // about to return to the atlas's free list are GPU-finished.

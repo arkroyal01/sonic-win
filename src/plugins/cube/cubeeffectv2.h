@@ -417,14 +417,40 @@ private:
     /// so every paint sees fresh per-desktop captures.
     void renderDesktopsToAtlas();
 
-    /// Build the cube-face graphics pipeline. Same shape as the
-    /// overview pipeline: combined-image-sampler binding 0, push
-    /// constants carrying per-face model matrix + atlas UV rect.
-    /// The fragment shader samples the atlas slot through the
-    /// SRGB view (same as overview); blends premultiplied. Phase
-    /// 3 lands the actual SPIR-V.
+    /// Build the cube-face graphics pipeline. Combined-image-sampler
+    /// at set=0,binding=0; push constants carry per-face MVP matrix,
+    /// atlas UV rect, and slide-in opacity. Compatible with the
+    /// renderer's post-FX render pass (LOAD_OP_LOAD, finalLayout
+    /// PRESENT_SRC_KHR). Idempotent; safe to call repeatedly.
     bool ensureVulkanPipeline(VulkanContext *ctx, VkFormat colorFormat);
     void destroyVulkanPipeline();
+
+    /// Per-face draw callback registered with
+    /// ItemRendererVulkan::registerFullscreenPostPass. Walks every
+    /// desktop slot, sorts by camera-space Z, then draws each as
+    /// a textured quad with per-face MVP push constants. Painter's
+    /// algorithm — no depth attachment.
+    void onPostPass(VkCommandBuffer cmd, VulkanTexture *sceneCapture,
+                    const RenderTarget &renderTarget,
+                    const RenderViewport &viewport);
+
+    /// Per-face model matrix for desktop @p i out of @p n. Combines
+    /// the unit-quad scale to fb dimensions, translation along +Z by
+    /// faceDistance(n), and Y-axis rotation by `angleTick * i`.
+    QMatrix4x4 faceModelMatrix(int i, int n) const;
+
+    /// Per-face descriptor handles + caches. Mirrors the per-slot
+    /// descriptor-set pattern overview V2's ensureVulkanPipeline
+    /// builds: one VkPipeline, one VkPipelineLayout, one
+    /// VkDescriptorSetLayout shared across all faces; each face
+    /// pushes its own descriptor write before drawing.
+    VkShaderModule m_vertModule = VK_NULL_HANDLE;
+    VkShaderModule m_fragModule = VK_NULL_HANDLE;
+    VkDescriptorSetLayout m_vkDescriptorSetLayout = VK_NULL_HANDLE;
+    VkPipelineLayout m_vkPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline m_vkPipeline = VK_NULL_HANDLE;
+    std::unique_ptr<VulkanRenderPass> m_postPassCompatRenderPass;
+    VkFormat m_pipelineColorFormat = VK_FORMAT_UNDEFINED;
 
     /// Drop every per-activation GPU resource: atlas slots,
     /// visibility refs, skybox texture, atlas singleton. Pipelines
