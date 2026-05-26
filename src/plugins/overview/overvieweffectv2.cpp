@@ -1966,6 +1966,23 @@ void OverviewEffectV2::activate()
 #if HAVE_VULKAN
     reserveSlotsForCurrentDesktop();
     reserveBarThumbs();
+    // Live activity refresh: window slots are reserved at activate-
+    // time, so an external activity switch (Plasma keybinding, KCM,
+    // DBus) would otherwise leave V2 showing an empty grid (old slots
+    // filtered out by isOnCurrentActivity, new activity's windows
+    // never reserved). Release everything and re-reserve on the new
+    // activity so the next frame paints correctly.
+    QObject::disconnect(m_activityConnection);
+    m_activityConnection = connect(effects, &EffectsHandler::currentActivityChanged,
+                                   this, [this](const QString &) {
+        if (!m_visible) {
+            return;
+        }
+        releaseAllSlots();
+        reserveSlotsForCurrentDesktop();
+        reserveBarThumbs();
+        effects->addRepaintFull();
+    });
     // Subscribe to preFrameRender so the atlas re-renders per frame
     // (per-window dirty tracking is a later optimisation). Bail out
     // gracefully if scene access fails — Phase 2c will gate behaviour
@@ -2034,6 +2051,8 @@ void OverviewEffectV2::deactivate()
     // completes (the existing m_animation.finished slot handles that).
     QObject::disconnect(m_preFrameConnection);
     m_preFrameConnection = {};
+    QObject::disconnect(m_activityConnection);
+    m_activityConnection = {};
 #endif
     // Release input grabs at the start of deactivate; the user can
     // immediately interact with normal windows again while the slide-
@@ -2067,6 +2086,8 @@ void OverviewEffectV2::teardownImmediate()
 #if HAVE_VULKAN
     QObject::disconnect(m_preFrameConnection);
     m_preFrameConnection = {};
+    QObject::disconnect(m_activityConnection);
+    m_activityConnection = {};
 #endif
     effects->stopMouseInterception(this);
     if (m_grabbedKeyboard) {

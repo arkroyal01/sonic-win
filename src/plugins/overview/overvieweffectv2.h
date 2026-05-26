@@ -471,6 +471,10 @@ private:
     /// the start of slide-out so we stop scheduling atlas writes once
     /// the user dismisses.
     QMetaObject::Connection m_preFrameConnection;
+    /// Connection to effects->currentActivityChanged, live while V2 is
+    /// visible. On signal we release the activate-time slot reservation
+    /// and re-reserve for the new activity so the grid stays correct.
+    QMetaObject::Connection m_activityConnection;
 #endif
 };
 
