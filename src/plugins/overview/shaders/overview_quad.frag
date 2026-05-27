@@ -32,6 +32,24 @@ layout(push_constant) uniform PC {
     // per-axis split lets non-square quads draw a circular pixel-
     // space corner via an elliptical UV-space SDF.
     vec2 cornerRadiusUv;
+    // Soft-edge falloff distance in normalised SDF radius units.
+    // Zero = hard discard outside the rounded boundary. Positive =
+    // smoothstep alpha falloff from the boundary out to
+    // (1.0 + edgeSoftnessUv) in q-space. Used by drop-shadow passes
+    // to fade the dark rect out gradually past the card edge.
+    float edgeSoftnessUv;
+    float _pad;
+    // Soft-shadow inset for the proper rounded-box-SDF path. When
+    // both components are non-zero, the shader uses a signed-
+    // distance rounded box instead of the elliptical-corner discard:
+    // inner half-extent = shadowInnerHalfUv, scalar corner radius =
+    // shadowCornerRadiusUv (both in the quad's local UV space), and
+    // outside-the-boundary alpha smoothsteps to zero over
+    // edgeSoftnessUv distance. Lets a single draw emit a proper
+    // soft drop shadow with Gaussian-like falloff outside the card.
+    vec2 shadowInnerHalfUv;
+    float shadowCornerRadiusUv;
+    float _pad2;
 } pc;
 
 layout(set = 0, binding = 0) uniform sampler2D atlas;
@@ -67,12 +85,34 @@ vec3 wallpaperBlur(vec2 uv, float lod)
 
 void main()
 {
-    // Rounded-rect discard: anything outside the inscribed rounded
-    // rectangle drops out before sampling. The SDF works in the
-    // quad's local UV space (centred at 0, half-extents 1). When
-    // both components of cornerRadiusUv are zero the if-test short-
-    // circuits — the path costs nothing for full-screen passes.
-    if (pc.cornerRadiusUv.x > 0.0 || pc.cornerRadiusUv.y > 0.0) {
+    // Two alpha paths, chosen by which push-constant fields are set:
+    //   shadowInnerHalfUv non-zero → proper rounded-box SDF (drop
+    //   shadow with smooth Gaussian-like falloff outside the inner
+    //   card).
+    //   cornerRadiusUv non-zero (and shadow path inactive) → simple
+    //   elliptical-corner discard / hard rounded boundary (tiles,
+    //   wallpaper card).
+    //   Otherwise → rectangular fullscreen pass.
+    float edgeAlpha = 1.0;
+    if (pc.shadowInnerHalfUv.x > 0.0 && pc.shadowInnerHalfUv.y > 0.0) {
+        // Rounded-box signed distance function. Returns negative
+        // inside the inner card, zero on its boundary, positive
+        // outside (magnitude = distance to nearest boundary point
+        // in the quad's UV space). The smoothstep then fades alpha
+        // from 1.0 at the boundary to 0 at edgeSoftnessUv beyond it.
+        vec2 p = fragUv * 2.0 - 1.0; // -1..1 quad UV
+        float r = pc.shadowCornerRadiusUv;
+        vec2 d = abs(p) - pc.shadowInnerHalfUv + vec2(r);
+        float sdf = length(max(d, vec2(0.0))) + min(max(d.x, d.y), 0.0) - r;
+        if (sdf <= 0.0) {
+            edgeAlpha = 1.0;
+        } else if (pc.edgeSoftnessUv > 0.0) {
+            edgeAlpha = 1.0 - smoothstep(0.0, pc.edgeSoftnessUv, sdf);
+            if (edgeAlpha <= 0.0) discard;
+        } else {
+            discard;
+        }
+    } else if (pc.cornerRadiusUv.x > 0.0 || pc.cornerRadiusUv.y > 0.0) {
         vec2 p = abs(fragUv * 2.0 - 1.0);
         vec2 d = p - (vec2(1.0) - pc.cornerRadiusUv);
         if (d.x > 0.0 && d.y > 0.0) {
@@ -80,7 +120,13 @@ void main()
             // space. The cpp side picks per-axis r so the resulting
             // ellipse traces a circular pixel-space corner.
             vec2 q = d / pc.cornerRadiusUv;
-            if (dot(q, q) > 1.0) discard;
+            float distQ = length(q);
+            if (pc.edgeSoftnessUv > 0.0) {
+                edgeAlpha = 1.0 - smoothstep(1.0, 1.0 + pc.edgeSoftnessUv, distQ);
+                if (edgeAlpha <= 0.0) discard;
+            } else if (distQ > 1.0) {
+                discard;
+            }
         }
     }
 
@@ -93,6 +139,7 @@ void main()
     // Atlas is SRGB-sampled (hardware decodes to linear on read).
     vec3 rgb = mix(sampled.rgb, pc.tintRgba.rgb, pc.tintRgba.a);
     float a = mix(sampled.a, 1.0, pc.tintRgba.a);
-    // Premultiplied output, modulated by opacity.
-    outColor = vec4(rgb * fragOpacity, a * fragOpacity);
+    // Premultiplied output, modulated by opacity and the soft-edge
+    // alpha falloff (edgeAlpha is 1.0 for the hard-discard path).
+    outColor = vec4(rgb * fragOpacity, a * fragOpacity) * edgeAlpha;
 }

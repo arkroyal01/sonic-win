@@ -91,10 +91,33 @@ struct OverviewQuadPushConstants
     // wallpaper backdrop) stay rectangular. Per-axis values mean
     // non-square quads draw an elliptical corner that traces the
     // intended pixel-radius even when the quad's NDC aspect differs
-    // from its pixel aspect. Helper makeCornerRadiusUv() below.
+    // from its pixel aspect. Helper setCornerRadiusUv() below.
     float cornerRadiusUv[2];
+    // Soft-edge fade distance in the SDF's normalised radius units.
+    // Zero = hard discard at the rounded boundary (the default for
+    // tiles). Positive = smoothstep alpha falloff from the boundary
+    // outward, used for soft drop shadows. Paired with a quad that
+    // extends beyond the surface being shadowed so the falloff has
+    // room to taper.
+    float edgeSoftnessUv;
+    // Pad to 16-byte alignment so the struct size matches the shader
+    // std430 push-constant block size deterministically.
+    float _pad;
+    // Soft-shadow inset (proper rounded-box SDF mode). When both
+    // components are non-zero, the shader switches from the simple
+    // elliptical-corner-discard path to a real signed-distance
+    // rounded-box. shadowInnerHalfUv is the inner solid rect's
+    // half-extent in the quad's local UV (so values < 1.0 leave a
+    // ring of soft alpha between the inner edge and the quad edge).
+    // shadowCornerRadiusUv is the corner radius of that inner rect
+    // in the same UV. edgeSoftnessUv controls the fade distance
+    // outside the inner boundary. Disables the elliptical-corner
+    // path when active so a draw can't accidentally do both.
+    float shadowInnerHalfUv[2];
+    float shadowCornerRadiusUv;
+    float _pad2;
 };
-static_assert(sizeof(OverviewQuadPushConstants) == 64,
+static_assert(sizeof(OverviewQuadPushConstants) == 88,
               "Push-constant layout must match shaders/overview_quad.{vert,frag}");
 
 // Convert a desired pixel-space corner radius into the per-axis UV
@@ -1999,6 +2022,64 @@ bool OverviewEffectV2::drawWallpaperBackground(VkCommandBuffer cmd, const QSize 
     const float cardTop = -1.0f + (settledTop - -1.0f) * factor;
     const float cardRight = 1.0f + (settledRight - 1.0f) * factor;
     const float cardBottom = 1.0f + (settledBottom - 1.0f) * factor;
+
+    // Pass 2.7: wallpaper-card drop shadow. V1's
+    // Kirigami.ShadowedTexture wraps the per-VD card with a soft
+    // 2-grid-unit drop at alpha 0.3. The shader's edgeSoftnessUv path
+    // is plumbed for a proper inset-SDF soft fade but not yet used
+    // here -- this draws a slightly-larger rounded rect behind the
+    // card at low opacity instead. The larger pixel radius
+    // (kRoundedRadiusCardPx + kShadowSpreadPx) gives a visible halo
+    // beyond the card's own rounded edge, which reads as depth at
+    // 0.25 alpha even without true Gaussian falloff. Only drawn when
+    // the activation factor is meaningfully forward so it doesn't
+    // flash during fast cycle transitions.
+    // Proper rounded-box SDF drop shadow: one draw, soft Gaussian-
+    // like alpha falloff outside the card's rounded edge via the
+    // shader's shadowInnerHalfUv + edgeSoftnessUv path. Quad expands
+    // past the card by kShadowSpreadPx on each side, plus a small
+    // downward Y offset so the brightest point of the shadow falls
+    // below the card (Breeze decoration shadow shape).
+    if (factor > 0.05f) {
+        constexpr float kShadowSpreadPx = 32.0f;
+        constexpr float kShadowYOffsetPx = 8.0f;
+        constexpr float kShadowAlpha = 0.55f;
+        const float cardWidthPx = (cardRight - cardLeft) * screenWf * 0.5f;
+        const float cardHeightPx = (cardBottom - cardTop) * screenHf * 0.5f;
+        const float quadHalfPxX = cardWidthPx * 0.5f + kShadowSpreadPx;
+        const float quadHalfPxY = cardHeightPx * 0.5f + kShadowSpreadPx;
+        const float spreadNdcX = 2.0f * kShadowSpreadPx / screenWf;
+        const float spreadNdcY = 2.0f * kShadowSpreadPx / screenHf;
+        const float yOffsetNdc = 2.0f * kShadowYOffsetPx / screenHf;
+        const float cardRadiusPx = roundedRadiusPx(kRoundedRadiusCardFrac);
+
+        OverviewQuadPushConstants shadow{};
+        shadow.quadRectNdc[0] = cardLeft - spreadNdcX;
+        shadow.quadRectNdc[1] = cardTop + yOffsetNdc - spreadNdcY;
+        shadow.quadRectNdc[2] = (cardRight - cardLeft) + 2.0f * spreadNdcX;
+        shadow.quadRectNdc[3] = (cardBottom - cardTop) + 2.0f * spreadNdcY;
+        shadow.atlasSlotUv[0] = 0.0f;
+        shadow.atlasSlotUv[1] = 0.0f;
+        shadow.atlasSlotUv[2] = 1.0f;
+        shadow.atlasSlotUv[3] = 1.0f;
+        shadow.tintRgba[3] = 1.0f; // solid black tint (rgb = 0 already)
+        shadow.opacity = kShadowAlpha * factor;
+        // Inner rounded-box parameters in the quad's UV space. The
+        // shader's rounded-box SDF returns negative inside this
+        // rect, zero on its boundary, positive outside; alpha then
+        // smoothsteps from 1 at the boundary to 0 at edgeSoftnessUv.
+        shadow.shadowInnerHalfUv[0] = cardWidthPx * 0.5f / quadHalfPxX;
+        shadow.shadowInnerHalfUv[1] = cardHeightPx * 0.5f / quadHalfPxY;
+        shadow.shadowCornerRadiusUv = cardRadiusPx / quadHalfPxX;
+        // Fade over (most of) the spread distance so the shadow
+        // tapers to invisible exactly at the quad edge.
+        shadow.edgeSoftnessUv = kShadowSpreadPx / quadHalfPxX;
+        vkCmdPushConstants(cmd, m_vkPipelineLayout,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                           0, sizeof(shadow), &shadow);
+        vkCmdDraw(cmd, 4, 1, 0, 0);
+    }
+
     OverviewQuadPushConstants card{};
     card.quadRectNdc[0] = cardLeft;
     card.quadRectNdc[1] = cardTop;
