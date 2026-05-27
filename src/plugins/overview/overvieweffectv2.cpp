@@ -765,14 +765,18 @@ void OverviewEffectV2::reserveBarThumbs()
         handle->refOffscreenRendering();
         // Force the WindowItem visible for the whole overview
         // lifetime so renderItem produces content for off-desktop
-        // windows every frame (live mini-thumbnails). The ref is
-        // released at deactivate; the X11 suspend hook then tears
-        // down each window's SurfaceItem pixmap + decoration FBO +
-        // shadow texture, and the dedicated-allocation work returns
-        // that VRAM to the OS instead of pinning VMA blocks.
+        // windows every frame (live mini-thumbnails). Intentionally
+        // exclude PAINT_DISABLED_BY_DESKTOP from the override -- if
+        // we override that too the window paints on the actual
+        // screen during the first frames of the activation animation
+        // before the wash dims things, producing a visible flash of
+        // other VDs' windows. Offscreen rendering still works for
+        // the mini-thumb atlas because the explicit
+        // refOffscreenRendering() call above is independent of the
+        // paint-disabled flag.
         m_barThumbVisRefs.emplace_back(
             ew,
-            EffectWindow::PAINT_DISABLED | EffectWindow::PAINT_DISABLED_BY_DESKTOP
+            EffectWindow::PAINT_DISABLED
                 | EffectWindow::PAINT_DISABLED_BY_MINIMIZE
                 | EffectWindow::PAINT_DISABLED_BY_ACTIVITY);
         m_barThumbSlots.emplace(handle, std::move(slot));
@@ -991,7 +995,10 @@ void OverviewEffectV2::rebuildTileLayout(const QSize &fbSize)
         // stretch to fill.
         const float scaleX = maxNdcW / std::max(1e-6f, t.realNdcW);
         const float scaleY = maxNdcH / std::max(1e-6f, t.realNdcH);
-        const float scale = std::min(scaleX, scaleY);
+        // V1 parity: clamp at 1.0 so a small window (e.g. KCalc) on a
+        // sparse grid doesn't blow up to fill the cell. Tiles only
+        // ever shrink to fit, never enlarge past their natural size.
+        const float scale = std::min({scaleX, scaleY, 1.0f});
         const float tileNdcW = t.realNdcW * scale;
         const float tileNdcH = t.realNdcH * scale;
         const int col = i % cols;
