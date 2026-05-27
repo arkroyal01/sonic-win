@@ -928,6 +928,10 @@ void OverviewEffectV2::releaseAllSlots()
     // texture is tiny (~16 KB) so re-uploading on the next activate
     // is essentially free.
     m_addIconTexture.reset();
+    m_deleteIconTexture.reset();
+    // Per-tile label cache (~40 KiB per window) -- drop on deactivate
+    // so the next activation starts at zero (V2 active-memory rule).
+    m_tileLabels.clear();
     m_fallbackFramebuffers.clear();
     m_atlasFramebuffer.reset();
     m_atlasRenderPass.reset();
@@ -1444,6 +1448,95 @@ void OverviewEffectV2::ensureBarIconTextures()
                 << "OverviewEffectV2: delete-icon upload failed";
         }
     }
+}
+
+VulkanTexture *OverviewEffectV2::ensureTileLabelTexture(Window *handle)
+{
+    if (!handle || !m_vulkanCtx) {
+        return nullptr;
+    }
+    // Label texture mirrors V1's WindowHeapDelegate: a large window
+    // icon stacked ABOVE a one-line caption, both horizontally
+    // centred. Only the caption carries a rounded background pill
+    // (sized to the text content, like V1's PC3.Label background);
+    // the icon floats on transparent texture. All dimensions are
+    // gridUnit-derived so the layout scales with the user's font /
+    // DPI. The icon side approximates Kirigami.Units.iconSizes.large
+    // (≈ 8/3 gridUnit at default metrics) so it reads clearly bigger
+    // than the caption, matching V1.
+    const int gridUnitPx = QFontMetrics(qApp->font()).height();
+    const int kSmallSpacing = std::max(2, gridUnitPx / 4);
+    const int kCornerRadius = std::max(2, gridUnitPx / 4);
+    const int kIconSidePx = 3 * gridUnitPx;
+    const QFontMetrics fm(qApp->font());
+    const int kTextH = fm.height();
+    const int kTextPillH = kTextH + kSmallSpacing;
+    const int kLabelW = 16 * gridUnitPx;
+    const int kLabelH = kIconSidePx + kSmallSpacing + kTextPillH;
+
+    const QString caption = handle->caption();
+    auto it = m_tileLabels.find(handle);
+    if (it != m_tileLabels.end()
+        && it->second.texture
+        && it->second.texture->isValid()
+        && it->second.renderedCaption == caption) {
+        return it->second.texture.get(); // cache hit
+    }
+
+    QImage img(kLabelW, kLabelH, QImage::Format_RGBA8888_Premultiplied);
+    img.fill(Qt::transparent);
+
+    QPainter p(&img);
+    p.setRenderHint(QPainter::Antialiasing);
+    p.setRenderHint(QPainter::TextAntialiasing);
+
+    // Icon centred at the top -- Window::icon() returns a QIcon;
+    // renders blank if the window has none (caption-only fallback).
+    const QIcon icon = handle->icon();
+    const int iconX = (kLabelW - kIconSidePx) / 2;
+    const int iconY = 0;
+    if (!icon.isNull()) {
+        const QPixmap pm = icon.pixmap(QSize(kIconSidePx, kIconSidePx));
+        if (!pm.isNull()) {
+            p.drawPixmap(iconX, iconY, pm);
+        }
+    }
+
+    // Caption below the icon, centred. qApp->font() (system default)
+    // matches V1's Kirigami theme font; palette.window() pill +
+    // palette.windowText() text give the canonical theme contrast on
+    // any colour scheme. The pill is sized to the text content
+    // (+ smallSpacing) and centred, exactly like V1's PC3.Label
+    // background Rectangle.
+    p.setFont(qApp->font());
+    const int textMaxW = kLabelW - 2 * kSmallSpacing;
+    const QString elided = fm.elidedText(caption, Qt::ElideRight, textMaxW);
+    const int textW = std::min(textMaxW, fm.horizontalAdvance(elided));
+    const int pillW = textW + kSmallSpacing;
+    const int pillX = (kLabelW - pillW) / 2;
+    const int pillY = kIconSidePx + kSmallSpacing;
+    p.setBrush(qApp->palette().window().color());
+    p.setPen(Qt::NoPen);
+    p.drawRoundedRect(QRect(pillX, pillY, pillW, kTextPillH),
+                      kCornerRadius, kCornerRadius);
+
+    p.setPen(qApp->palette().windowText().color());
+    const int textBaselineY = pillY + (kTextPillH + fm.ascent() - fm.descent()) / 2;
+    p.drawText((kLabelW - textW) / 2, textBaselineY, elided);
+    p.end();
+
+    auto next = VulkanTexture::upload(m_vulkanCtx, img);
+    if (!next) {
+        qCWarning(KWIN_OVERVIEW_V2_LOG)
+            << "OverviewEffectV2: tile-label upload failed for"
+            << handle;
+        return nullptr;
+    }
+    VulkanTexture *raw = next.get();
+    auto &entry = m_tileLabels[handle];
+    entry.texture = std::move(next);
+    entry.renderedCaption = caption;
+    return raw;
 }
 
 void OverviewEffectV2::updateSearchTexture()
@@ -2482,6 +2575,96 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
                       tileNdcW - insetX - insetW,
                       tileNdcH - insetY - insetH);
     }
+
+    // Pass 2.6: per-tile labels (icon + caption) beneath each tile.
+    // Mirrors V1's WindowHeapDelegate: a large window icon stacked
+    // above a one-line caption pill. Each label texture is cached
+    // per-window (m_tileLabels) and re-rendered only when the caption
+    // changes. Drawn AFTER the highlight outline (pass 2.5) so the
+    // icon + title stay on top of the hover/selection border, matching
+    // V1's stacking. Skipped for the dragged tile so it doesn't ghost
+    // on top of the drop-target landing area.
+    if (factor > 0.05f) {
+        const int gridUnitPx = QFontMetrics(qApp->font()).height();
+        // V1 anchors the icon's vertical centre to the thumbnail bottom
+        // with verticalCenterOffset -iconHeight/4, so the icon overlaps
+        // the thumbnail by 3/4 of its height and pokes 1/4 below. Our
+        // label texture stacks the icon at its top, so to reproduce
+        // that the texture top sits 3/4 of an icon height above the
+        // visible window bottom edge.
+        const int kIconSidePx = 3 * gridUnitPx;
+        const float iconOverlapNdc = 2.0f * (0.75f * float(kIconSidePx)) / screenH;
+        for (const TileLayout &t : m_tileLayout) {
+            if (!t.handle || isDragged(t)) {
+                continue;
+            }
+            VulkanTexture *labelTex = ensureTileLabelTexture(t.handle);
+            if (!labelTex || !labelTex->isValid()) {
+                continue;
+            }
+            const float texW = float(labelTex->width());
+            const float texH = float(labelTex->height());
+            const float labelHeightNdc = 2.0f * texH / screenH;
+            const float labelWidthNdc = 2.0f * texW / screenW;
+            const float tileNdcX = t.realNdcX + (t.gridNdcX - t.realNdcX) * factor;
+            const float tileNdcY = t.realNdcY + (t.gridNdcY - t.realNdcY) * factor;
+            const float tileNdcW = t.realNdcW + (t.gridNdcW - t.realNdcW) * factor;
+            const float tileNdcH = t.realNdcH + (t.gridNdcH - t.realNdcH) * factor;
+            // The tile rect spans visibleGeometry (which includes the
+            // decoration-shadow halo); the visible window occupies the
+            // inset frame rect within it. Position the label relative
+            // to that inset rect — its centre and bottom edge — so the
+            // gap to the visible window border is uniform regardless of
+            // each window's shadow halo size (matches the tile-draw
+            // crop in pushAndDraw).
+            float ixL = 0.0f, ixR = 0.0f, iyB = 0.0f;
+            {
+                const QRectF vis = t.handle->visibleGeometry();
+                const QRectF frame = t.handle->frameGeometry();
+                if (vis.width() > 0.0 && vis.height() > 0.0) {
+                    ixL = std::max(0.0f, float((frame.x() - vis.x()) / vis.width()));
+                    ixR = std::max(0.0f, float((vis.right() - frame.right()) / vis.width()));
+                    iyB = std::max(0.0f, float((vis.bottom() - frame.bottom()) / vis.height()));
+                }
+            }
+            const float winNdcX = tileNdcX + tileNdcW * ixL;
+            const float winNdcW = tileNdcW * (1.0f - ixL - ixR);
+            const float winBottomNdc = tileNdcY + tileNdcH * (1.0f - iyB);
+            // Draw at native aspect, centred under the visible window.
+            // If the label is wider than the window, clip the centre
+            // band by shrinking the drawn width and sampling the centre
+            // UV slice — keeps icon+text in proportion when constrained.
+            const float lblH = labelHeightNdc;
+            const float lblW = std::min(labelWidthNdc, winNdcW);
+            const float lblX = winNdcX + (winNdcW - lblW) * 0.5f;
+            const float lblY = winBottomNdc - iconOverlapNdc;
+            const float uvScale = lblW / labelWidthNdc;
+            const float uvX = (1.0f - uvScale) * 0.5f;
+            pushView(labelTex->imageView());
+            OverviewQuadPushConstants pc{};
+            pc.quadRectNdc[0] = lblX;
+            pc.quadRectNdc[1] = lblY;
+            pc.quadRectNdc[2] = lblW;
+            pc.quadRectNdc[3] = lblH;
+            pc.atlasSlotUv[0] = uvX;
+            pc.atlasSlotUv[1] = 0.0f;
+            pc.atlasSlotUv[2] = uvScale;
+            pc.atlasSlotUv[3] = 1.0f;
+            // tintRgba.a = 0 → pure texture sample.
+            pc.opacity = factor;
+            vkCmdPushConstants(cmd, m_vkPipelineLayout,
+                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                               0, sizeof(pc), &pc);
+            vkCmdDraw(cmd, 4, 1, 0, 0);
+        }
+        // Rebind the atlas view for the bar pass below (pushOutline /
+        // bar tiles don't sample the atlas — tintRgba.a is 1.0 — but
+        // the pipeline still needs a valid descriptor bound).
+        if (atlasSrgbView != VK_NULL_HANDLE) {
+            pushView(atlasSrgbView);
+        }
+    }
+
     // Bar-tile focus wash drawn after the bar pass below so it lands
     // on top of the bar tile's own colour.
 

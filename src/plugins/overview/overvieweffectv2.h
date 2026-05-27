@@ -276,6 +276,25 @@ private:
     std::unique_ptr<VulkanTexture> m_addIconTexture;
     std::unique_ptr<VulkanTexture> m_deleteIconTexture;
     void ensureBarIconTextures();
+
+    /// Per-window-tile label texture cache (icon + elided caption).
+    /// V1's WindowHeapDelegate renders a Kirigami Heading with the
+    /// window's icon and title beneath each tile thumbnail; V2 was
+    /// thumbnail-only. Cached per Window* so re-renders only happen
+    /// when caption changes or the window is freshly seen. The
+    /// caption-change check is cheap (string compare); the upload is
+    /// the only allocation-heavy bit.
+    /// Memory: ~40 KB per label (320×32×4) × N windows on the
+    /// overview. With typical N = 5..20 this is well under 1 MB; the
+    /// cache is dropped wholesale in releaseAllSlots on deactivate,
+    /// matching the V2 active-memory rule.
+    struct TileLabelEntry
+    {
+        std::unique_ptr<VulkanTexture> texture;
+        QString renderedCaption;
+    };
+    std::unordered_map<Window *, TileLabelEntry> m_tileLabels;
+    VulkanTexture *ensureTileLabelTexture(Window *handle);
 #endif
 
     /// Whether the cursor is currently inside the rect of the Add-VD
