@@ -41,16 +41,24 @@ layout(location = 0) out vec4 outColor;
 // (generateMipsAndPublish writes the full cascade), so the weighted
 // sum behaves like a wide Gaussian — but without the per-LOD texel
 // structure a single-LOD tap shows. Single-pass, 5 texture fetches.
-// pc.lod selects the heaviest mip (centre of mass for the blur).
+// pc.lod selects the nominal centre; the asymmetric weighting below
+// biases the effective centre of mass to lod+0.4 so the result is
+// softer than a symmetric kernel at the same nominal LOD. Combined
+// with a cpp-side pc.lod = 3.0, the perceived blur sits near mip 3.4
+// which closes most of the gap to V1's FastBlur(radius:64) without
+// the cost of a second pass.
 vec3 wallpaperBlur(vec2 uv, float lod)
 {
-    // σ-like spacing: closer mip levels carry more weight, far mips
-    // soften the result. Weights sum to 1.
-    vec3 c  = textureLod(atlas, uv, max(lod - 2.0, 0.0)).rgb * 0.08;
-    c      += textureLod(atlas, uv, max(lod - 1.0, 0.0)).rgb * 0.22;
-    c      += textureLod(atlas, uv,        lod        ).rgb * 0.40;
-    c      += textureLod(atlas, uv,        lod + 1.0  ).rgb * 0.22;
-    c      += textureLod(atlas, uv,        lod + 2.0  ).rgb * 0.08;
+    // Heavier-biased weights, sum to 1. Increasing the lod+1 and
+    // lod+2 contributions and dropping lod-2/lod-1 trades a little
+    // mid-frequency detail for a noticeably softer result. If the
+    // image looks blocky on lower-end content, drop lod+2 from 0.20
+    // back toward 0.10 to bring the centre of mass back to ~lod+0.2.
+    vec3 c  = textureLod(atlas, uv, max(lod - 2.0, 0.0)).rgb * 0.05;
+    c      += textureLod(atlas, uv, max(lod - 1.0, 0.0)).rgb * 0.15;
+    c      += textureLod(atlas, uv,        lod        ).rgb * 0.30;
+    c      += textureLod(atlas, uv,        lod + 1.0  ).rgb * 0.30;
+    c      += textureLod(atlas, uv,        lod + 2.0  ).rgb * 0.20;
     return c;
 }
 

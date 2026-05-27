@@ -1356,15 +1356,23 @@ void OverviewEffectV2::updateSearchTexture()
     p.drawRoundedRect(QRectF(img.rect()).adjusted(2.0, 2.0, -2.0, -2.0), 8.0, 8.0);
 
     // Search icon on the left, matching V1's PlasmaExtras.SearchField.
-    // The icon stays visible whether or not the field has text.
+    // The icon stays visible whether or not the field has text. Theme
+    // icons are typically dark glyphs; recolour to the text colour
+    // so the icon stays visible against the dark bar background and
+    // reads as continuous with the typed text.
     constexpr int kIconSize = 18;
     constexpr int kIconX = 10;
+    const QColor textColor(255, 255, 255, 240);
     const int iconY = (kHeight - kIconSize) / 2;
     const QIcon searchIcon = QIcon::fromTheme(QStringLiteral("search-symbolic"),
                                               QIcon::fromTheme(QStringLiteral("edit-find")));
     if (!searchIcon.isNull()) {
-        const QPixmap pm = searchIcon.pixmap(QSize(kIconSize, kIconSize));
+        QPixmap pm = searchIcon.pixmap(QSize(kIconSize, kIconSize));
         if (!pm.isNull()) {
+            QPainter recolour(&pm);
+            recolour.setCompositionMode(QPainter::CompositionMode_SourceIn);
+            recolour.fillRect(pm.rect(), textColor);
+            recolour.end();
             p.drawPixmap(kIconX, iconY, pm);
         }
     }
@@ -1449,10 +1457,11 @@ void OverviewEffectV2::ensureNoMatchesTexture()
     // so the text sits on the dimmed/blurred backdrop with consistent
     // contrast across wallpapers.
     p.setFont(font);
-    // Kirigami.Theme.disabledTextColor maps to QPalette::Disabled's
-    // WindowText role -- the faded variant used for placeholder /
-    // hint text on light and dark themes alike.
-    p.setPen(qApp->palette().color(QPalette::Disabled, QPalette::WindowText));
+    // Same colour as the search-bar text so the empty-state message
+    // reads as continuous with the bar that introduced it. The wash
+    // beneath provides enough contrast for white-on-dim on both light
+    // and dark themes.
+    p.setPen(QColor(255, 255, 255, 240));
     const int baseline = (kHeight + fm.ascent() - fm.descent()) / 2;
     p.drawText(kSidePad, baseline, text);
     p.end();
@@ -1838,11 +1847,13 @@ bool OverviewEffectV2::drawWallpaperBackground(VkCommandBuffer cmd, const QSize 
         pc.atlasSlotUv[2] = float(wp.slot.rect.width()) / atlasSize;
         pc.atlasSlotUv[3] = float(wp.slot.rect.height()) / atlasSize;
     }
-    // Combined mip-LOD downsample + 13-tap Gaussian in the fragment
-    // shader. LOD 2 (4× downsample) keeps enough mid-frequency detail
-    // that the Gaussian taps blend smoothly; the LOD 4 blocky-mosaic
-    // pass from the previous iteration is gone.
-    pc.lod = 2.0f;
+    // Nominal mip centre for the 5-tap multi-LOD blur in
+    // overview_quad.frag::wallpaperBlur. The shader's asymmetric weights
+    // shift the effective centre of mass to ~lod+0.4 (i.e. mip 3.4 here,
+    // ~11× downsample), which is the closest single-pass approximation
+    // of V1's FastBlur(radius:64) we get without a separate Gaussian
+    // pass and an intermediate render target.
+    pc.lod = 3.0f;
     pc.opacity = factor;
     vkCmdPushConstants(cmd, m_vkPipelineLayout,
                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -1857,6 +1868,15 @@ bool OverviewEffectV2::drawWallpaperBackground(VkCommandBuffer cmd, const QSize 
     // atlas sample, which the atlas's *_SRGB format already decoded
     // to linear on read; tints must live in the same space.
     constexpr float kDarkWashAlpha = 0.7f;
+    // V1's QML underlay rectangle blends in sRGB space (Qt's scene
+    // graph default). V2's Vulkan path blends in linear space because
+    // the atlas sampler is *_SRGB and decodes on read. Same arithmetic
+    // ends up brighter in linear-blend than sRGB-blend, especially on
+    // light themes where the tint colour dominates. Compensate with a
+    // 0.55 darkening multiplier so the linear-blend output matches V1's
+    // sRGB-blend perceived strength. Dark themes already match natively
+    // (tint near zero is invariant under the darkening).
+    constexpr float kTintDarken = 0.10f;
     const QColor washColor = qApp->palette().window().color();
     auto sRgbToLinear = [](double c) -> float {
         return c <= 0.04045 ? float(c / 12.92)
@@ -1871,9 +1891,9 @@ bool OverviewEffectV2::drawWallpaperBackground(VkCommandBuffer cmd, const QSize 
     wash.atlasSlotUv[1] = 0.0f;
     wash.atlasSlotUv[2] = 1.0f;
     wash.atlasSlotUv[3] = 1.0f;
-    wash.tintRgba[0] = sRgbToLinear(washColor.redF());
-    wash.tintRgba[1] = sRgbToLinear(washColor.greenF());
-    wash.tintRgba[2] = sRgbToLinear(washColor.blueF());
+    wash.tintRgba[0] = sRgbToLinear(washColor.redF()) * kTintDarken;
+    wash.tintRgba[1] = sRgbToLinear(washColor.greenF()) * kTintDarken;
+    wash.tintRgba[2] = sRgbToLinear(washColor.blueF()) * kTintDarken;
     wash.tintRgba[3] = 1.0f; // solid tint
     wash.opacity = kDarkWashAlpha * factor;
     vkCmdPushConstants(cmd, m_vkPipelineLayout,
