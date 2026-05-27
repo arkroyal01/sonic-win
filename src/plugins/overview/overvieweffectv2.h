@@ -78,8 +78,24 @@ public:
     /// once the renderer path is committed to Vulkan-only.
     static bool supported();
 
+    /// Activation modes. Overview is the V1-parity heap + bar UI;
+    /// GridView is V1's "Grid View" alternate layout (Super+G by
+    /// default) that arranges every VD as a 2-D grid of wallpaper
+    /// cards. Both states share m_animation / m_activationFactor;
+    /// switching mode mid-activation is a follow-up (proper
+    /// crossfade FSM tracked in the parity execution plan).
+    enum class Mode { Overview,
+                      GridView };
+
     /// Activate the effect: starts the slide-in animation.
+    /// Defaults to Mode::Overview to preserve existing call sites
+    /// (e.g. the Meta+W toggle and the swipe gestures).
     void activate();
+    /// Activate in a specific mode (Overview or GridView). Used by
+    /// the Grid View global shortcut. When called while already
+    /// visible in the other mode the mode flips immediately; the
+    /// full crossfade-during-activation FSM is a follow-up.
+    void activate(Mode mode);
     /// Deactivate: animates slide-out then releases per-activation state.
     void deactivate();
 
@@ -120,6 +136,12 @@ private:
     /// if the click is outside any tile. Recomputes the same grid the
     /// post-pass draws — keeps the two paths trivially consistent.
     Window *hitTestTile(const QPoint &globalPos) const;
+
+    /// Hit-test a global mouse position against the Grid View desktop
+    /// cards. Returns the VirtualDesktop whose card contains @p
+    /// globalPos, or nullptr if outside any card / not in Grid View.
+    /// Used by the click path to activate the desktop and dismiss.
+    VirtualDesktop *hitTestGridCard(const QPoint &globalPos) const;
 
 #if HAVE_VULKAN
     /// Hit-test a global mouse position against the desktop bar.
@@ -357,10 +379,16 @@ private:
     /// focus-wash overlay so the trailing edge doesn't leave smear.
     static constexpr int kDragDamagePadPx = 8;
 
+    Mode m_mode = Mode::Overview;
+
     /// Global toggle shortcut. Same object name as the existing
     /// OverviewEffect's `Overview` action so the user's saved binding
     /// (default `Meta+W`) carries over without reconfiguration.
     QAction *m_toggleAction = nullptr;
+    /// Toggle for the Grid View mode (default Super+G). Registers
+    /// under the standard "Grid View" action name so Plasma's
+    /// shortcut UI picks it up alongside the legacy V1 binding.
+    QAction *m_gridViewAction = nullptr;
 
     /// Touchpad / touchscreen swipe-to-activate handlers. KWin's
     /// gesture API takes QActions for "gesture completed in this
@@ -485,6 +513,13 @@ private:
     /// snapshot keeps the bar stacking steady for the overview lifetime.
     /// Cleared in releaseAllSlots.
     std::unordered_map<const Window *, int> m_stackingIndex;
+
+    /// Settled (factor == 1) NDC rect of each Grid View desktop card,
+    /// paired with its VirtualDesktop. Populated every frame by the
+    /// Grid View render in drawWallpaperBackground; read by
+    /// hitTestGridCard so a click activates the desktop under the
+    /// cursor. Empty in Overview mode.
+    std::vector<std::pair<VirtualDesktop *, QRectF>> m_gridCardRects;
 
     /// Atlas slots holding the desktop wallpaper. Two-level indirection
     /// so we dedup slots when Plasma uses a single sticky desktop window

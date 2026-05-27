@@ -268,10 +268,36 @@ OverviewEffectV2::OverviewEffectV2()
     KGlobalAccel::self()->setDefaultShortcut(m_toggleAction, {defaultShortcut});
     KGlobalAccel::self()->setShortcut(m_toggleAction, {defaultShortcut});
     connect(m_toggleAction, &QAction::triggered, this, [this]() {
-        if (m_visible) {
+        // From GridView, Meta+W switches back to Overview mode rather
+        // than dismissing -- matches V1's "Cycle Overview" semantics
+        // for the canonical overview toggle.
+        if (m_visible && m_mode == Mode::GridView) {
+            activate(Mode::Overview);
+        } else if (m_visible) {
             deactivate();
         } else {
-            activate();
+            activate(Mode::Overview);
+        }
+    });
+
+    // Grid View action. V1 binds Super+G to the "Grid View" action
+    // (object name picked up by Plasma's shortcut UI). Same toggle
+    // semantics: pressed while showing GridView -> dismiss; pressed
+    // in Overview -> switch to GridView; pressed when hidden ->
+    // activate in GridView.
+    m_gridViewAction = new QAction(this);
+    m_gridViewAction->setObjectName(QStringLiteral("Grid View"));
+    m_gridViewAction->setText(i18nc("@action Grid View is the name of a Kwin overview mode",
+                                    "Toggle Grid View"));
+    m_gridViewAction->setAutoRepeat(false);
+    const QKeySequence gridShortcut = Qt::META | Qt::Key_G;
+    KGlobalAccel::self()->setDefaultShortcut(m_gridViewAction, {gridShortcut});
+    KGlobalAccel::self()->setShortcut(m_gridViewAction, {gridShortcut});
+    connect(m_gridViewAction, &QAction::triggered, this, [this]() {
+        if (m_visible && m_mode == Mode::GridView) {
+            deactivate();
+        } else {
+            activate(Mode::GridView);
         }
     });
 
@@ -309,6 +335,9 @@ OverviewEffectV2::~OverviewEffectV2()
 {
     if (m_toggleAction) {
         KGlobalAccel::self()->removeAllShortcuts(m_toggleAction);
+    }
+    if (m_gridViewAction) {
+        KGlobalAccel::self()->removeAllShortcuts(m_gridViewAction);
     }
     for (const ElectricBorder &border : std::as_const(m_borderActivate)) {
         effects->unreserveElectricBorder(border, this);
@@ -578,6 +607,17 @@ void OverviewEffectV2::reserveSlotsForCurrentDesktop()
         }
     }
 
+    // Grid View doesn't draw the overview heap, so it needs no large
+    // per-window slots. Overview and Grid View are mutually exclusive
+    // (you're only ever in one), so skipping these here leaves the
+    // whole atlas free for the high-resolution grid mini-thumbnails
+    // that reserveBarThumbs sizes to the card — no separate atlas
+    // image required, and nothing is held that the active mode won't
+    // draw.
+    if (m_mode == Mode::GridView) {
+        return;
+    }
+
     // Walk current-desktop windows in stacking order and reserve one
     // atlas slot per window, sized to the window's visible geometry
     // (matching the rendered region in WindowThumbnailSource's existing
@@ -808,7 +848,22 @@ void OverviewEffectV2::reserveBarThumbs()
     // bloated kwin to. Each window's bar mini-thumbnail samples this
     // small slot; sampling at low LOD is still cheap (mip cascade is
     // built once when the snapshot is rendered).
-    constexpr QSize kBarThumbSize(256, 192);
+    //
+    // In Grid View each card is ~screen/gridSize and the window thumbs
+    // are drawn large, so 256x192 reads blocky. Size the slot to the
+    // card resolution instead (screen / gridSize). This is self-
+    // balancing — more virtual desktops means a larger gridSize, hence
+    // smaller cards and smaller thumbs — so atlas use stays bounded,
+    // and Grid View has the whole atlas to itself anyway (the overview
+    // heap's large slots are skipped in reserveSlotsForCurrentDesktop).
+    QSize kBarThumbSize(256, 192);
+    if (m_mode == Mode::GridView) {
+        const int gridSize = std::max({1, effects->desktopGridWidth(),
+                                       effects->desktopGridHeight()});
+        const QRect vs = effects->virtualScreenGeometry();
+        kBarThumbSize = QSize(std::max(256, vs.width() / gridSize),
+                              std::max(192, vs.height() / gridSize));
+    }
 
     for (EffectWindow *ew : effects->stackingOrder()) {
         if (!ew) {
@@ -930,6 +985,7 @@ void OverviewEffectV2::releaseAllSlots()
     m_windowSlots.clear();
     m_barThumbSlots.clear();
     m_stackingIndex.clear();
+    m_gridCardRects.clear();
     m_wallpaperSlotByHandle.clear();
     m_wallpaperHandleByVd.clear();
     m_barScrollX = 0.0f;
@@ -2206,6 +2262,174 @@ bool OverviewEffectV2::drawWallpaperBackground(VkCommandBuffer cmd, const QSize 
     const float cardRight = 1.0f + (settledRight - 1.0f) * factor;
     const float cardBottom = 1.0f + (settledBottom - 1.0f) * factor;
 
+    // GridView mode replaces the single wallpaper card with a 2-D
+    // grid of per-VD wallpaper cards. The full-screen wallpaper +
+    // theme wash still draw (above) so the activation slide-in
+    // visually mirrors Overview's transition; only the card layout
+    // differs. Bar + window-grid + outlines are skipped in
+    // renderTilesPostPass when m_mode == GridView.
+    if (m_mode == Mode::GridView && effects) {
+        const int cols = std::max(1, effects->desktopGridWidth());
+        const int rows = std::max(1, effects->desktopGridHeight());
+        const auto desktopList = effects->desktops();
+        // V1's DesktopGrid scales each desktop to 1/gridSize of the
+        // FULL screen, where gridSize = max(rows, cols), applies a 2%
+        // gap (xScale 1 - 0.02), arranges the cards in a cols x rows
+        // grid and centres the whole grid. In NDC the full screen is
+        // 2x2 and is itself screen-aspect, so a card occupying
+        // 1/gridSize of the screen is a square-NDC rect of side
+        // 2/gridSize (screen-aspect, undistorted); the gap shrinks it
+        // slightly. Cell pitch is 2/gridSize on both axes; the grid is
+        // centred on (0, 0).
+        const int gridSize = std::max(rows, cols);
+        constexpr float kCardGapFrac = 0.02f;
+        const float pitch = 2.0f / float(gridSize);
+        const float side = pitch * (1.0f - kCardGapFrac);
+        m_gridCardRects.clear();
+        for (int i = 0; i < int(desktopList.size()) && i < rows * cols; ++i) {
+            VirtualDesktop *vd = desktopList[i];
+            const int row = i / cols;
+            const int col = i % cols;
+            const float cardCentreX = (float(col) - float(cols - 1) * 0.5f) * pitch;
+            const float cardCentreY = (float(row) - float(rows - 1) * 0.5f) * pitch;
+            const float cellSettledLeft = cardCentreX - side * 0.5f;
+            const float cellSettledTop = cardCentreY - side * 0.5f;
+            const float cellSettledRight = cardCentreX + side * 0.5f;
+            const float cellSettledBottom = cardCentreY + side * 0.5f;
+            // Record the settled card rect (NDC) for click hit-testing.
+            m_gridCardRects.emplace_back(
+                vd, QRectF(cellSettledLeft, cellSettledTop, cellSettledRight - cellSettledLeft, cellSettledBottom - cellSettledTop));
+            const float cellLeft = -1.0f + (cellSettledLeft - -1.0f) * factor;
+            const float cellTop = -1.0f + (cellSettledTop - -1.0f) * factor;
+            const float cellRight = 1.0f + (cellSettledRight - 1.0f) * factor;
+            const float cellBottom = 1.0f + (cellSettledBottom - 1.0f) * factor;
+
+            // Per-VD wallpaper slot (same map renderDesktopBar uses).
+            const VulkanThumbnailAtlas::Slot *wpSlot = nullptr;
+            auto hIt = m_wallpaperHandleByVd.find(vd);
+            if (hIt != m_wallpaperHandleByVd.end()) {
+                auto sIt = m_wallpaperSlotByHandle.find(hIt->second);
+                if (sIt != m_wallpaperSlotByHandle.end()
+                    && sIt->second.isValid() && sIt->second.hasContent
+                    && !sIt->second.isFallback) {
+                    wpSlot = &sIt->second;
+                }
+            }
+            OverviewQuadPushConstants cell{};
+            cell.quadRectNdc[0] = cellLeft;
+            cell.quadRectNdc[1] = cellTop;
+            cell.quadRectNdc[2] = cellRight - cellLeft;
+            cell.quadRectNdc[3] = cellBottom - cellTop;
+            if (wpSlot) {
+                cell.atlasSlotUv[0] = float(wpSlot->rect.x()) / atlasSize;
+                cell.atlasSlotUv[1] = float(wpSlot->rect.y()) / atlasSize;
+                cell.atlasSlotUv[2] = float(wpSlot->rect.width()) / atlasSize;
+                cell.atlasSlotUv[3] = float(wpSlot->rect.height()) / atlasSize;
+            } else {
+                // Fallback: solid neutral tint when the wallpaper slot
+                // hasn't been reserved (rare; reserveWallpaperSlot
+                // handles all known cases at activate-time).
+                cell.atlasSlotUv[0] = 0.0f;
+                cell.atlasSlotUv[1] = 0.0f;
+                cell.atlasSlotUv[2] = 1.0f;
+                cell.atlasSlotUv[3] = 1.0f;
+                cell.tintRgba[0] = 0.30f;
+                cell.tintRgba[1] = 0.30f;
+                cell.tintRgba[2] = 0.35f;
+                cell.tintRgba[3] = 1.0f;
+            }
+            cell.opacity = factor;
+            setCornerRadiusUv(cell, fbSize, roundedRadiusPx(kRoundedRadiusCardFrac));
+            vkCmdPushConstants(cmd, m_vkPipelineLayout,
+                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                               0, sizeof(cell), &cell);
+            vkCmdDraw(cmd, 4, 1, 0, 0);
+
+            // Draw the VD's windows on top of its card at their real
+            // positions, mirroring V1's Grid View (each card is a live
+            // mini-desktop). Same mapping as the overview bar mini-
+            // thumbnails: frameGeometry into the card rect, slot UV
+            // cropped to the frame (drops the decoration-shadow halo),
+            // drawn bottom-to-top by the frozen stacking snapshot.
+            const QRect vScreen = effects->virtualScreenGeometry();
+            const float vsW = std::max(1.0f, float(vScreen.width()));
+            const float vsH = std::max(1.0f, float(vScreen.height()));
+            struct GridWin
+            {
+                VulkanThumbnailAtlas::Slot slot;
+                QRectF frame;
+                QRectF vis;
+                int z;
+            };
+            std::vector<GridWin> gwins;
+            for (EffectWindow *ew : effects->stackingOrder()) {
+                if (!ew || !ew->isOnDesktop(vd)) {
+                    continue;
+                }
+                Window *h = ew->window();
+                if (!h) {
+                    continue;
+                }
+                auto sit = m_barThumbSlots.find(h);
+                if (sit == m_barThumbSlots.end()) {
+                    continue;
+                }
+                const auto &slot = sit->second;
+                if (slot.isFallback || !slot.hasContent) {
+                    continue;
+                }
+                const QRectF frame = h->frameGeometry();
+                const QRectF vis = h->visibleGeometry();
+                if (frame.isEmpty() || vis.isEmpty()) {
+                    continue;
+                }
+                auto zit = m_stackingIndex.find(h);
+                gwins.push_back({slot, frame, vis, zit != m_stackingIndex.end() ? zit->second : 0});
+            }
+            std::stable_sort(gwins.begin(), gwins.end(),
+                             [](const GridWin &a, const GridWin &b) {
+                return a.z < b.z;
+            });
+            const float innerX = cellLeft;
+            const float innerY = cellTop;
+            const float innerW = cellRight - cellLeft;
+            const float innerH = cellBottom - cellTop;
+            for (const GridWin &g : gwins) {
+                const float relX = float(g.frame.x() - vScreen.x()) / vsW;
+                const float relY = float(g.frame.y() - vScreen.y()) / vsH;
+                const float relW = float(g.frame.width()) / vsW;
+                const float relH = float(g.frame.height()) / vsH;
+                const float wx = innerX + std::clamp(relX, 0.0f, 1.0f) * innerW;
+                const float wy = innerY + std::clamp(relY, 0.0f, 1.0f) * innerH;
+                const float ww = std::clamp(relW, 0.0f, 1.0f) * innerW;
+                const float wh = std::clamp(relH, 0.0f, 1.0f) * innerH;
+                if (ww <= 0.0f || wh <= 0.0f) {
+                    continue;
+                }
+                const float ixL = std::clamp(float((g.frame.x() - g.vis.x()) / g.vis.width()), 0.0f, 1.0f);
+                const float iyT = std::clamp(float((g.frame.y() - g.vis.y()) / g.vis.height()), 0.0f, 1.0f);
+                const float ixR = std::clamp(float((g.vis.right() - g.frame.right()) / g.vis.width()), 0.0f, 1.0f);
+                const float iyB = std::clamp(float((g.vis.bottom() - g.frame.bottom()) / g.vis.height()), 0.0f, 1.0f);
+                OverviewQuadPushConstants w{};
+                w.quadRectNdc[0] = wx;
+                w.quadRectNdc[1] = wy;
+                w.quadRectNdc[2] = ww;
+                w.quadRectNdc[3] = wh;
+                w.atlasSlotUv[0] = (float(g.slot.rect.x()) + float(g.slot.rect.width()) * ixL) / atlasSize;
+                w.atlasSlotUv[1] = (float(g.slot.rect.y()) + float(g.slot.rect.height()) * iyT) / atlasSize;
+                w.atlasSlotUv[2] = float(g.slot.rect.width()) * (1.0f - ixL - ixR) / atlasSize;
+                w.atlasSlotUv[3] = float(g.slot.rect.height()) * (1.0f - iyT - iyB) / atlasSize;
+                w.opacity = factor;
+                setCornerRadiusUv(w, fbSize, roundedRadiusPx(kRoundedRadiusMiniFrac));
+                vkCmdPushConstants(cmd, m_vkPipelineLayout,
+                                   VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                                   0, sizeof(w), &w);
+                vkCmdDraw(cmd, 4, 1, 0, 0);
+            }
+        }
+        return true;
+    }
+
     // Pass 2.7: wallpaper-card drop shadow. V1's
     // Kirigami.ShadowedTexture wraps the per-VD card with a soft
     // 2-grid-unit drop at alpha 0.3. The shader's edgeSoftnessUv path
@@ -2346,6 +2570,15 @@ void OverviewEffectV2::drawSceneCaptureBackground(VkCommandBuffer cmd, VulkanTex
 
 void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbSize, VkFormat colorFormat)
 {
+    // GridView draws its content entirely in drawWallpaperBackground:
+    // the per-VD cards take the place of the window-grid heap and the
+    // desktop bar. Skip the rest of this function to avoid rendering
+    // the Overview-mode bar / heap / outlines / labels / search bar
+    // on top of the GridView layout. Search + drag-tile are
+    // intentional follow-ups (stage 10b in the parity execution plan).
+    if (m_mode == Mode::GridView) {
+        return;
+    }
     if (!m_atlas || !m_vulkanCtx) {
         return;
     }
@@ -3046,9 +3279,22 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
 
 void OverviewEffectV2::activate()
 {
+    activate(Mode::Overview);
+}
+
+void OverviewEffectV2::activate(Mode mode)
+{
+    // Mode change while already showing: just flip m_mode and request
+    // a repaint. The activation animation has already played; the
+    // follow-up FSM stage will add a real crossfade between modes.
     if (m_visible && m_animation.direction() == QVariantAnimation::Forward) {
+        if (m_mode != mode) {
+            m_mode = mode;
+            effects->addRepaintFull();
+        }
         return;
     }
+    m_mode = mode;
     m_visible = true;
     m_focusZone = FocusZone::None; // first arrow/Tab picks tile 0 in grid
     m_focusedIndex = -1;
@@ -3369,6 +3615,19 @@ void OverviewEffectV2::grabbedKeyboardEvent(QKeyEvent *event)
         deactivate();
         return;
     }
+    // Grid View toggle (Meta+G). KGlobalAccel can't fire
+    // m_gridViewAction while we hold the keyboard grab (see the
+    // desktop-switch note below), so recognise the default binding
+    // locally and mirror the action's toggle semantics: in GridView
+    // it dismisses (same as Escape), in Overview it flips to GridView.
+    if (event->key() == Qt::Key_G && (event->modifiers() & Qt::MetaModifier)) {
+        if (m_mode == Mode::GridView) {
+            deactivate();
+        } else {
+            activate(Mode::GridView);
+        }
+        return;
+    }
     // Backspace edits the search filter when one is active. Sits
     // before the nav handling so the same key doesn't double as
     // anything else.
@@ -3684,6 +3943,29 @@ void OverviewEffectV2::windowInputMouseEvent(QEvent *event)
     }
 
     const QPoint pos = mouseEvent->globalPosition().toPoint();
+
+#if HAVE_VULKAN
+    // Grid View handles input on its own: a left-click on a desktop
+    // card activates that desktop and dismisses the effect (V1's
+    // TapHandler-on-card behaviour). The overview heap/bar/drag paths
+    // below don't apply in this mode, so consume everything here.
+    if (m_mode == Mode::GridView) {
+        if (event->type() == QEvent::MouseButtonRelease
+            && mouseEvent->button() == Qt::LeftButton && effects) {
+            if (VirtualDesktop *vd = hitTestGridCard(pos)) {
+                VirtualDesktop *current = effects->currentDesktop();
+                // Synchronous teardown before the switch, same as the
+                // bar-click path — avoids racing the slide-out with
+                // setCurrentDesktop's OSD / desktop-change effects.
+                teardownImmediate();
+                if (vd != current) {
+                    effects->setCurrentDesktop(vd);
+                }
+            }
+        }
+        return;
+    }
+#endif
 
     if (event->type() == QEvent::MouseMove) {
         const QPoint prev = m_dragCurrentGlobal;
@@ -4126,6 +4408,27 @@ Window *OverviewEffectV2::hitTestTile(const QPoint &globalPos) const
     }
 #endif
     Q_UNUSED(globalPos)
+    return nullptr;
+}
+
+VirtualDesktop *OverviewEffectV2::hitTestGridCard(const QPoint &globalPos) const
+{
+    if (m_gridCardRects.empty() || !effects) {
+        return nullptr;
+    }
+    const QRect screen = effects->virtualScreenGeometry();
+    if (screen.isEmpty() || !screen.contains(globalPos)) {
+        return nullptr;
+    }
+    const float screenW = std::max(1.0f, float(screen.width()));
+    const float screenH = std::max(1.0f, float(screen.height()));
+    const float mxNdc = (float(globalPos.x() - screen.x()) / screenW) * 2.0f - 1.0f;
+    const float myNdc = (float(globalPos.y() - screen.y()) / screenH) * 2.0f - 1.0f;
+    for (const auto &[vd, rect] : m_gridCardRects) {
+        if (rect.contains(QPointF(mxNdc, myNdc))) {
+            return vd;
+        }
+    }
     return nullptr;
 }
 
