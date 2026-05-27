@@ -904,8 +904,15 @@ void OverviewEffectV2::rebuildTileLayout(const QSize &fbSize)
     // window heap, so the grid heap starts noticeably lower than the
     // gap-below-bar position the early V2 used (which made the search
     // bar overlap the top row of grid tiles).
-    constexpr float kGridTop = -0.70f;
-    constexpr float kGridBottom = 0.8f;
+    // V1's QML lays the per-VD card at ~87% of screen height /
+    // ~87% width on a 16:9 monitor (heap loader fills the space
+    // below topBar, extends to screen bottom). V2's previous
+    // 75% × 75% card looked visibly smaller. New range 1.70 NDC
+    // gives ~85% × 85% which closes most of the gap. kGridTop stays
+    // below the search bar's quad bottom (-0.72) so the search
+    // strip fits between the desktop bar and the grid top.
+    constexpr float kGridTop = -0.72f;
+    constexpr float kGridBottom = 0.98f;
     const float screenW = std::max(1.0f, float(fbSize.width()));
     const float screenH = std::max(1.0f, float(fbSize.height()));
     // Match the wallpaper card's settled rect (drawWallpaperBackground
@@ -973,7 +980,6 @@ void OverviewEffectV2::rebuildTileLayout(const QSize &fbSize)
 
 void OverviewEffectV2::rebuildBarLayout(const QSize &fbSize)
 {
-    Q_UNUSED(fbSize);
     m_barTiles.clear();
     m_addTileNdc = QRectF();
     if (!effects) {
@@ -983,21 +989,43 @@ void OverviewEffectV2::rebuildBarLayout(const QSize &fbSize)
     const int n = desktops.size();
     VirtualDesktop *current = effects->currentDesktop();
 
-    // Bar bounds in NDC. Positive viewport Y in the post-pass → -1 is
-    // the top of the screen. Bar gets a thin band at the top; tile
-    // width is chosen so each tile matches the screen's pixel aspect
-    // (NDC X and Y have different pixel scales, so a screen-aspect
-    // rect has equal NDC width and height). The strip is centred
-    // horizontally. Keep kBarTop+kBarHeight in sync with kGridTop in
-    // rebuildTileLayout so grid tiles and bar tiles don't overlap.
+    // Bar bounds in NDC, derived from Plasma's gridUnit so the bar
+    // scales with the user's font setting (V1 parity: V1's
+    // DesktopBar.qml uses Kirigami.Units.gridUnit * 5 for the tile
+    // height and gridUnit-derived spacing). gridUnit corresponds to
+    // QFontMetrics(qApp->font()).height(); on a default 10pt Plasma
+    // setup that's ~14-18 px.
+    //
+    // Tile width = tile height in NDC because NDC X and Y are scaled
+    // by different pixel half-extents (screenW/2 vs screenH/2), so
+    // equal NDC values give screen-aspect-correct pixel tiles.
+    //
+    // Bar label strip (gridUnit tall) sits below each tile; reserved
+    // here so other layout sites (kGridTop) can stay below the full
+    // bar zone (bar tile + label strip).
     //
     // The Add-VD tile lives at the trailing end of the strip and is
     // always rendered, even with a single desktop, so users can
     // create more VDs from inside the overview.
-    constexpr float kBarTop = -0.96f;
-    constexpr float kBarHeight = 0.16f;
-    constexpr float kGutter = 0.012f;
+    const float screenW = std::max(1.0f, float(fbSize.width()));
+    const float screenH = std::max(1.0f, float(fbSize.height()));
+    const float gridUnitPx = float(QFontMetrics(qApp->font()).height());
+    const float gridUnitNdcX = 2.0f * gridUnitPx / screenW;
+    const float gridUnitNdcY = 2.0f * gridUnitPx / screenH;
+    const float kBarTop = -1.0f + gridUnitNdcY; // 1 gridUnit top margin
+    const float kBarHeight = 5.0f * gridUnitNdcY; // V1's desktopHeight
+    // Reserve no space for labels yet -- the label draw is the next
+    // step in stage 3b. When labels land, set this to gridUnitNdcY
+    // to match V1's column = desktopHeight + gridUnit layout.
+    const float kBarLabelStrip = 0.0f;
+    // V1's Row spacing in DesktopBar.qml defaults to smallSpacing
+    // (~gridUnit/4.5 in Plasma's Kirigami.Units). Approximate.
+    const float kGutter = gridUnitNdcX * 0.22f;
     const float tileW = kBarHeight; // → screen aspect in pixel space
+    m_barTopNdc = kBarTop;
+    m_barHeightNdc = kBarHeight;
+    m_barTileWidthNdc = tileW;
+    m_barLabelStripNdc = kBarLabelStrip;
     const int totalSlots = n + 1; // desktop tiles + Add tile
     const float stripW = totalSlots * tileW + (totalSlots - 1) * kGutter;
     m_barStripWidthNdc = stripW;
@@ -1317,16 +1345,16 @@ void OverviewEffectV2::updateSearchTexture()
         return;
     }
 
-    // Fixed-size bar so the texture is allocated once per overview and
-    // reused for every keystroke (the 4096-byte alignment + dedicated-
-    // allocation work makes per-keystroke vmaCreateImage cheap, but a
-    // stable size means VulkanTexture::upload can reuse the existing
-    // image when the dimensions match). 360x32 matches V1's
-    // PlasmaExtras.SearchField at default DPI: 20 * gridUnit (18 px)
-    // wide, ~32 px tall (system font + Kirigami inner padding).
-    // Overflowing strings elide at draw time.
-    constexpr int kWidth = 360;
-    constexpr int kHeight = 32;
+    // Bar dimensions derived from gridUnit (= QFontMetrics(font).height
+    // = ~Kirigami.Units.gridUnit on the C++ side). V1's QML uses
+    // Math.min(parent.width, 20 * gridUnit) for the SearchField width
+    // and the system font height (plus theme padding ~= half gridUnit
+    // on each side) for the height. Result scales with the user's
+    // font / DPI setting so HiDPI users get a proportionally larger
+    // bar instead of a tiny stripe.
+    const int gridUnitPx = QFontMetrics(qApp->font()).height();
+    const int kWidth = 20 * gridUnitPx;
+    const int kHeight = 2 * gridUnitPx;
     const QSize size(kWidth, kHeight);
 
     QImage img(size, QImage::Format_RGBA8888_Premultiplied);
@@ -1360,8 +1388,8 @@ void OverviewEffectV2::updateSearchTexture()
     // icons are typically dark glyphs; recolour to the text colour
     // so the icon stays visible against the dark bar background and
     // reads as continuous with the typed text.
-    constexpr int kIconSize = 18;
-    constexpr int kIconX = 10;
+    const int kIconSize = gridUnitPx;
+    const int kIconX = gridUnitPx / 2;
     const QColor textColor(255, 255, 255, 240);
     const int iconY = (kHeight - kIconSize) / 2;
     const QIcon searchIcon = QIcon::fromTheme(QStringLiteral("search-symbolic"),
@@ -1440,9 +1468,14 @@ void OverviewEffectV2::ensureNoMatchesTexture()
     const QString text = i18ndc("kwin_x11",
                                 "@info:placeholder Shown in the overview when search has no results",
                                 "No matching windows");
-    constexpr int kSidePad = 18;
-    const int kHeight = fm.height() + 12;
-    const int width = std::max(160, fm.horizontalAdvance(text) + 2 * kSidePad);
+    // gridUnit-derived side padding + minimum width so the placeholder
+    // scales with the user's font setting alongside V1's Kirigami
+    // PlaceholderMessage sizing.
+    const int gridUnitPx = QFontMetrics(qApp->font()).height();
+    const int kSidePad = gridUnitPx;
+    const int kHeight = fm.height() + gridUnitPx; // half gridUnit padding each side
+    const int width = std::max(8 * gridUnitPx,
+                               fm.horizontalAdvance(text) + 2 * kSidePad);
     const QSize size(width, kHeight);
 
     QImage img(size, QImage::Format_RGBA8888_Premultiplied);
@@ -1922,8 +1955,8 @@ bool OverviewEffectV2::drawWallpaperBackground(VkCommandBuffer cmd, const QSize 
     // dedicated shader and are deferred; this pass paints the sharp
     // wallpaper at the animated rect so the user sees the desktop
     // preview beneath the tile grid.
-    constexpr float kGridTopNdc = -0.70f; // matches kGridTop in rebuildTileLayout
-    constexpr float kGridBottomNdc = 0.8f; // matches kGridBottom
+    constexpr float kGridTopNdc = -0.72f; // matches kGridTop in rebuildTileLayout
+    constexpr float kGridBottomNdc = 0.98f; // matches kGridBottom
     const float screenWf = std::max(1.0f, float(fbSize.width()));
     const float screenHf = std::max(1.0f, float(fbSize.height()));
     // Settled (factor = 1) card: largest screen-aspect rect that
@@ -2407,20 +2440,25 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
     updateSearchTexture();
     if (m_searchTexture && m_searchTexture->isValid()) {
         pushView(m_searchTexture->imageView());
-        // NDC search-bar geometry. The bar sits in the strip between
-        // kBarTop+kBarHeight (≈ -0.80) and kGridTop (-0.70), centred
-        // vertically in that ~0.10-NDC strip. V1's QML keeps the
-        // SearchField on its own row above the grid heap rather than
-        // floating into the top row of windows; we mirror that.
-        // Width = 800/screenW (matches the texture's pixel size so
-        // we sample 1:1 and the text stays crisp).
+        // NDC search-bar geometry. V1's topBar anchors to
+        // desktopBar.bottom + largeSpacing (= 1 gridUnit), so the
+        // search bar sits 1 gridUnit below the bar zone (bar tile +
+        // label strip). We mirror that with m_barTopNdc /
+        // m_barHeightNdc / m_barLabelStripNdc populated by
+        // rebuildBarLayout. Width samples the texture 1:1 so text
+        // stays crisp; the texture itself is gridUnit-sized in
+        // updateSearchTexture.
         const float texPxW = float(m_searchTextureSize.width());
         const float texPxH = float(m_searchTextureSize.height());
-        const float ndcW = 2.0f * texPxW / std::max(1.0f, float(fbSize.width()));
-        const float ndcH = 2.0f * texPxH / std::max(1.0f, float(fbSize.height()));
+        const float screenW = std::max(1.0f, float(fbSize.width()));
+        const float screenH = std::max(1.0f, float(fbSize.height()));
+        const float ndcW = 2.0f * texPxW / screenW;
+        const float ndcH = 2.0f * texPxH / screenH;
         const float ndcX = -ndcW * 0.5f;
-        // Centre vertically in the [-0.80, -0.70] search-bar strip.
-        const float ndcY = -0.75f - ndcH * 0.5f;
+        const float gridUnitNdcY = 2.0f * float(QFontMetrics(qApp->font()).height())
+            / screenH;
+        const float barZoneBottom = m_barTopNdc + m_barHeightNdc + m_barLabelStripNdc;
+        const float ndcY = barZoneBottom + gridUnitNdcY * 0.5f;
         OverviewQuadPushConstants pc{};
         pc.quadRectNdc[0] = ndcX;
         pc.quadRectNdc[1] = ndcY;
@@ -3149,11 +3187,14 @@ void OverviewEffectV2::windowInputMouseEvent(QEvent *event)
             return;
         }
         const QPoint pos = wheel->globalPosition().toPoint();
-        // Bar zone: top ~9% of the screen (kBarTop=-0.96, kBarHeight=0.16
-        // → 2% to ~18% of screen height). Wheel only counts when the
-        // cursor is over the bar strip.
-        const int barTopPx = screen.y() + int(0.02 * screen.height());
-        const int barBottomPx = barTopPx + int(0.16 * screen.height());
+        // Bar zone covers the bar tile + label strip below it.
+        // Computed from the gridUnit-derived member variables that
+        // rebuildBarLayout populates so the hit-test stays in sync
+        // with rendering regardless of the user's font / DPI.
+        const int barTopPx = screen.y()
+            + int((m_barTopNdc + 1.0f) * 0.5f * screen.height());
+        const int barBottomPx = barTopPx
+            + int((m_barHeightNdc + m_barLabelStripNdc) * 0.5f * screen.height());
         if (pos.y() < barTopPx || pos.y() > barBottomPx) {
             return;
         }
@@ -3294,14 +3335,18 @@ void OverviewEffectV2::windowInputMouseEvent(QEvent *event)
             // extra throttling needed here.
             const QRect newRect = draggedTileScreenRect(pos);
             QRegion damage = QRegion(m_dragLastDamage).united(QRegion(newRect));
-            // Bar strip (kBarTop=-0.96, kBarHeight=0.16 in NDC → top
-            // ~9% of the screen). Cheap addition; covers any bar tile
-            // the cursor enters or leaves between frames.
+            // Bar strip damage region: derived from gridUnit-aware
+            // member variables so the repaint covers exactly the bar
+            // tile + label strip area, with a small pad so a tile
+            // leaving the cursor doesn't leave a smear.
             if (effects) {
                 const QRect screen = effects->virtualScreenGeometry();
                 if (!screen.isEmpty()) {
-                    const int barTopPx = screen.y() + int(0.02 * screen.height());
-                    const int barHeightPx = int(0.16 * screen.height()) + kDragDamagePadPx * 2;
+                    const int barTopPx = screen.y()
+                        + int((m_barTopNdc + 1.0f) * 0.5f * screen.height());
+                    const int barHeightPx = int((m_barHeightNdc + m_barLabelStripNdc)
+                                                * 0.5f * screen.height())
+                        + kDragDamagePadPx * 2;
                     damage += QRect(screen.x(), barTopPx, screen.width(), barHeightPx);
                 }
             }

@@ -253,6 +253,20 @@ private:
     QSize m_noMatchesTextureSize;
     void ensureNoMatchesTexture();
 
+    /// Per-VirtualDesktop label textures rendered below the desktop
+    /// bar tile (V1 parity: DesktopBar.qml gives each bar tile a
+    /// label strip showing the desktop name). Built lazily per VD,
+    /// invalidated on rename via the VirtualDesktop::nameChanged
+    /// signal, dropped wholesale in releaseAllSlots.
+    struct BarLabelEntry
+    {
+        std::unique_ptr<VulkanTexture> texture;
+        QSize size;
+        QString renderedName;
+    };
+    std::unordered_map<VirtualDesktop *, BarLabelEntry> m_barLabels;
+    VulkanTexture *ensureBarLabelTexture(VirtualDesktop *vd, QSize *outSize);
+
     /// Persistent icon textures for the bar's Add ("+") and Delete
     /// ("×") affordances. QPainter-rendered into transparent
     /// QImages, uploaded once per V2 lifetime — the icons don't
@@ -293,6 +307,18 @@ private:
     /// Computed in rebuildBarLayout; used to clamp m_barScrollX and
     /// to gate wheel input (don't react if the strip fits).
     float m_barStripWidthNdc = 0.0f;
+    /// Bar geometry in NDC, derived from qApp->font() metrics in
+    /// rebuildBarLayout (gridUnit = QFontMetrics::height) so the bar
+    /// scales with the Plasma theme's font size, matching V1's
+    /// Kirigami.Units.gridUnit behaviour. Other sites (hit-test,
+    /// damage tracking, wheel handler) read these instead of
+    /// hardcoded -0.96 / 0.16 NDC.
+    float m_barTopNdc = -0.96f;
+    float m_barHeightNdc = 0.16f;
+    float m_barTileWidthNdc = 0.16f;
+    /// Label strip below each bar tile -- V1's DesktopBar column
+    /// has a gridUnit-tall label area; 0 disables (legacy layout).
+    float m_barLabelStripNdc = 0.0f;
 
     Window *m_dragCandidate = nullptr;
     QPoint m_dragPressGlobal;
