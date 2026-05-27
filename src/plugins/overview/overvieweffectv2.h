@@ -476,6 +476,16 @@ private:
     /// dropped at deactivate.
     std::unordered_map<Window *, VulkanThumbnailAtlas::Slot> m_barThumbSlots;
 
+    /// Stable stacking-order index per window, snapshotted once when
+    /// the overview activates. The real-position bar mini-thumbnails
+    /// overlap, so their draw order is significant; querying the live
+    /// effects->stackingOrder() every frame lets the order shift mid-
+    /// animation (the activated window gets raised), which reads as the
+    /// bar thumbnails reshuffling their z-order. Sorting by this frozen
+    /// snapshot keeps the bar stacking steady for the overview lifetime.
+    /// Cleared in releaseAllSlots.
+    std::unordered_map<const Window *, int> m_stackingIndex;
+
     /// Atlas slots holding the desktop wallpaper. Two-level indirection
     /// so we dedup slots when Plasma uses a single sticky desktop window
     /// for all virtual desktops (the common case): one slot per unique

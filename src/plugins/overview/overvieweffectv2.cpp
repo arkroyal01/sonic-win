@@ -565,6 +565,19 @@ void OverviewEffectV2::reserveSlotsForCurrentDesktop()
         return;
     }
 
+    // Freeze the current global stacking order so the overlapping bar
+    // mini-thumbnails keep a stable z-order for the whole activation,
+    // independent of any live raise/lower during the animation.
+    m_stackingIndex.clear();
+    {
+        int z = 0;
+        for (EffectWindow *ew : effects->stackingOrder()) {
+            if (ew && ew->window()) {
+                m_stackingIndex.emplace(ew->window(), z++);
+            }
+        }
+    }
+
     // Walk current-desktop windows in stacking order and reserve one
     // atlas slot per window, sized to the window's visible geometry
     // (matching the rendered region in WindowThumbnailSource's existing
@@ -798,12 +811,20 @@ void OverviewEffectV2::reserveBarThumbs()
     constexpr QSize kBarThumbSize(256, 192);
 
     for (EffectWindow *ew : effects->stackingOrder()) {
-        if (!ew || ew->isOnDesktop(currentDesktop)) {
-            // Current-desktop windows already have a full-size slot
-            // in m_windowSlots — the bar pass samples that for their
-            // mini-thumbnail.
+        if (!ew) {
             continue;
         }
+        // A small bar thumb is reserved for EVERY window, including
+        // current-desktop ones. The bar previously reused the large
+        // m_windowSlots entry for current-desktop windows, but under
+        // atlas pressure those large reservations spill to fallback
+        // slots (dedicated images, not atlas-resident), which the bar
+        // pass cannot sample with the shared atlas descriptor — so the
+        // window silently vanished from the bar whenever its desktop
+        // was current. A dedicated 256x192 atlas thumb always fits
+        // (fallback grid slots don't consume atlas space), keeping the
+        // bar robust and uniform across current and non-current tiles.
+        const bool onCurrent = ew->isOnDesktop(currentDesktop);
         Window *handle = ew->window();
         if (!handle) {
             continue;
@@ -841,12 +862,15 @@ void OverviewEffectV2::reserveBarThumbs()
         // other VDs' windows. Offscreen rendering still works for
         // the mini-thumb atlas because the explicit
         // refOffscreenRendering() call above is independent of the
-        // paint-disabled flag.
-        m_barThumbVisRefs.emplace_back(
-            ew,
-            EffectWindow::PAINT_DISABLED
-                | EffectWindow::PAINT_DISABLED_BY_MINIMIZE
-                | EffectWindow::PAINT_DISABLED_BY_ACTIVITY);
+        // paint-disabled flag. Current-desktop windows are already
+        // painted normally, so they need no visibility override.
+        if (!onCurrent) {
+            m_barThumbVisRefs.emplace_back(
+                ew,
+                EffectWindow::PAINT_DISABLED
+                    | EffectWindow::PAINT_DISABLED_BY_MINIMIZE
+                    | EffectWindow::PAINT_DISABLED_BY_ACTIVITY);
+        }
         m_barThumbSlots.emplace(handle, std::move(slot));
         // Drop the snapshot slot if the window dies during overview.
         connect(handle, &QObject::destroyed, this, [this, handle]() {
@@ -905,6 +929,7 @@ void OverviewEffectV2::releaseAllSlots()
     }
     m_windowSlots.clear();
     m_barThumbSlots.clear();
+    m_stackingIndex.clear();
     m_wallpaperSlotByHandle.clear();
     m_wallpaperHandleByVd.clear();
     m_barScrollX = 0.0f;
@@ -1183,8 +1208,6 @@ void OverviewEffectV2::renderDesktopBar(VkCommandBuffer cmd, const QSize &fbSize
     if ((m_barTiles.empty() && m_addTileNdc.isEmpty()) || m_vkPipelineLayout == VK_NULL_HANDLE) {
         return;
     }
-    const float screenW = std::max(1.0f, float(fbSize.width()));
-    const float screenH = std::max(1.0f, float(fbSize.height()));
     // The pipeline is already bound, descriptor set 0 already has an
     // atlas-or-fallback image bound from the window-tile passes (the
     // shader doesn't sample it when tintRgba.a == 1, but Vulkan still
@@ -1272,20 +1295,28 @@ void OverviewEffectV2::renderDesktopBar(VkCommandBuffer cmd, const QSize &fbSize
         vkCmdDraw(cmd, 4, 1, 0, 0);
     }
 
-    // Mini-thumbnails inside each bar tile. Current-desktop windows
-    // use the full-size slot from m_windowSlots (sampled at low LOD
-    // via the mip cascade); non-current-desktop windows use the small
-    // static snapshot in m_barThumbSlots. Both are atlas-resident
-    // and share the descriptor the caller already bound. Fallback
-    // slots are rare (only m_windowSlots can overflow; snapshots are
-    // sized small enough to always fit) and skipped here to avoid
-    // per-thumb descriptor switching — the bar tile's solid colour
-    // still shows for that window.
+    // Mini-thumbnails inside each bar tile. Real-position layout
+    // (V1's DesktopView parity): each window maps to a scaled-down
+    // copy of its actual on-screen rect within the bar tile, so the
+    // user sees the desktop's real arrangement at a glance rather
+    // than a generic grid of caption-less rectangles. Position is
+    // computed from visibleGeometry() relative to the virtual screen
+    // and scaled into the bar tile's inner-padded rect.
+    //
+    // Current-desktop windows use the full-size slot from
+    // m_windowSlots (sampled at low LOD via the mip cascade); non-
+    // current-desktop windows use the small static snapshot in
+    // m_barThumbSlots. Both are atlas-resident and share the
+    // descriptor the caller already bound. Fallback slots are skipped
+    // here to avoid per-thumb descriptor switching -- the bar tile's
+    // solid colour still shows for that window.
     if (!effects) {
         return;
     }
     constexpr float kBarInnerPad = 0.08f;
-    auto *currentDesktop = effects->currentDesktop();
+    const QRect virtualScreen = effects->virtualScreenGeometry();
+    const float vsWf = std::max(1.0f, float(virtualScreen.width()));
+    const float vsHf = std::max(1.0f, float(virtualScreen.height()));
     for (const BarTile &b : m_barTiles) {
         if (!b.desktop) {
             continue;
@@ -1293,16 +1324,21 @@ void OverviewEffectV2::renderDesktopBar(VkCommandBuffer cmd, const QSize &fbSize
         struct MiniSrc
         {
             VulkanThumbnailAtlas::Slot slot;
-            float aspect;
+            QRectF frame; // window frame rect, virtual-screen px
+            QRectF vis; // visible rect (frame + shadow halo), same space
+            int z; // frozen stacking index (bottom..top)
         };
         std::vector<MiniSrc> srcs;
-        const bool isCurrentTile = (b.desktop == currentDesktop);
         for (EffectWindow *ew : effects->stackingOrder()) {
             if (!ew || !ew->isOnDesktop(b.desktop)) {
                 continue;
             }
             Window *handle = ew->window();
-            const auto &lookupMap = isCurrentTile ? m_windowSlots : m_barThumbSlots;
+            // Always sample the small bar-thumb slot, for every tile.
+            // Current-desktop windows have one too now (see
+            // reserveBarThumbs) so the bar never depends on the large,
+            // atlas-pressure-prone m_windowSlots entries.
+            const auto &lookupMap = m_barThumbSlots;
             auto it = lookupMap.find(handle);
             if (it == lookupMap.end()) {
                 continue;
@@ -1311,60 +1347,69 @@ void OverviewEffectV2::renderDesktopBar(VkCommandBuffer cmd, const QSize &fbSize
             if (slot.isFallback || !slot.hasContent) {
                 continue;
             }
-            const QRectF g = handle->visibleGeometry();
-            if (g.isEmpty()) {
+            // Place by frameGeometry(): it is the authoritative, always-
+            // current window rect, whereas visibleGeometry() (the
+            // WindowItem's scene-mapped bounding rect) can lag behind a
+            // move performed while the overview was closed, leaving the
+            // mini-thumbnail at a stale position. visibleGeometry is
+            // still needed for the slot UV crop, since the slot content
+            // spans it (frame + decoration-shadow halo).
+            const QRectF frame = handle->frameGeometry();
+            const QRectF vis = handle->visibleGeometry();
+            if (frame.isEmpty() || vis.isEmpty()) {
                 continue;
             }
-            srcs.push_back({slot, float(g.width() / std::max(1.0, g.height()))});
+            auto zit = m_stackingIndex.find(handle);
+            const int z = (zit != m_stackingIndex.end()) ? zit->second : 0;
+            srcs.push_back({slot, frame, vis, z});
         }
         if (srcs.empty()) {
             continue;
         }
-        const int miniN = int(srcs.size());
-        const int miniCols = std::max(1, int(std::ceil(std::sqrt(double(miniN)))));
-        const int miniRows = (miniN + miniCols - 1) / miniCols;
+        // Draw bottom-to-top using the frozen stacking snapshot so the
+        // overlapping mini-thumbnails keep a steady z-order through the
+        // activation animation (stable_sort keeps reservation order for
+        // any ties).
+        std::stable_sort(srcs.begin(), srcs.end(),
+                         [](const MiniSrc &a, const MiniSrc &b) {
+            return a.z < b.z;
+        });
         const float padX = b.ndcW * kBarInnerPad;
         const float padY = b.ndcH * kBarInnerPad;
         const float innerW = b.ndcW - 2 * padX;
         const float innerH = b.ndcH - 2 * padY;
-        const float cellW = innerW / miniCols;
-        const float cellH = innerH / miniRows;
-        const float originX = b.ndcX + padX;
-        const float originY = b.ndcY + padY;
-        // Aspect-preserving fit in pixel space (cells inherit the bar
-        // tile's screen-aspect pixel shape, so an NDC-only fit would
-        // distort).
-        const float cellPxW = cellW * 0.5f * screenW;
-        const float cellPxH = cellH * 0.5f * screenH;
-        const float cellPxAspect = cellPxW / std::max(1e-6f, cellPxH);
-        for (int i = 0; i < miniN; ++i) {
-            const MiniSrc &s = srcs[i];
-            const int col = i % miniCols;
-            const int row = i / miniCols;
-            float tilePxW;
-            float tilePxH;
-            if (s.aspect > cellPxAspect) {
-                tilePxW = cellPxW;
-                tilePxH = cellPxW / std::max(0.01f, s.aspect);
-            } else {
-                tilePxH = cellPxH;
-                tilePxW = cellPxH * s.aspect;
+        const float innerX = b.ndcX + padX;
+        const float innerY = b.ndcY + padY;
+        for (const MiniSrc &s : srcs) {
+            const float relX = float(s.frame.x() - virtualScreen.x()) / vsWf;
+            const float relY = float(s.frame.y() - virtualScreen.y()) / vsHf;
+            const float relW = float(s.frame.width()) / vsWf;
+            const float relH = float(s.frame.height()) / vsHf;
+            const float x = innerX + std::clamp(relX, 0.0f, 1.0f) * innerW;
+            const float y = innerY + std::clamp(relY, 0.0f, 1.0f) * innerH;
+            const float w = std::clamp(relW, 0.0f, 1.0f) * innerW;
+            const float h = std::clamp(relH, 0.0f, 1.0f) * innerH;
+            if (w <= 0.0f || h <= 0.0f) {
+                continue;
             }
-            const float tileW_ndc = 2.0f * tilePxW / screenW;
-            const float tileH_ndc = 2.0f * tilePxH / screenH;
-            const float x = originX + col * cellW + (cellW - tileW_ndc) * 0.5f;
-            const float y = originY + row * cellH + (cellH - tileH_ndc) * 0.5f;
+            // Slot content spans the visible rect (frame + shadow halo);
+            // the quad is the frame only, so sample the frame sub-region
+            // of the slot to crop the halo — same as the grid tiles.
+            const float ixL = std::clamp(float((s.frame.x() - s.vis.x()) / s.vis.width()), 0.0f, 1.0f);
+            const float iyT = std::clamp(float((s.frame.y() - s.vis.y()) / s.vis.height()), 0.0f, 1.0f);
+            const float ixR = std::clamp(float((s.vis.right() - s.frame.right()) / s.vis.width()), 0.0f, 1.0f);
+            const float iyB = std::clamp(float((s.vis.bottom() - s.frame.bottom()) / s.vis.height()), 0.0f, 1.0f);
 
             OverviewQuadPushConstants pc{};
             pc.quadRectNdc[0] = x;
             pc.quadRectNdc[1] = y;
-            pc.quadRectNdc[2] = tileW_ndc;
-            pc.quadRectNdc[3] = tileH_ndc;
+            pc.quadRectNdc[2] = w;
+            pc.quadRectNdc[3] = h;
             setCornerRadiusUv(pc, fbSize, roundedRadiusPx(kRoundedRadiusMiniFrac));
-            pc.atlasSlotUv[0] = float(s.slot.rect.x()) / atlasSize;
-            pc.atlasSlotUv[1] = float(s.slot.rect.y()) / atlasSize;
-            pc.atlasSlotUv[2] = float(s.slot.rect.width()) / atlasSize;
-            pc.atlasSlotUv[3] = float(s.slot.rect.height()) / atlasSize;
+            pc.atlasSlotUv[0] = (float(s.slot.rect.x()) + float(s.slot.rect.width()) * ixL) / atlasSize;
+            pc.atlasSlotUv[1] = (float(s.slot.rect.y()) + float(s.slot.rect.height()) * iyT) / atlasSize;
+            pc.atlasSlotUv[2] = float(s.slot.rect.width()) * (1.0f - ixL - ixR) / atlasSize;
+            pc.atlasSlotUv[3] = float(s.slot.rect.height()) * (1.0f - iyT - iyB) / atlasSize;
             // tintRgba.a = 0 → pure atlas sample.
             pc.opacity = factor;
             vkCmdPushConstants(cmd, m_vkPipelineLayout,
