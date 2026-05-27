@@ -151,6 +151,51 @@ inline float roundedRadiusPx(float gridUnitFrac)
 {
     return gridUnitFrac * float(QFontMetrics(qApp->font()).height());
 }
+
+// Fill a push-constants struct with a Breeze-style soft drop shadow
+// for an inner rounded rect at (innerLeftNdc, innerTopNdc) of size
+// (innerWNdc, innerHNdc). Uses the shader's rounded-box SDF mode --
+// shadowInnerHalfUv + shadowCornerRadiusUv + edgeSoftnessUv path --
+// so the alpha smoothsteps to zero outside the inner boundary
+// (Gaussian-like falloff in one fragment per pixel).
+//   spreadPx   = how far the shadow extends past the inner rect
+//                on each side (= softness distance)
+//   yOffsetPx  = downward offset of the shadow's centre vs the inner
+//                rect's centre (makes the shadow sit below the
+//                inner rect, like a real drop shadow)
+//   radiusPx   = inner rect's corner radius
+//   alpha      = peak alpha of the shadow (typically 0.25-0.55)
+inline void setupShadowPc(OverviewQuadPushConstants &pc, const QSize &fbSize,
+                          float innerLeftNdc, float innerTopNdc,
+                          float innerWNdc, float innerHNdc,
+                          float radiusPx, float spreadPx, float yOffsetPx,
+                          float alpha)
+{
+    const float screenW = std::max(1.0f, float(fbSize.width()));
+    const float screenH = std::max(1.0f, float(fbSize.height()));
+    const float innerHalfWPx = innerWNdc * screenW * 0.25f;
+    const float innerHalfHPx = innerHNdc * screenH * 0.25f;
+    const float quadHalfPxX = innerHalfWPx + spreadPx;
+    const float quadHalfPxY = innerHalfHPx + spreadPx;
+    const float spreadNdcX = 2.0f * spreadPx / screenW;
+    const float spreadNdcY = 2.0f * spreadPx / screenH;
+    const float yOffsetNdc = 2.0f * yOffsetPx / screenH;
+
+    pc.quadRectNdc[0] = innerLeftNdc - spreadNdcX;
+    pc.quadRectNdc[1] = innerTopNdc + yOffsetNdc - spreadNdcY;
+    pc.quadRectNdc[2] = innerWNdc + 2.0f * spreadNdcX;
+    pc.quadRectNdc[3] = innerHNdc + 2.0f * spreadNdcY;
+    pc.atlasSlotUv[0] = 0.0f;
+    pc.atlasSlotUv[1] = 0.0f;
+    pc.atlasSlotUv[2] = 1.0f;
+    pc.atlasSlotUv[3] = 1.0f;
+    pc.tintRgba[3] = 1.0f; // solid tint (rgb stays 0 → black)
+    pc.opacity = alpha;
+    pc.shadowInnerHalfUv[0] = innerHalfWPx / quadHalfPxX;
+    pc.shadowInnerHalfUv[1] = innerHalfHPx / quadHalfPxY;
+    pc.shadowCornerRadiusUv = radiusPx / std::max(1.0f, quadHalfPxX);
+    pc.edgeSoftnessUv = spreadPx / std::max(1.0f, quadHalfPxX);
+}
 } // namespace
 
 #endif // HAVE_VULKAN
@@ -2044,36 +2089,12 @@ bool OverviewEffectV2::drawWallpaperBackground(VkCommandBuffer cmd, const QSize 
         constexpr float kShadowSpreadPx = 32.0f;
         constexpr float kShadowYOffsetPx = 8.0f;
         constexpr float kShadowAlpha = 0.55f;
-        const float cardWidthPx = (cardRight - cardLeft) * screenWf * 0.5f;
-        const float cardHeightPx = (cardBottom - cardTop) * screenHf * 0.5f;
-        const float quadHalfPxX = cardWidthPx * 0.5f + kShadowSpreadPx;
-        const float quadHalfPxY = cardHeightPx * 0.5f + kShadowSpreadPx;
-        const float spreadNdcX = 2.0f * kShadowSpreadPx / screenWf;
-        const float spreadNdcY = 2.0f * kShadowSpreadPx / screenHf;
-        const float yOffsetNdc = 2.0f * kShadowYOffsetPx / screenHf;
-        const float cardRadiusPx = roundedRadiusPx(kRoundedRadiusCardFrac);
-
         OverviewQuadPushConstants shadow{};
-        shadow.quadRectNdc[0] = cardLeft - spreadNdcX;
-        shadow.quadRectNdc[1] = cardTop + yOffsetNdc - spreadNdcY;
-        shadow.quadRectNdc[2] = (cardRight - cardLeft) + 2.0f * spreadNdcX;
-        shadow.quadRectNdc[3] = (cardBottom - cardTop) + 2.0f * spreadNdcY;
-        shadow.atlasSlotUv[0] = 0.0f;
-        shadow.atlasSlotUv[1] = 0.0f;
-        shadow.atlasSlotUv[2] = 1.0f;
-        shadow.atlasSlotUv[3] = 1.0f;
-        shadow.tintRgba[3] = 1.0f; // solid black tint (rgb = 0 already)
-        shadow.opacity = kShadowAlpha * factor;
-        // Inner rounded-box parameters in the quad's UV space. The
-        // shader's rounded-box SDF returns negative inside this
-        // rect, zero on its boundary, positive outside; alpha then
-        // smoothsteps from 1 at the boundary to 0 at edgeSoftnessUv.
-        shadow.shadowInnerHalfUv[0] = cardWidthPx * 0.5f / quadHalfPxX;
-        shadow.shadowInnerHalfUv[1] = cardHeightPx * 0.5f / quadHalfPxY;
-        shadow.shadowCornerRadiusUv = cardRadiusPx / quadHalfPxX;
-        // Fade over (most of) the spread distance so the shadow
-        // tapers to invisible exactly at the quad edge.
-        shadow.edgeSoftnessUv = kShadowSpreadPx / quadHalfPxX;
+        setupShadowPc(shadow, fbSize, cardLeft, cardTop,
+                      cardRight - cardLeft, cardBottom - cardTop,
+                      roundedRadiusPx(kRoundedRadiusCardFrac),
+                      kShadowSpreadPx, kShadowYOffsetPx,
+                      kShadowAlpha * factor);
         vkCmdPushConstants(cmd, m_vkPipelineLayout,
                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                            0, sizeof(shadow), &shadow);
@@ -2264,22 +2285,70 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
         : QPointF(0, 0);
     auto pushAndDraw = [&](const TileLayout &t, float uvX, float uvY, float uvW, float uvH) {
         const bool dragging = m_dragActive && t.handle == m_dragCandidate;
-        OverviewQuadPushConstants pc{};
-        pc.quadRectNdc[0] = t.realNdcX + (t.gridNdcX - t.realNdcX) * factor
+        const float baseNdcX = t.realNdcX + (t.gridNdcX - t.realNdcX) * factor
             + (dragging ? float(dragOffsetNdc.x()) : 0.0f);
-        pc.quadRectNdc[1] = t.realNdcY + (t.gridNdcY - t.realNdcY) * factor
+        const float baseNdcY = t.realNdcY + (t.gridNdcY - t.realNdcY) * factor
             + (dragging ? float(dragOffsetNdc.y()) : 0.0f);
-        pc.quadRectNdc[2] = t.realNdcW + (t.gridNdcW - t.realNdcW) * factor;
-        pc.quadRectNdc[3] = t.realNdcH + (t.gridNdcH - t.realNdcH) * factor;
-        // Tiles lerp between real (factor=0) and grid (factor=1) rects;
-        // both come from real client geometry so radius interpolation
-        // would also lerp visually — but the activation animation is
-        // fast enough that we just compute against the current rect.
-        setCornerRadiusUv(pc, fbSize, roundedRadiusPx(kRoundedRadiusTileFrac));
-        pc.atlasSlotUv[0] = uvX;
-        pc.atlasSlotUv[1] = uvY;
-        pc.atlasSlotUv[2] = uvW;
-        pc.atlasSlotUv[3] = uvH;
+        const float baseNdcW = t.realNdcW + (t.gridNdcW - t.realNdcW) * factor;
+        const float baseNdcH = t.realNdcH + (t.gridNdcH - t.realNdcH) * factor;
+
+        // The atlas slot was reserved at visibleGeometry size, so it
+        // contains the window's decoration drop-shadow halo as part
+        // of the rendered content. That halo reads as a chunky black
+        // outline on every tile when it shouldn't be visible. Inset
+        // both the drawn tile rect AND the UV sample by the frame-vs-
+        // visible ratios so we crop the shadow halo away cleanly --
+        // tile = frame portion only, no halo.
+        float ixL = 0.0f, iyT = 0.0f, ixR = 0.0f, iyB = 0.0f;
+        if (t.handle) {
+            const QRectF vis = t.handle->visibleGeometry();
+            const QRectF frame = t.handle->frameGeometry();
+            if (vis.width() > 0.0 && vis.height() > 0.0) {
+                ixL = float((frame.x() - vis.x()) / vis.width());
+                iyT = float((frame.y() - vis.y()) / vis.height());
+                ixR = float((vis.right() - frame.right()) / vis.width());
+                iyB = float((vis.bottom() - frame.bottom()) / vis.height());
+                ixL = std::max(0.0f, ixL);
+                iyT = std::max(0.0f, iyT);
+                ixR = std::max(0.0f, ixR);
+                iyB = std::max(0.0f, iyB);
+            }
+        }
+        const float tileNdcX = baseNdcX + baseNdcW * ixL;
+        const float tileNdcY = baseNdcY + baseNdcH * iyT;
+        const float tileNdcW = baseNdcW * (1.0f - ixL - ixR);
+        const float tileNdcH = baseNdcH * (1.0f - iyT - iyB);
+        const float tileRadiusPx = roundedRadiusPx(kRoundedRadiusTileFrac);
+
+        // Subtle SDF drop shadow under each grid tile so the tiles
+        // read as floating against the wallpaper card. Now that the
+        // baked decoration-shadow halo is cropped away (UV inset
+        // above), this is purely additive instead of doubling with
+        // the existing halo.
+        if (factor > 0.05f) {
+            constexpr float kTileShadowSpreadPx = 10.0f;
+            constexpr float kTileShadowYOffsetPx = 4.0f;
+            constexpr float kTileShadowAlpha = 0.30f;
+            OverviewQuadPushConstants shadow{};
+            setupShadowPc(shadow, fbSize, tileNdcX, tileNdcY, tileNdcW, tileNdcH,
+                          tileRadiusPx, kTileShadowSpreadPx, kTileShadowYOffsetPx,
+                          kTileShadowAlpha * factor);
+            vkCmdPushConstants(cmd, m_vkPipelineLayout,
+                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                               0, sizeof(shadow), &shadow);
+            vkCmdDraw(cmd, 4, 1, 0, 0);
+        }
+
+        OverviewQuadPushConstants pc{};
+        pc.quadRectNdc[0] = tileNdcX;
+        pc.quadRectNdc[1] = tileNdcY;
+        pc.quadRectNdc[2] = tileNdcW;
+        pc.quadRectNdc[3] = tileNdcH;
+        setCornerRadiusUv(pc, fbSize, tileRadiusPx);
+        pc.atlasSlotUv[0] = uvX + uvW * ixL;
+        pc.atlasSlotUv[1] = uvY + uvH * iyT;
+        pc.atlasSlotUv[2] = uvW * (1.0f - ixL - ixR);
+        pc.atlasSlotUv[3] = uvH * (1.0f - iyT - iyB);
         pc.opacity = factor;
         vkCmdPushConstants(cmd, m_vkPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                            0, sizeof(pc), &pc);
@@ -2676,16 +2745,66 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
             } else {
                 break;
             }
+            // Same shadow-halo crop as the resting grid tile: inset
+            // the drawn rect AND UV by the source window's frame-vs-
+            // visible ratios so the dragged tile shows only the
+            // frame portion of the atlas slot (no Breeze decoration
+            // shadow baked into the thumbnail).
+            float ixL = 0.0f, iyT = 0.0f, ixR = 0.0f, iyB = 0.0f;
+            if (t.handle) {
+                const QRectF vis = t.handle->visibleGeometry();
+                const QRectF frame = t.handle->frameGeometry();
+                if (vis.width() > 0.0 && vis.height() > 0.0) {
+                    ixL = float((frame.x() - vis.x()) / vis.width());
+                    iyT = float((frame.y() - vis.y()) / vis.height());
+                    ixR = float((vis.right() - frame.right()) / vis.width());
+                    iyB = float((vis.bottom() - frame.bottom()) / vis.height());
+                    ixL = std::max(0.0f, ixL);
+                    iyT = std::max(0.0f, iyT);
+                    ixR = std::max(0.0f, ixR);
+                    iyB = std::max(0.0f, iyB);
+                }
+            }
+            const float dragX = x + w * ixL;
+            const float dragY = y + h * iyT;
+            const float dragW = w * (1.0f - ixL - ixR);
+            const float dragH = h * (1.0f - iyT - iyB);
+            const float dragRadiusPx = roundedRadiusPx(kRoundedRadiusTileFrac);
+
+            // SDF drop shadow under the dragged tile (larger spread
+            // and higher alpha than the resting grid-tile shadow so
+            // the dragged tile reads as lifted off the grid).
+            {
+                constexpr float kDragShadowSpreadPx = 18.0f;
+                constexpr float kDragShadowYOffsetPx = 6.0f;
+                constexpr float kDragShadowAlpha = 0.45f;
+                OverviewQuadPushConstants ds{};
+                setupShadowPc(ds, fbSize, dragX, dragY, dragW, dragH,
+                              dragRadiusPx, kDragShadowSpreadPx, kDragShadowYOffsetPx,
+                              kDragShadowAlpha * factor);
+                vkCmdPushConstants(cmd, m_vkPipelineLayout,
+                                   VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                                   0, sizeof(ds), &ds);
+                vkCmdDraw(cmd, 4, 1, 0, 0);
+                // Re-bind the tile's image view since the shadow draw
+                // doesn't read the texture but the next pc still
+                // needs the slot view bound.
+                if (t.slot.isFallback) {
+                    pushView(t.slot.srgbView);
+                } else {
+                    pushView(atlasSrgbView);
+                }
+            }
             OverviewQuadPushConstants pc{};
-            pc.quadRectNdc[0] = x;
-            pc.quadRectNdc[1] = y;
-            pc.quadRectNdc[2] = w;
-            pc.quadRectNdc[3] = h;
-            setCornerRadiusUv(pc, fbSize, roundedRadiusPx(kRoundedRadiusTileFrac));
-            pc.atlasSlotUv[0] = uvX;
-            pc.atlasSlotUv[1] = uvY;
-            pc.atlasSlotUv[2] = uvW;
-            pc.atlasSlotUv[3] = uvH;
+            pc.quadRectNdc[0] = dragX;
+            pc.quadRectNdc[1] = dragY;
+            pc.quadRectNdc[2] = dragW;
+            pc.quadRectNdc[3] = dragH;
+            setCornerRadiusUv(pc, fbSize, dragRadiusPx);
+            pc.atlasSlotUv[0] = uvX + uvW * ixL;
+            pc.atlasSlotUv[1] = uvY + uvH * iyT;
+            pc.atlasSlotUv[2] = uvW * (1.0f - ixL - ixR);
+            pc.atlasSlotUv[3] = uvH * (1.0f - iyT - iyB);
             pc.opacity = factor;
             vkCmdPushConstants(cmd, m_vkPipelineLayout,
                                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
