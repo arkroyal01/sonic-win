@@ -26,6 +26,12 @@ layout(push_constant) uniform PC {
     // higher LOD as a cheap mipmap-based blur — the atlas already
     // generates a mip cascade for every slot.
     float lod;
+    // Per-axis rounded-corner radius in UV space
+    // (radius_px / half_quad_px on X and Y). Both zero disables the
+    // SDF discard path so full-screen passes stay rectangular. The
+    // per-axis split lets non-square quads draw a circular pixel-
+    // space corner via an elliptical UV-space SDF.
+    vec2 cornerRadiusUv;
 } pc;
 
 layout(set = 0, binding = 0) uniform sampler2D atlas;
@@ -35,35 +41,49 @@ layout(location = 1) in float fragOpacity;
 
 layout(location = 0) out vec4 outColor;
 
-// Multi-scale blur: sample several mip levels at the same UV and
-// blend their pre-filtered contributions. Each mip is already a
-// box-filter average over progressively larger source regions
-// (generateMipsAndPublish writes the full cascade), so the weighted
-// sum behaves like a wide Gaussian — but without the per-LOD texel
-// structure a single-LOD tap shows. Single-pass, 5 texture fetches.
-// pc.lod selects the nominal centre; the asymmetric weighting below
-// biases the effective centre of mass to lod+0.4 so the result is
-// softer than a symmetric kernel at the same nominal LOD. Combined
-// with a cpp-side pc.lod = 3.0, the perceived blur sits near mip 3.4
-// which closes most of the gap to V1's FastBlur(radius:64) without
-// the cost of a second pass.
+// 9-tap symmetric Gaussian-ish blur at a single LOD with UV offsets.
+// Earlier iterations blended across mip levels (1-5) for "free"
+// coverage but the high mips introduced visible blockiness where
+// mip aliasing showed through the wash. A single mid-mip plus
+// spatial spread costs the same 9 fetch budget and produces a
+// smoother result. Centre + 4 axial + 4 diagonal taps; weights sum
+// to 1.0. Effective radius is set by the 4-texel step at the chosen
+// mip level (cpp passes pc.lod = 1.0 so each step ≈ 8 source
+// pixels in the original wallpaper).
 vec3 wallpaperBlur(vec2 uv, float lod)
 {
-    // Heavier-biased weights, sum to 1. Increasing the lod+1 and
-    // lod+2 contributions and dropping lod-2/lod-1 trades a little
-    // mid-frequency detail for a noticeably softer result. If the
-    // image looks blocky on lower-end content, drop lod+2 from 0.20
-    // back toward 0.10 to bring the centre of mass back to ~lod+0.2.
-    vec3 c  = textureLod(atlas, uv, max(lod - 2.0, 0.0)).rgb * 0.05;
-    c      += textureLod(atlas, uv, max(lod - 1.0, 0.0)).rgb * 0.15;
-    c      += textureLod(atlas, uv,        lod        ).rgb * 0.30;
-    c      += textureLod(atlas, uv,        lod + 1.0  ).rgb * 0.30;
-    c      += textureLod(atlas, uv,        lod + 2.0  ).rgb * 0.20;
+    vec2 t = 4.0 / vec2(textureSize(atlas, int(lod)));
+    vec3 c  = textureLod(atlas, uv,                          lod).rgb * 0.20;
+    c      += textureLod(atlas, uv + vec2( t.x,  0.0),       lod).rgb * 0.12;
+    c      += textureLod(atlas, uv + vec2(-t.x,  0.0),       lod).rgb * 0.12;
+    c      += textureLod(atlas, uv + vec2( 0.0,  t.y),       lod).rgb * 0.12;
+    c      += textureLod(atlas, uv + vec2( 0.0, -t.y),       lod).rgb * 0.12;
+    c      += textureLod(atlas, uv + vec2( t.x,  t.y),       lod).rgb * 0.08;
+    c      += textureLod(atlas, uv + vec2(-t.x,  t.y),       lod).rgb * 0.08;
+    c      += textureLod(atlas, uv + vec2( t.x, -t.y),       lod).rgb * 0.08;
+    c      += textureLod(atlas, uv + vec2(-t.x, -t.y),       lod).rgb * 0.08;
     return c;
 }
 
 void main()
 {
+    // Rounded-rect discard: anything outside the inscribed rounded
+    // rectangle drops out before sampling. The SDF works in the
+    // quad's local UV space (centred at 0, half-extents 1). When
+    // both components of cornerRadiusUv are zero the if-test short-
+    // circuits — the path costs nothing for full-screen passes.
+    if (pc.cornerRadiusUv.x > 0.0 || pc.cornerRadiusUv.y > 0.0) {
+        vec2 p = abs(fragUv * 2.0 - 1.0);
+        vec2 d = p - (vec2(1.0) - pc.cornerRadiusUv);
+        if (d.x > 0.0 && d.y > 0.0) {
+            // Elliptical-corner SDF: distance in radius-normalised
+            // space. The cpp side picks per-axis r so the resulting
+            // ellipse traces a circular pixel-space corner.
+            vec2 q = d / pc.cornerRadiusUv;
+            if (dot(q, q) > 1.0) discard;
+        }
+    }
+
     vec4 sampled;
     if (pc.lod > 0.0) {
         sampled = vec4(wallpaperBlur(fragUv, pc.lod), 1.0);

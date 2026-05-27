@@ -84,9 +84,50 @@ struct OverviewQuadPushConstants
     // texture() (LOD 0 for a fullscreen quad). Higher values produce
     // a mipmap-based blur — see overview_quad.frag.
     float lod;
+    // Per-quad rounded-corner radius in UV space, separately on each
+    // axis (radius_px / half_quad_px on X and Y). The shader runs a
+    // rounded-rect SDF discard against this; both components zero
+    // disables the path entirely so full-screen passes (wash,
+    // wallpaper backdrop) stay rectangular. Per-axis values mean
+    // non-square quads draw an elliptical corner that traces the
+    // intended pixel-radius even when the quad's NDC aspect differs
+    // from its pixel aspect. Helper makeCornerRadiusUv() below.
+    float cornerRadiusUv[2];
 };
-static_assert(sizeof(OverviewQuadPushConstants) == 56,
+static_assert(sizeof(OverviewQuadPushConstants) == 64,
               "Push-constant layout must match shaders/overview_quad.{vert,frag}");
+
+// Convert a desired pixel-space corner radius into the per-axis UV
+// values OverviewQuadPushConstants::cornerRadiusUv expects. The shader
+// evaluates an elliptical SDF whose semi-axes are these two values,
+// chosen so a non-square pixel quad still draws a circular pixel-space
+// corner of size radiusPx. Clamped to [0, 1] because anything larger
+// would degenerate the SDF (the rect becomes all-corner).
+inline void setCornerRadiusUv(OverviewQuadPushConstants &pc,
+                              const QSize &fbSize, float radiusPx)
+{
+    const float halfWpx = std::max(1.0f,
+                                   std::abs(pc.quadRectNdc[2]) * 0.5f * float(fbSize.width()));
+    const float halfHpx = std::max(1.0f,
+                                   std::abs(pc.quadRectNdc[3]) * 0.5f * float(fbSize.height()));
+    pc.cornerRadiusUv[0] = std::clamp(radiusPx / halfWpx, 0.0f, 1.0f);
+    pc.cornerRadiusUv[1] = std::clamp(radiusPx / halfHpx, 0.0f, 1.0f);
+}
+
+// Corner radii expressed as gridUnit fractions so they scale with the
+// user's font / DPI setting (V1's Kirigami.Units.cornerRadius derives
+// from smallSpacing which is itself ~gridUnit/4). Multiplied by
+// QFontMetrics(qApp->font()).height() at each call site via the
+// roundedRadiusPx helper to get the pixel value setCornerRadiusUv
+// expects. Conservative defaults approximate V1's modest rounding.
+constexpr float kRoundedRadiusCardFrac = 0.5f; // wallpaper card -- ~gridUnit/2
+constexpr float kRoundedRadiusTileFrac = 0.3f; // grid tiles, bar tiles
+constexpr float kRoundedRadiusMiniFrac = 0.15f; // bar mini-thumbnails
+
+inline float roundedRadiusPx(float gridUnitFrac)
+{
+    return gridUnitFrac * float(QFontMetrics(qApp->font()).height());
+}
 } // namespace
 
 #endif // HAVE_VULKAN
@@ -1078,6 +1119,7 @@ void OverviewEffectV2::renderDesktopBar(VkCommandBuffer cmd, const QSize &fbSize
         pc.quadRectNdc[1] = b.ndcY;
         pc.quadRectNdc[2] = b.ndcW;
         pc.quadRectNdc[3] = b.ndcH;
+        setCornerRadiusUv(pc, fbSize, roundedRadiusPx(kRoundedRadiusTileFrac));
         // Sample this VD's wallpaper if its slot is atlas-resident.
         // All atlas slots share the bound srgbView; only UV differs.
         // Fallback slots have their own dedicated view, so skip the
@@ -1135,6 +1177,7 @@ void OverviewEffectV2::renderDesktopBar(VkCommandBuffer cmd, const QSize &fbSize
         pc.quadRectNdc[1] = float(m_addTileNdc.y());
         pc.quadRectNdc[2] = float(m_addTileNdc.width());
         pc.quadRectNdc[3] = float(m_addTileNdc.height());
+        setCornerRadiusUv(pc, fbSize, roundedRadiusPx(kRoundedRadiusTileFrac));
         pc.atlasSlotUv[0] = 0.0f;
         pc.atlasSlotUv[1] = 0.0f;
         pc.atlasSlotUv[2] = 1.0f;
@@ -1238,6 +1281,7 @@ void OverviewEffectV2::renderDesktopBar(VkCommandBuffer cmd, const QSize &fbSize
             pc.quadRectNdc[1] = y;
             pc.quadRectNdc[2] = tileW_ndc;
             pc.quadRectNdc[3] = tileH_ndc;
+            setCornerRadiusUv(pc, fbSize, roundedRadiusPx(kRoundedRadiusMiniFrac));
             pc.atlasSlotUv[0] = float(s.slot.rect.x()) / atlasSize;
             pc.atlasSlotUv[1] = float(s.slot.rect.y()) / atlasSize;
             pc.atlasSlotUv[2] = float(s.slot.rect.width()) / atlasSize;
@@ -1880,59 +1924,27 @@ bool OverviewEffectV2::drawWallpaperBackground(VkCommandBuffer cmd, const QSize 
         pc.atlasSlotUv[2] = float(wp.slot.rect.width()) / atlasSize;
         pc.atlasSlotUv[3] = float(wp.slot.rect.height()) / atlasSize;
     }
-    // Nominal mip centre for the 5-tap multi-LOD blur in
-    // overview_quad.frag::wallpaperBlur. The shader's asymmetric weights
-    // shift the effective centre of mass to ~lod+0.4 (i.e. mip 3.4 here,
-    // ~11× downsample), which is the closest single-pass approximation
-    // of V1's FastBlur(radius:64) we get without a separate Gaussian
-    // pass and an intermediate render target.
-    pc.lod = 3.0f;
+    // LOD for the 9-tap Gaussian-ish blur in
+    // overview_quad.frag::wallpaperBlur. Lower mip than the previous
+    // multi-LOD blend (which sampled mips 1-5 and showed blocky
+    // aliasing between levels). Mip 1 = 2x downsample, then the
+    // shader spreads 9 samples at 4-texel offsets to widen the blur
+    // without resorting to higher mips.
+    pc.lod = 1.0f;
     pc.opacity = factor;
     vkCmdPushConstants(cmd, m_vkPipelineLayout,
                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                        0, sizeof(pc), &pc);
     vkCmdDraw(cmd, 4, 1, 0, 0);
 
-    // Pass 2: theme-driven wash on top. V1's QML uses a translucent
-    // Kirigami.Theme.backgroundColor rectangle at opacity 0.7 — Qt's
-    // qApp->palette().window() is the analogous source on the C++ side
-    // (Plasma feeds the same colour scheme into both). sRGB-to-linear
-    // conversion is required because the shader mixes against the
-    // atlas sample, which the atlas's *_SRGB format already decoded
-    // to linear on read; tints must live in the same space.
-    constexpr float kDarkWashAlpha = 0.7f;
-    // V1's QML underlay rectangle blends in sRGB space (Qt's scene
-    // graph default). V2's Vulkan path blends in linear space because
-    // the atlas sampler is *_SRGB and decodes on read. Same arithmetic
-    // ends up brighter in linear-blend than sRGB-blend, especially on
-    // light themes where the tint colour dominates. Compensate with a
-    // 0.55 darkening multiplier so the linear-blend output matches V1's
-    // sRGB-blend perceived strength. Dark themes already match natively
-    // (tint near zero is invariant under the darkening).
-    constexpr float kTintDarken = 0.10f;
-    const QColor washColor = qApp->palette().window().color();
-    auto sRgbToLinear = [](double c) -> float {
-        return c <= 0.04045 ? float(c / 12.92)
-                            : float(std::pow((c + 0.055) / 1.055, 2.4));
-    };
-    OverviewQuadPushConstants wash{};
-    wash.quadRectNdc[0] = -1.0f;
-    wash.quadRectNdc[1] = -1.0f;
-    wash.quadRectNdc[2] = 2.0f;
-    wash.quadRectNdc[3] = 2.0f;
-    wash.atlasSlotUv[0] = 0.0f;
-    wash.atlasSlotUv[1] = 0.0f;
-    wash.atlasSlotUv[2] = 1.0f;
-    wash.atlasSlotUv[3] = 1.0f;
-    wash.tintRgba[0] = sRgbToLinear(washColor.redF()) * kTintDarken;
-    wash.tintRgba[1] = sRgbToLinear(washColor.greenF()) * kTintDarken;
-    wash.tintRgba[2] = sRgbToLinear(washColor.blueF()) * kTintDarken;
-    wash.tintRgba[3] = 1.0f; // solid tint
-    wash.opacity = kDarkWashAlpha * factor;
-    vkCmdPushConstants(cmd, m_vkPipelineLayout,
-                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                       0, sizeof(wash), &wash);
-    vkCmdDraw(cmd, 4, 1, 0, 0);
+    // Pass 2 (theme wash) intentionally dropped. The earlier wash was
+    // there to compensate for the mip-based blur's blockiness and
+    // brightness mismatch against V1's FastBlur, but it also masked
+    // the wallpaper detail to a degree V1 doesn't. The plan is to
+    // replace the mip-based blur with a proper dual-kawase chain
+    // (matching the blur effect's Vulkan path -- see plugins/blur/
+    // blur.cpp's m_vulkanBlurPipelineLayout etc.) and let the wallpaper
+    // backdrop stand on its own merit. Wash hidden until that lands.
 
     // V1 hides the per-desktop background card when the active
     // search filter has zero matches (currentHeap.count === 0 in
@@ -1999,6 +2011,7 @@ bool OverviewEffectV2::drawWallpaperBackground(VkCommandBuffer cmd, const QSize 
     card.opacity = factor;
     // lod stays 0 — the card uses the sharp wallpaper, not the
     // blurred mip cascade.
+    setCornerRadiusUv(card, fbSize, roundedRadiusPx(kRoundedRadiusCardFrac));
     vkCmdPushConstants(cmd, m_vkPipelineLayout,
                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                        0, sizeof(card), &card);
@@ -2170,6 +2183,11 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
             + (dragging ? float(dragOffsetNdc.y()) : 0.0f);
         pc.quadRectNdc[2] = t.realNdcW + (t.gridNdcW - t.realNdcW) * factor;
         pc.quadRectNdc[3] = t.realNdcH + (t.gridNdcH - t.realNdcH) * factor;
+        // Tiles lerp between real (factor=0) and grid (factor=1) rects;
+        // both come from real client geometry so radius interpolation
+        // would also lerp visually — but the activation animation is
+        // fast enough that we just compute against the current rect.
+        setCornerRadiusUv(pc, fbSize, roundedRadiusPx(kRoundedRadiusTileFrac));
         pc.atlasSlotUv[0] = uvX;
         pc.atlasSlotUv[1] = uvY;
         pc.atlasSlotUv[2] = uvW;
@@ -2575,6 +2593,7 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
             pc.quadRectNdc[1] = y;
             pc.quadRectNdc[2] = w;
             pc.quadRectNdc[3] = h;
+            setCornerRadiusUv(pc, fbSize, roundedRadiusPx(kRoundedRadiusTileFrac));
             pc.atlasSlotUv[0] = uvX;
             pc.atlasSlotUv[1] = uvY;
             pc.atlasSlotUv[2] = uvW;
