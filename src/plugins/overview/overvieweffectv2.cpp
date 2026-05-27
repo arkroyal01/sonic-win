@@ -24,6 +24,8 @@
 #include "window.h"
 #endif
 
+#include <cmath>
+
 #include <KConfigGroup>
 #include <KGlobalAccel>
 #include <KLocalizedString>
@@ -1732,11 +1734,19 @@ bool OverviewEffectV2::drawWallpaperBackground(VkCommandBuffer cmd, const QSize 
                        0, sizeof(pc), &pc);
     vkCmdDraw(cmd, 4, 1, 0, 0);
 
-    // Pass 2: dark wash on top. V1's QML uses a translucent
-    // theme.backgroundColor Rectangle at opacity 0.7 to soften the
-    // wallpaper and emphasise the foreground UI. Constant black for
-    // now; future change to follow Kirigami theme.
+    // Pass 2: theme-driven wash on top. V1's QML uses a translucent
+    // Kirigami.Theme.backgroundColor rectangle at opacity 0.7 — Qt's
+    // qApp->palette().window() is the analogous source on the C++ side
+    // (Plasma feeds the same colour scheme into both). sRGB-to-linear
+    // conversion is required because the shader mixes against the
+    // atlas sample, which the atlas's *_SRGB format already decoded
+    // to linear on read; tints must live in the same space.
     constexpr float kDarkWashAlpha = 0.7f;
+    const QColor washColor = qApp->palette().window().color();
+    auto sRgbToLinear = [](double c) -> float {
+        return c <= 0.04045 ? float(c / 12.92)
+                            : float(std::pow((c + 0.055) / 1.055, 2.4));
+    };
     OverviewQuadPushConstants wash{};
     wash.quadRectNdc[0] = -1.0f;
     wash.quadRectNdc[1] = -1.0f;
@@ -1746,7 +1756,10 @@ bool OverviewEffectV2::drawWallpaperBackground(VkCommandBuffer cmd, const QSize 
     wash.atlasSlotUv[1] = 0.0f;
     wash.atlasSlotUv[2] = 1.0f;
     wash.atlasSlotUv[3] = 1.0f;
-    wash.tintRgba[3] = 1.0f; // solid tint, RGB stays 0 → black
+    wash.tintRgba[0] = sRgbToLinear(washColor.redF());
+    wash.tintRgba[1] = sRgbToLinear(washColor.greenF());
+    wash.tintRgba[2] = sRgbToLinear(washColor.blueF());
+    wash.tintRgba[3] = 1.0f; // solid tint
     wash.opacity = kDarkWashAlpha * factor;
     vkCmdPushConstants(cmd, m_vkPipelineLayout,
                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -2639,6 +2652,23 @@ void OverviewEffectV2::paintScreen(const RenderTarget &renderTarget,
 void OverviewEffectV2::postPaintScreen()
 {
     Effect::postPaintScreen();
+}
+
+bool OverviewEffectV2::event(QEvent *e)
+{
+    if (e->type() == QEvent::ApplicationPaletteChange) {
+        // Qt 6 dispatches ApplicationPaletteChange to every QObject
+        // when QGuiApplication::palette() updates (KDE colour scheme
+        // switch, system theme change). Effects that sample
+        // qApp->palette() at paint-time would otherwise keep showing
+        // the palette that was current when kwin started -- ditto for
+        // anyone who connects to KColorSchemeManager. Trigger a full
+        // repaint so the next frame picks up the new colours.
+        if (m_visible) {
+            effects->addRepaintFull();
+        }
+    }
+    return Effect::event(e);
 }
 
 void OverviewEffectV2::grabbedKeyboardEvent(QKeyEvent *event)

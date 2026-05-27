@@ -108,6 +108,12 @@ public:
     void grabbedKeyboardEvent(QKeyEvent *event) override;
     void windowInputMouseEvent(QEvent *event) override;
 
+    /// Catch QEvent::ApplicationPaletteChange so the theme-driven
+    /// wash colour follows live System Settings → Colors switches
+    /// without requiring kwin --replace. Forwarded to QObject for
+    /// any other event types so the rest of the dispatch is intact.
+    bool event(QEvent *e) override;
+
 private:
     /// Hit-test a global mouse position against the current tile grid.
     /// Returns the Window* whose tile contains @p globalPos, or nullptr
