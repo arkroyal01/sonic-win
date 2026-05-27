@@ -806,6 +806,8 @@ void OverviewEffectV2::releaseAllSlots()
     m_searchRenderedText.clear();
     m_searchTexture.reset();
     m_searchTextureSize = QSize();
+    m_noMatchesTexture.reset();
+    m_noMatchesTextureSize = QSize();
     m_addTileNdc = QRectF();
     m_addTileHover = false;
     // Drop the "+" icon texture so the V2 effect releases all GPU
@@ -884,22 +886,48 @@ void OverviewEffectV2::rebuildTileLayout(const QSize &fbSize)
         drawable.push_back({handle, it->second, 0, 0, 0, 0, 0, 0, 0, 0});
     }
     const int n = drawable.size();
+    // Always publish the filtered set so callers see the true count
+    // (the search "No matching windows" placeholder relies on
+    // m_tileLayout.empty() to mean "filter matched nothing", not
+    // "we left an old layout untouched because n was zero").
+    m_tileLayout.clear();
     if (n == 0) {
         return;
     }
     const int cols = std::max(1, int(std::ceil(std::sqrt(double(n)))));
     const int rows = (n + cols - 1) / cols;
-    // Grid top sits just below the desktop bar (kBarTop + kBarHeight +
-    // a small gap); see rebuildBarLayout for the bar's NDC bounds.
-    constexpr float kGridTop = -0.78f;
+    // Grid top sits below the desktop bar AND the search-bar strip
+    // (kBarTop + kBarHeight + small gap + search-bar height + small
+    // gap); see rebuildBarLayout for the bar's NDC bounds and the
+    // search-bar draw in renderTilesPostPass for where it lands. V1's
+    // QML reserves a whole row for PlasmaExtras.SearchField above the
+    // window heap, so the grid heap starts noticeably lower than the
+    // gap-below-bar position the early V2 used (which made the search
+    // bar overlap the top row of grid tiles).
+    constexpr float kGridTop = -0.70f;
     constexpr float kGridBottom = 0.8f;
-    const float cellNdcW = 1.6f / cols;
-    const float cellNdcH = (kGridBottom - kGridTop) / rows;
+    const float screenW = std::max(1.0f, float(fbSize.width()));
+    const float screenH = std::max(1.0f, float(fbSize.height()));
+    // Match the wallpaper card's settled rect (drawWallpaperBackground
+    // computes the same formula). V1's QML positions the window heap
+    // *inside* the per-VD card; without this match the cells were
+    // laid against [-0.8, +0.8] and tiles spilled past the card's
+    // left/right edges on 16:9 screens (card is ~1.5 NDC wide).
+    const float cardPxW = screenW;
+    const float cardPxH = (kGridBottom - kGridTop) * 0.5f * screenH;
+    const float screenAspect = screenW / std::max(1.0f, screenH);
+    const float cardSettledPxH = std::min(cardPxH, cardPxW / screenAspect);
+    const float cardSettledPxW = cardSettledPxH * screenAspect;
+    const float cardNdcW = 2.0f * cardSettledPxW / screenW;
+    const float cardNdcH = 2.0f * cardSettledPxH / screenH;
+    const float cardCentreY = (kGridTop + kGridBottom) * 0.5f;
+    const float cardLeft = -cardNdcW * 0.5f;
+    const float cardTop = cardCentreY - cardNdcH * 0.5f;
+    const float cellNdcW = cardNdcW / cols;
+    const float cellNdcH = cardNdcH / rows;
     constexpr float kTilePad = 0.9f;
     const float maxNdcW = cellNdcW * kTilePad;
     const float maxNdcH = cellNdcH * kTilePad;
-    const float screenW = std::max(1.0f, float(fbSize.width()));
-    const float screenH = std::max(1.0f, float(fbSize.height()));
     for (int i = 0; i < n; ++i) {
         TileLayout &t = drawable[i];
         const QRectF realGeom = t.handle->visibleGeometry();
@@ -920,8 +948,8 @@ void OverviewEffectV2::rebuildTileLayout(const QSize &fbSize)
         const float tileNdcH = t.realNdcH * scale;
         const int col = i % cols;
         const int row = i / cols;
-        const float cellOriginX = -0.8f + col * cellNdcW;
-        const float cellOriginY = kGridTop + row * cellNdcH;
+        const float cellOriginX = cardLeft + col * cellNdcW;
+        const float cellOriginY = cardTop + row * cellNdcH;
         t.gridNdcX = cellOriginX + (cellNdcW - tileNdcW) * 0.5f;
         t.gridNdcY = cellOriginY + (cellNdcH - tileNdcH) * 0.5f;
         t.gridNdcW = tileNdcW;
@@ -1273,15 +1301,15 @@ void OverviewEffectV2::ensureBarIconTextures()
 
 void OverviewEffectV2::updateSearchTexture()
 {
-    if (m_searchText.isEmpty()) {
-        // Empty filter ⇒ no bar to draw. Drop the texture so a fresh
-        // activation doesn't carry stale pixels and so the per-session
-        // VRAM footprint stays at zero when search isn't used.
-        m_searchTexture.reset();
-        m_searchRenderedText.clear();
-        m_searchTextureSize = QSize();
-        return;
-    }
+    // Always-visible search bar matches V1's QML, which renders the
+    // PlasmaExtras.SearchField for the entire overview lifetime --
+    // the empty bar with a blinking caret is the visual hint that
+    // typing will filter the grid. First-keystroke buffering still
+    // works (Effect::grabKeyboard catches the press regardless).
+    //
+    // ~128 KiB texture pinned for the duration of an overview
+    // activation; deactivate() releases it via m_searchTexture.reset()
+    // alongside every other GPU resource (V2 active-memory rule).
     if (m_searchText == m_searchRenderedText && m_searchTexture) {
         return; // cache hit — no re-render needed
     }
@@ -1293,11 +1321,12 @@ void OverviewEffectV2::updateSearchTexture()
     // reused for every keystroke (the 4096-byte alignment + dedicated-
     // allocation work makes per-keystroke vmaCreateImage cheap, but a
     // stable size means VulkanTexture::upload can reuse the existing
-    // image when the dimensions match). 800×40 fits ~30 chars at the
-    // chosen font size; overflowing strings get truncated at draw
-    // time, intentional MVP behaviour.
-    constexpr int kWidth = 800;
-    constexpr int kHeight = 40;
+    // image when the dimensions match). 360x32 matches V1's
+    // PlasmaExtras.SearchField at default DPI: 20 * gridUnit (18 px)
+    // wide, ~32 px tall (system font + Kirigami inner padding).
+    // Overflowing strings elide at draw time.
+    constexpr int kWidth = 360;
+    constexpr int kHeight = 32;
     const QSize size(kWidth, kHeight);
 
     QImage img(size, QImage::Format_RGBA8888_Premultiplied);
@@ -1315,23 +1344,58 @@ void OverviewEffectV2::updateSearchTexture()
     p.setPen(Qt::NoPen);
     p.drawRoundedRect(img.rect().adjusted(2, 2, -2, -2), 8, 8);
 
-    QFont font = QFont();
-    font.setPointSizeF(14);
+    // V1's PlasmaExtras.SearchField has a thin themed outline that
+    // tracks the active focus colour. We don't have keyboard focus
+    // semantics for the bar (it's always focused while overview is
+    // open), so just paint the highlight-coloured border statically
+    // at the standard Kirigami border weight.
+    QPen borderPen(qApp->palette().highlight().color());
+    borderPen.setWidthF(1.5);
+    p.setPen(borderPen);
+    p.setBrush(Qt::NoBrush);
+    p.drawRoundedRect(QRectF(img.rect()).adjusted(2.0, 2.0, -2.0, -2.0), 8.0, 8.0);
+
+    // Search icon on the left, matching V1's PlasmaExtras.SearchField.
+    // The icon stays visible whether or not the field has text.
+    constexpr int kIconSize = 18;
+    constexpr int kIconX = 10;
+    const int iconY = (kHeight - kIconSize) / 2;
+    const QIcon searchIcon = QIcon::fromTheme(QStringLiteral("search-symbolic"),
+                                              QIcon::fromTheme(QStringLiteral("edit-find")));
+    if (!searchIcon.isNull()) {
+        const QPixmap pm = searchIcon.pixmap(QSize(kIconSize, kIconSize));
+        if (!pm.isNull()) {
+            p.drawPixmap(kIconX, iconY, pm);
+        }
+    }
+
+    // System font at its default size matches V1's SearchField, which
+    // doesn't override font.pointSize -- the inherited theme size.
+    QFont font = qApp->font();
     p.setFont(font);
-    p.setPen(QColor(255, 255, 255, 240));
 
     const QFontMetrics fm(font);
     const int textBaseline = (kHeight + fm.ascent() - fm.descent()) / 2;
-    const int textX = 16;
-    // Elide so an overflowing search string still draws inside the bar
-    // without overflowing into the dimmed area outside.
-    const QString display = fm.elidedText(m_searchText, Qt::ElideLeft, kWidth - 2 * textX - 10);
-    p.drawText(textX, textBaseline, display);
-
-    // Caret: thin vertical line at the right edge of the rendered text.
-    const int caretX = textX + fm.horizontalAdvance(display) + 2;
-    if (caretX < kWidth - textX) {
-        p.fillRect(QRect(caretX, 6, 2, kHeight - 12), QColor(255, 255, 255, 220));
+    const int textX = kIconX + kIconSize + 6;
+    if (m_searchText.isEmpty()) {
+        // Empty state: icon only, no caret. V1 shows a "Search…"
+        // placeholder string from Plasma's i18n catalog; reusing it
+        // cleanly from kwin_x11 would need a catalog-loading dance,
+        // and the search icon already signals "this is a search
+        // field" on its own. Skip the text to avoid creating a new
+        // string for translators.
+    } else {
+        p.setPen(QColor(255, 255, 255, 240));
+        // Elide-left so the cursor (right edge) stays visible.
+        const QString display = fm.elidedText(m_searchText,
+                                              Qt::ElideLeft, kWidth - textX - 8);
+        p.drawText(textX, textBaseline, display);
+        // Caret: thin vertical line at the right edge of rendered text.
+        const int caretX = textX + fm.horizontalAdvance(display) + 2;
+        if (caretX < kWidth - 8) {
+            p.fillRect(QRect(caretX, 6, 2, kHeight - 12),
+                       QColor(255, 255, 255, 220));
+        }
     }
     p.end();
 
@@ -1349,6 +1413,57 @@ void OverviewEffectV2::updateSearchTexture()
     m_searchTexture = std::move(next);
     m_searchRenderedText = m_searchText;
     m_searchTextureSize = size;
+}
+
+void OverviewEffectV2::ensureNoMatchesTexture()
+{
+    if (m_noMatchesTexture || !m_vulkanCtx) {
+        return;
+    }
+    // Mirrors V1's PlasmaExtras.PlaceholderMessage shown when
+    // currentHeap.count == 0 && filterWindows. Text is fixed so we
+    // build the texture once and reuse for the whole activation.
+    // V1's PlasmaExtras.PlaceholderMessage renders at Kirigami Heading
+    // 2 level (~1.6x the system font, bold). Mirror that here.
+    QFont font = qApp->font();
+    font.setPointSizeF(font.pointSizeF() * 1.6);
+    font.setBold(true);
+    const QFontMetrics fm(font);
+    const QString text = i18ndc("kwin_x11",
+                                "@info:placeholder Shown in the overview when search has no results",
+                                "No matching windows");
+    constexpr int kSidePad = 18;
+    const int kHeight = fm.height() + 12;
+    const int width = std::max(160, fm.horizontalAdvance(text) + 2 * kSidePad);
+    const QSize size(width, kHeight);
+
+    QImage img(size, QImage::Format_RGBA8888_Premultiplied);
+    img.fill(Qt::transparent);
+
+    QPainter p(&img);
+    p.setRenderHint(QPainter::Antialiasing);
+    p.setRenderHint(QPainter::TextAntialiasing);
+    // No background pill: V1's PlaceholderMessage draws plain text on
+    // top of the blur+wash backdrop, no chrome. We hide the sharp
+    // wallpaper card when no matches (see drawWallpaperBackground)
+    // so the text sits on the dimmed/blurred backdrop with consistent
+    // contrast across wallpapers.
+    p.setFont(font);
+    // Kirigami.Theme.disabledTextColor maps to QPalette::Disabled's
+    // WindowText role -- the faded variant used for placeholder /
+    // hint text on light and dark themes alike.
+    p.setPen(qApp->palette().color(QPalette::Disabled, QPalette::WindowText));
+    const int baseline = (kHeight + fm.ascent() - fm.descent()) / 2;
+    p.drawText(kSidePad, baseline, text);
+    p.end();
+
+    m_noMatchesTexture = VulkanTexture::upload(m_vulkanCtx, img);
+    if (m_noMatchesTexture) {
+        m_noMatchesTextureSize = size;
+    } else {
+        qCWarning(KWIN_OVERVIEW_V2_LOG)
+            << "OverviewEffectV2: no-matches placeholder upload failed";
+    }
 }
 
 void OverviewEffectV2::renderWindowsToAtlas()
@@ -1766,6 +1881,18 @@ bool OverviewEffectV2::drawWallpaperBackground(VkCommandBuffer cmd, const QSize 
                        0, sizeof(wash), &wash);
     vkCmdDraw(cmd, 4, 1, 0, 0);
 
+    // V1 hides the per-desktop background card when the active
+    // search filter has zero matches (currentHeap.count === 0 in
+    // the QML guard), so the "No matching windows" placeholder reads
+    // against the dimmed wallpaper backdrop instead of the sharp
+    // card. Mirror that: skip Pass 3 when m_tileLayout is empty AND
+    // the user has typed a search term. m_tileLayout was rebuilt by
+    // renderTilesPostPass on the previous frame so this is one-frame
+    // lagged; at 60 Hz the lag is imperceptible.
+    if (!m_searchText.isEmpty() && m_tileLayout.empty()) {
+        return true;
+    }
+
     // Pass 3: sharp wallpaper card at the scaled-down grid area.
     // V1's per-desktop backgroundArea Item renders a second copy of
     // the same wallpaper inside Kirigami.ShadowedTexture (rounded
@@ -1775,7 +1902,7 @@ bool OverviewEffectV2::drawWallpaperBackground(VkCommandBuffer cmd, const QSize 
     // dedicated shader and are deferred; this pass paints the sharp
     // wallpaper at the animated rect so the user sees the desktop
     // preview beneath the tile grid.
-    constexpr float kGridTopNdc = -0.78f; // matches kGridTop in rebuildTileLayout
+    constexpr float kGridTopNdc = -0.70f; // matches kGridTop in rebuildTileLayout
     constexpr float kGridBottomNdc = 0.8f; // matches kGridBottom
     const float screenWf = std::max(1.0f, float(fbSize.width()));
     const float screenHf = std::max(1.0f, float(fbSize.height()));
@@ -2260,18 +2387,20 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
     updateSearchTexture();
     if (m_searchTexture && m_searchTexture->isValid()) {
         pushView(m_searchTexture->imageView());
-        // NDC bar geometry. The bar sits in the gap between
-        // kBarTop+kBarHeight (≈ -0.80) and kGridTop (-0.78) — wait,
-        // that gap is tiny. Place the bar a bit further down so it
-        // doesn't overlap the top grid row when the grid has many
-        // tiles. Width = 800/screenW (matches the texture's pixel
-        // size so we sample 1:1 and the text stays crisp).
+        // NDC search-bar geometry. The bar sits in the strip between
+        // kBarTop+kBarHeight (≈ -0.80) and kGridTop (-0.70), centred
+        // vertically in that ~0.10-NDC strip. V1's QML keeps the
+        // SearchField on its own row above the grid heap rather than
+        // floating into the top row of windows; we mirror that.
+        // Width = 800/screenW (matches the texture's pixel size so
+        // we sample 1:1 and the text stays crisp).
         const float texPxW = float(m_searchTextureSize.width());
         const float texPxH = float(m_searchTextureSize.height());
         const float ndcW = 2.0f * texPxW / std::max(1.0f, float(fbSize.width()));
         const float ndcH = 2.0f * texPxH / std::max(1.0f, float(fbSize.height()));
         const float ndcX = -ndcW * 0.5f;
-        const float ndcY = -0.74f; // just below the bar's bottom edge
+        // Centre vertically in the [-0.80, -0.70] search-bar strip.
+        const float ndcY = -0.75f - ndcH * 0.5f;
         OverviewQuadPushConstants pc{};
         pc.quadRectNdc[0] = ndcX;
         pc.quadRectNdc[1] = ndcY;
@@ -2287,6 +2416,45 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                            0, sizeof(pc), &pc);
         vkCmdDraw(cmd, 4, 1, 0, 0);
+    }
+
+    // "No matching windows" placeholder. V1 shows it whenever the
+    // active filter has zero results (PlaceholderMessage at main.qml
+    // line 738); we draw it just below where the search bar sits so
+    // it reads as the empty-state for the search rather than a
+    // generic empty-grid message. Skipped when the search field is
+    // empty -- the grid is just sparse / empty, not "no matches".
+    if (m_tileLayout.empty() && !m_searchText.isEmpty()) {
+        ensureNoMatchesTexture();
+        if (m_noMatchesTexture && m_noMatchesTexture->isValid()) {
+            pushView(m_noMatchesTexture->imageView());
+            const float texPxW = float(m_noMatchesTextureSize.width());
+            const float texPxH = float(m_noMatchesTextureSize.height());
+            const float ndcW = 2.0f * texPxW / std::max(1.0f, float(fbSize.width()));
+            const float ndcH = 2.0f * texPxH / std::max(1.0f, float(fbSize.height()));
+            const float ndcX = -ndcW * 0.5f;
+            // Mirror V1: PlaceholderMessage anchored to the heap
+            // loader's parent.top, i.e. immediately below the topBar
+            // with no gap. Search-bar quad bottom in V2 ≈ -0.72, so
+            // top of placeholder texture starts there. Texture
+            // extends down into what would be the grid area (which
+            // is empty in the no-matches state).
+            const float ndcY = -0.72f;
+            OverviewQuadPushConstants pc{};
+            pc.quadRectNdc[0] = ndcX;
+            pc.quadRectNdc[1] = ndcY;
+            pc.quadRectNdc[2] = ndcW;
+            pc.quadRectNdc[3] = ndcH;
+            pc.atlasSlotUv[0] = 0.0f;
+            pc.atlasSlotUv[1] = 0.0f;
+            pc.atlasSlotUv[2] = 1.0f;
+            pc.atlasSlotUv[3] = 1.0f;
+            pc.opacity = factor;
+            vkCmdPushConstants(cmd, m_vkPipelineLayout,
+                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                               0, sizeof(pc), &pc);
+            vkCmdDraw(cmd, 4, 1, 0, 0);
+        }
     }
 
     // The dragged grid tile, drawn last so it floats above every

@@ -245,6 +245,14 @@ private:
     /// the QPainter+upload if m_searchRenderedText already matches.
     void updateSearchTexture();
 
+    /// Cached "No matching windows" placeholder texture, drawn in the
+    /// centre of the grid area when the active search filter has zero
+    /// results. Built once per V2 lifetime (text is fixed) and released
+    /// alongside m_searchTexture in releaseAllSlots.
+    std::unique_ptr<VulkanTexture> m_noMatchesTexture;
+    QSize m_noMatchesTextureSize;
+    void ensureNoMatchesTexture();
+
     /// Persistent icon textures for the bar's Add ("+") and Delete
     /// ("×") affordances. QPainter-rendered into transparent
     /// QImages, uploaded once per V2 lifetime — the icons don't
