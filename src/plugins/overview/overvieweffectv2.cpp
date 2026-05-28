@@ -3582,15 +3582,33 @@ void OverviewEffectV2::postPaintScreen()
 
 bool OverviewEffectV2::event(QEvent *e)
 {
-    if (e->type() == QEvent::ApplicationPaletteChange) {
-        // Qt 6 dispatches ApplicationPaletteChange to every QObject
-        // when QGuiApplication::palette() updates (KDE colour scheme
-        // switch, system theme change). Effects that sample
-        // qApp->palette() at paint-time would otherwise keep showing
-        // the palette that was current when kwin started -- ditto for
-        // anyone who connects to KColorSchemeManager. Trigger a full
-        // repaint so the next frame picks up the new colours.
+    if (e->type() == QEvent::ApplicationPaletteChange
+        || e->type() == QEvent::ApplicationFontChange) {
+        // Qt 6 dispatches ApplicationPaletteChange / ApplicationFontChange
+        // to every QObject when QGuiApplication's palette or font updates
+        // (KDE colour-scheme switch, system theme / font change).
+        //
+        // Paint-time samples of qApp->palette() (the grid/bar outlines)
+        // pick up the new colours on the next repaint for free. But the
+        // themed colours — and the font-derived gridUnit sizing — are
+        // also baked into cached QPainter textures (tile labels, search
+        // field, bar labels, the no-matches message and the bar icons),
+        // whose cache keys are the rendered text only. A repaint alone
+        // re-shows those stale textures, so drop the caches here to force
+        // a rebuild with the current palette/font on the next frame.
+        // event() runs on the main thread outside frame recording, and
+        // the same texture-replacement happens routinely on text changes,
+        // so clearing here is safe. Only matters when the theme/font
+        // changes while the overview is open; a fresh activation already
+        // rebuilds against the current values.
         if (m_visible) {
+            m_tileLabels.clear();
+            m_barLabels.clear();
+            m_searchTexture.reset();
+            m_searchRenderedText.clear();
+            m_noMatchesTexture.reset();
+            m_addIconTexture.reset();
+            m_deleteIconTexture.reset();
             effects->addRepaintFull();
         }
     }
