@@ -34,6 +34,7 @@ class Window;
 #if HAVE_VULKAN
 class VulkanContext;
 class VulkanFramebuffer;
+class VulkanKawaseBlur;
 class VulkanRenderPass;
 class VulkanTexture;
 #endif
@@ -582,24 +583,15 @@ private:
     };
     std::unordered_map<Window *, BlurSrcEntry> m_wallpaperBlurSrcByHandle;
 
-    /// Lazy-built Vulkan blur pipeline objects (sampler / descriptor +
-    /// pipeline layout / render pass / two pipelines). Built on first
-    /// blur, kept for the V2 plugin's lifetime, torn down in the dtor.
-    VkSampler m_blurSampler = VK_NULL_HANDLE;
-    VkDescriptorSetLayout m_blurDsLayout = VK_NULL_HANDLE;
-    VkPipelineLayout m_blurPipelineLayout = VK_NULL_HANDLE;
-    std::unique_ptr<VulkanRenderPass> m_blurRenderPass;
-    VkPipeline m_blurDownsamplePipeline = VK_NULL_HANDLE;
-    VkPipeline m_blurUpsamplePipeline = VK_NULL_HANDLE;
-    VulkanContext *m_blurCtx = nullptr; // ctx the pipelines belong to (for cleanup)
+    /// Shared dual-kawase blur. Lazy-built on first blur, kept for the V2
+    /// plugin's lifetime, torn down in the dtor. Owns the sampler /
+    /// descriptor + pipeline layout / render pass / down+up pipelines; the
+    /// scratch level framebuffers below are built against its render pass.
+    std::unique_ptr<VulkanKawaseBlur> m_kawaseBlur;
 
-    /// Lazy-build the dual-kawase pipeline objects. Returns true on
-    /// success and is a no-op on subsequent calls. Mirrors blur.cpp.
+    /// Lazy-build the shared blur helper. Returns true on success and is a
+    /// no-op on subsequent calls.
     bool ensureBlurPipelines();
-    /// Tear down the lazy-built blur pipeline objects. Called from the
-    /// dtor — per-activation textures are freed separately by
-    /// releaseAllSlots.
-    void destroyBlurPipelines();
     /// (Re)allocate the shared scratch level chain for @p screenSize.
     /// No-op if it already matches.
     bool ensureBlurScratch(const QSize &screenSize);
