@@ -59,28 +59,34 @@ layout(location = 1) in float fragOpacity;
 
 layout(location = 0) out vec4 outColor;
 
-// 9-tap symmetric Gaussian-ish blur at a single LOD with UV offsets.
-// Earlier iterations blended across mip levels (1-5) for "free"
-// coverage but the high mips introduced visible blockiness where
-// mip aliasing showed through the wash. A single mid-mip plus
-// spatial spread costs the same 9 fetch budget and produces a
-// smoother result. Centre + 4 axial + 4 diagonal taps; weights sum
-// to 1.0. Effective radius is set by the 4-texel step at the chosen
-// mip level (cpp passes pc.lod = 1.0 so each step ≈ 8 source
-// pixels in the original wallpaper).
+// Two-LOD kawase-style blur. Each tap is the dual-kawase downsample
+// pattern (centre weight 4 + 4 diagonals weight 1, sum 8) at one mip
+// level — bilinear filtering at the mip already blurs in-pixel, so
+// even a 5-tap diamond reads as a smooth Gaussian. We sample twice:
+// a coarser mip with a wider spread gives the broad backdrop blur,
+// and a finer mip with a tight spread fills in low-frequency detail
+// the coarser sample loses. The 60/40 blend keeps the wide spread
+// dominant without the heavy mip-step aliasing that the previous
+// single-LOD 9-tap path showed at low wash multipliers.
+//
+// The `lod` push-constant arrives as a base offset (cpp passes 1.0);
+// we add to it so cpp can dial overall strength without rewriting
+// the shader's mip selection.
+vec3 kawaseTap(vec2 uv, float lod, float offsetTexels)
+{
+    vec2 t = offsetTexels / vec2(textureSize(atlas, int(lod)));
+    vec4 sum = textureLod(atlas, uv, lod) * 4.0;
+    sum += textureLod(atlas, uv + vec2( t.x,  t.y), lod);
+    sum += textureLod(atlas, uv + vec2(-t.x,  t.y), lod);
+    sum += textureLod(atlas, uv + vec2( t.x, -t.y), lod);
+    sum += textureLod(atlas, uv + vec2(-t.x, -t.y), lod);
+    return sum.rgb / 8.0;
+}
+
 vec3 wallpaperBlur(vec2 uv, float lod)
 {
-    vec2 t = 4.0 / vec2(textureSize(atlas, int(lod)));
-    vec3 c  = textureLod(atlas, uv,                          lod).rgb * 0.20;
-    c      += textureLod(atlas, uv + vec2( t.x,  0.0),       lod).rgb * 0.12;
-    c      += textureLod(atlas, uv + vec2(-t.x,  0.0),       lod).rgb * 0.12;
-    c      += textureLod(atlas, uv + vec2( 0.0,  t.y),       lod).rgb * 0.12;
-    c      += textureLod(atlas, uv + vec2( 0.0, -t.y),       lod).rgb * 0.12;
-    c      += textureLod(atlas, uv + vec2( t.x,  t.y),       lod).rgb * 0.08;
-    c      += textureLod(atlas, uv + vec2(-t.x,  t.y),       lod).rgb * 0.08;
-    c      += textureLod(atlas, uv + vec2( t.x, -t.y),       lod).rgb * 0.08;
-    c      += textureLod(atlas, uv + vec2(-t.x, -t.y),       lod).rgb * 0.08;
-    return c;
+    return 0.60 * kawaseTap(uv, lod + 2.0, 2.5)
+         + 0.40 * kawaseTap(uv, lod + 4.0, 1.0);
 }
 
 void main()
