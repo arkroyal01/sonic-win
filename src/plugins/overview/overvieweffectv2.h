@@ -86,7 +86,12 @@ public:
     /// switching mode mid-activation is a follow-up (proper
     /// crossfade FSM tracked in the parity execution plan).
     enum class Mode { Overview,
-                      GridView };
+                      GridView,
+                      // Present every window sharing the active window's
+                      // resourceClass, across all virtual desktops, in a
+                      // plain uniform grid with the search bar (Ctrl+F7).
+                      // No desktop bar, no wallpaper card.
+                      WindowClass };
 
     /// Activate the effect: starts the slide-in animation.
     /// Defaults to Mode::Overview to preserve existing call sites
@@ -390,6 +395,17 @@ private:
     /// under the standard "Grid View" action name so Plasma's
     /// shortcut UI picks it up alongside the legacy V1 binding.
     QAction *m_gridViewAction = nullptr;
+    /// Toggle for the WindowClass mode (default Ctrl+F7). Mirrors the
+    /// stock windowview "ExposeClass" action, which this fork unbinds
+    /// so V2 owns the shortcut. Uses a distinct object name to avoid a
+    /// KGlobalAccel action-name collision with windowview.
+    QAction *m_exposeClassAction = nullptr;
+
+    /// Active window's resourceClass captured at WindowClass-mode
+    /// activation; reserveSlotsForCurrentDesktop filters every VD's
+    /// windows against it. Empty when not in WindowClass mode (or the
+    /// active window had no class), which yields an empty grid.
+    QString m_windowClassFilter;
 
     /// Touchpad / touchscreen swipe-to-activate handlers. KWin's
     /// gesture API takes QActions for "gesture completed in this

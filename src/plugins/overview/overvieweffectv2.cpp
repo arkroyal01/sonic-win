@@ -313,6 +313,35 @@ OverviewEffectV2::OverviewEffectV2()
         }
     });
 
+    // WindowClass mode (default Ctrl+F7) — present every window sharing the
+    // active window's class across all desktops. The stock windowview effect
+    // owns "ExposeClass"/Ctrl+F7; this fork unbinds it (see
+    // windowvieweffect.cpp) so V2 takes over with this Vulkan grid + search
+    // reimplementation. Distinct object name to avoid a KGlobalAccel
+    // action-name collision with windowview's still-registered action.
+    m_exposeClassAction = new QAction(this);
+    m_exposeClassAction->setObjectName(QStringLiteral("OverviewWindowClass"));
+    m_exposeClassAction->setText(i18nc("@action", "Toggle Present Windows (Current Application)"));
+    m_exposeClassAction->setAutoRepeat(false);
+    const QKeySequence classShortcut = Qt::CTRL | Qt::Key_F7;
+    KGlobalAccel::self()->setDefaultShortcut(m_exposeClassAction, {classShortcut});
+    // NoAutoloading: force Ctrl+F7 onto this action regardless of the saved
+    // config. Effects load alphabetically, so this ("overviewv2") registers
+    // before windowview clears its ExposeClass binding — with plain
+    // autoloading KGlobalAccel sees ExposeClass still holding Ctrl+F7,
+    // assigns us an empty shortcut and *persists* the empty, so the binding
+    // silently dies on every start. Forcing it steals the key from the
+    // (about-to-be-cleared) ExposeClass and overwrites the poisoned entry.
+    KGlobalAccel::self()->setShortcut(m_exposeClassAction, {classShortcut},
+                                      KGlobalAccel::NoAutoloading);
+    connect(m_exposeClassAction, &QAction::triggered, this, [this]() {
+        if (m_visible && m_mode == Mode::WindowClass) {
+            deactivate();
+        } else {
+            activate(Mode::WindowClass);
+        }
+    });
+
     // Touchpad + touchscreen gesture activation. V1 binds 4-finger
     // touchpad swipe up and 3-finger touchscreen swipe up to
     // activate the overview, with the opposite direction to
@@ -350,6 +379,9 @@ OverviewEffectV2::~OverviewEffectV2()
     }
     if (m_gridViewAction) {
         KGlobalAccel::self()->removeAllShortcuts(m_gridViewAction);
+    }
+    if (m_exposeClassAction) {
+        KGlobalAccel::self()->removeAllShortcuts(m_exposeClassAction);
     }
     for (const ElectricBorder &border : std::as_const(m_borderActivate)) {
         effects->unreserveElectricBorder(border, this);
@@ -844,11 +876,24 @@ void OverviewEffectV2::reserveSlotsForCurrentDesktop()
     // overview's `isNormalWindow` filter in WindowHeapView.
     auto *currentDesktop = effects->currentDesktop();
     for (EffectWindow *ew : effects->stackingOrder()) {
-        if (!ew || !currentDesktop || !ew->isOnDesktop(currentDesktop)) {
+        if (!ew) {
             continue;
         }
         Window *handle = ew->window();
         if (!handle) {
+            continue;
+        }
+        // Which windows belong in the heap depends on the mode:
+        //  - WindowClass (Ctrl+F7): every VD's windows whose resourceClass
+        //    matches the active window captured at activation. An empty
+        //    filter (no active window / no class) matches nothing.
+        //  - Overview: current-desktop windows only.
+        if (m_mode == Mode::WindowClass) {
+            if (m_windowClassFilter.isEmpty()
+                || handle->resourceClass() != m_windowClassFilter) {
+                continue;
+            }
+        } else if (!currentDesktop || !ew->isOnDesktop(currentDesktop)) {
             continue;
         }
         // Match V1's effective overview filter (overview/qml/main.qml
@@ -1052,6 +1097,11 @@ void OverviewEffectV2::reserveWallpaperSlot()
 void OverviewEffectV2::reserveBarThumbs()
 {
     if (!effects || !m_atlas || !m_vulkanCtx) {
+        return;
+    }
+    // WindowClass mode draws no desktop bar and no per-VD grid cards, so it
+    // needs none of the bar mini-thumbnails this reserves.
+    if (m_mode == Mode::WindowClass) {
         return;
     }
     auto *currentDesktop = effects->currentDesktop();
@@ -1408,6 +1458,11 @@ void OverviewEffectV2::rebuildBarLayout(const QSize &fbSize)
     m_barTiles.clear();
     m_addTileNdc = QRectF();
     if (!effects) {
+        return;
+    }
+    // No desktop bar in WindowClass mode — leave the tile list empty so the
+    // post-pass draws only the window grid and the search field.
+    if (m_mode == Mode::WindowClass) {
         return;
     }
     const auto desktops = effects->desktops();
@@ -2505,6 +2560,13 @@ bool OverviewEffectV2::drawWallpaperBackground(VkCommandBuffer cmd, const QSize 
         return true;
     }
 
+    // WindowClass mode (Ctrl+F7) presents the app's windows over the plain
+    // blurred backdrop — no Overview wallpaper card, no GridView per-VD
+    // cards. The window grid + search field draw in renderTilesPostPass.
+    if (m_mode == Mode::WindowClass) {
+        return true;
+    }
+
     // Pass 3: sharp wallpaper card at the scaled-down grid area.
     // V1's per-desktop backgroundArea Item renders a second copy of
     // the same wallpaper inside Kirigami.ShadowedTexture (rounded
@@ -2922,7 +2984,12 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
     // on-screen rect to a grid cell; the bar sits at the top.
     rebuildTileLayout(fbSize);
     rebuildBarLayout(fbSize);
-    if (m_tileLayout.empty() && m_barTiles.empty()) {
+    // Keep rendering while a search filter is active even if it currently
+    // matches nothing: the search field is always-visible, and bailing here
+    // (WindowClass mode has no bar, so m_barTiles is always empty) would make
+    // the search bar + "no matching windows" placeholder vanish until the
+    // user backspaced the query back to a matching prefix.
+    if (m_tileLayout.empty() && m_barTiles.empty() && m_searchText.isEmpty()) {
         return;
     }
     // When activating on an empty desktop, seed focus on the bar so
@@ -3423,8 +3490,17 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
         const float ndcX = -ndcW * 0.5f;
         const float gridUnitNdcY = 2.0f * float(QFontMetrics(qApp->font()).height())
             / screenH;
-        const float barZoneBottom = m_barTopNdc + m_barHeightNdc + m_barLabelStripNdc;
-        const float ndcY = barZoneBottom + gridUnitNdcY * 0.5f;
+        float ndcY;
+        if (m_mode == Mode::WindowClass) {
+            // No desktop bar in this mode, so anchor the search field one
+            // gridUnit below the screen top — matching windowview's
+            // ColumnLayout, where the SearchField uses
+            // Layout.topMargin = Kirigami.Units.gridUnit.
+            ndcY = -1.0f + gridUnitNdcY;
+        } else {
+            const float barZoneBottom = m_barTopNdc + m_barHeightNdc + m_barLabelStripNdc;
+            ndcY = barZoneBottom + gridUnitNdcY * 0.5f;
+        }
         OverviewQuadPushConstants pc{};
         pc.quadRectNdc[0] = ndcX;
         pc.quadRectNdc[1] = ndcY;
@@ -3614,6 +3690,16 @@ void OverviewEffectV2::activate()
 
 void OverviewEffectV2::activate(Mode mode)
 {
+    // Capture the target window class up-front, before the keyboard grab
+    // below steals focus from the active window. WindowClass mode presents
+    // every window sharing this resourceClass across all virtual desktops.
+    if (mode == Mode::WindowClass) {
+        EffectWindow *active = effects ? effects->activeWindow() : nullptr;
+        m_windowClassFilter = (active && active->window())
+            ? active->window()->resourceClass()
+            : QString();
+    }
+
     // Mode change while already showing: just flip m_mode and request
     // a repaint. The activation animation has already played; the
     // follow-up FSM stage will add a real crossfade between modes.
@@ -3976,6 +4062,19 @@ void OverviewEffectV2::grabbedKeyboardEvent(QKeyEvent *event)
             deactivate();
         } else {
             activate(Mode::GridView);
+        }
+        return;
+    }
+    // WindowClass toggle (Ctrl+F7). Same rationale as Meta+G: KGlobalAccel
+    // can't fire m_exposeClassAction under the grab. Critically this must run
+    // BEFORE the Ctrl+F1..F12 desktop-switch handling below, which would
+    // otherwise swallow Ctrl+F7 as "switch to desktop 7". In WindowClass it
+    // dismisses; from another mode it switches in.
+    if (event->key() == Qt::Key_F7 && event->modifiers() == Qt::ControlModifier) {
+        if (m_mode == Mode::WindowClass) {
+            deactivate();
+        } else {
+            activate(Mode::WindowClass);
         }
         return;
     }
