@@ -62,6 +62,7 @@ Q_LOGGING_CATEGORY(KWIN_OVERVIEW_V2_LOG, "kwin_overview_v2", QtWarningMsg)
 // clang-format doesn't blow them up to one element per line every
 // time this file is touched.
 #include "shaders/overview_quad_spv.inc"
+#include "shaders/wallpaper_blur_spv.inc"
 
 namespace
 {
@@ -355,6 +356,7 @@ OverviewEffectV2::~OverviewEffectV2()
     }
     releaseAllSlots();
     destroyVulkanPipeline();
+    destroyBlurPipelines();
 #endif
 }
 
@@ -570,6 +572,467 @@ void OverviewEffectV2::destroyVulkanPipeline()
     }
     m_pipelineColorFormat = VK_FORMAT_UNDEFINED;
     m_vulkanCtx = nullptr;
+}
+
+void OverviewEffectV2::destroyBlurPipelines()
+{
+    if (!m_blurCtx) {
+        return;
+    }
+    VkDevice device = m_blurCtx->backend()->device();
+    if (m_blurDownsamplePipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device, m_blurDownsamplePipeline, nullptr);
+        m_blurDownsamplePipeline = VK_NULL_HANDLE;
+    }
+    if (m_blurUpsamplePipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device, m_blurUpsamplePipeline, nullptr);
+        m_blurUpsamplePipeline = VK_NULL_HANDLE;
+    }
+    if (m_blurPipelineLayout != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(device, m_blurPipelineLayout, nullptr);
+        m_blurPipelineLayout = VK_NULL_HANDLE;
+    }
+    if (m_blurDsLayout != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(device, m_blurDsLayout, nullptr);
+        m_blurDsLayout = VK_NULL_HANDLE;
+    }
+    if (m_blurSampler != VK_NULL_HANDLE) {
+        vkDestroySampler(device, m_blurSampler, nullptr);
+        m_blurSampler = VK_NULL_HANDLE;
+    }
+    m_blurRenderPass.reset();
+    m_blurCtx = nullptr;
+}
+
+bool OverviewEffectV2::ensureBlurPipelines()
+{
+    // Lazy-built once per V2 plugin lifetime: sampler, descriptor set
+    // layout (push-descriptor + immutable sampler), pipeline layout
+    // (12-byte push constants: vec2 halfpixel + float offset, matching
+    // the GL blur effect's), a colour-only GENERAL-layout render pass
+    // for the kawase intermediates, and the two graphics pipelines
+    // (downsample + upsample) that share all of that.
+    if (m_blurDownsamplePipeline != VK_NULL_HANDLE
+        && m_blurUpsamplePipeline != VK_NULL_HANDLE) {
+        return true;
+    }
+    if (!m_vulkanCtx) {
+        return false;
+    }
+    auto *backend = m_vulkanCtx->backend();
+    if (!backend) {
+        return false;
+    }
+    VkDevice device = backend->device();
+    m_blurCtx = m_vulkanCtx;
+    static constexpr VkFormat kBlurFmt = VK_FORMAT_R8G8B8A8_UNORM;
+
+    {
+        VkSamplerCreateInfo si{};
+        si.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        si.magFilter = VK_FILTER_LINEAR;
+        si.minFilter = VK_FILTER_LINEAR;
+        si.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        si.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        if (vkCreateSampler(device, &si, nullptr, &m_blurSampler) != VK_SUCCESS) {
+            qCWarning(KWIN_OVERVIEW_V2_LOG) << "OverviewEffectV2: blur sampler create failed";
+            return false;
+        }
+    }
+    {
+        VkDescriptorSetLayoutBinding b{};
+        b.binding = 0;
+        b.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        b.descriptorCount = 1;
+        b.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        b.pImmutableSamplers = &m_blurSampler;
+        VkDescriptorSetLayoutCreateInfo li{};
+        li.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        li.bindingCount = 1;
+        li.pBindings = &b;
+        if (backend->supportsPushDescriptor()) {
+            li.flags |= VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+        }
+        if (vkCreateDescriptorSetLayout(device, &li, nullptr, &m_blurDsLayout) != VK_SUCCESS) {
+            qCWarning(KWIN_OVERVIEW_V2_LOG) << "OverviewEffectV2: blur DS layout create failed";
+            return false;
+        }
+    }
+    {
+        VkPushConstantRange pc{};
+        pc.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        pc.offset = 0;
+        pc.size = 12;
+        VkPipelineLayoutCreateInfo li{};
+        li.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        li.setLayoutCount = 1;
+        li.pSetLayouts = &m_blurDsLayout;
+        li.pushConstantRangeCount = 1;
+        li.pPushConstantRanges = &pc;
+        if (vkCreatePipelineLayout(device, &li, nullptr, &m_blurPipelineLayout) != VK_SUCCESS) {
+            qCWarning(KWIN_OVERVIEW_V2_LOG) << "OverviewEffectV2: blur pipeline layout create failed";
+            return false;
+        }
+    }
+    {
+        VulkanRenderPass::Config cfg;
+        cfg.colorFormat = kBlurFmt;
+        cfg.colorLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        cfg.colorStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
+        cfg.initialLayout = VK_IMAGE_LAYOUT_GENERAL;
+        cfg.finalLayout = VK_IMAGE_LAYOUT_GENERAL;
+        m_blurRenderPass = VulkanRenderPass::create(m_vulkanCtx, cfg);
+        if (!m_blurRenderPass) {
+            qCWarning(KWIN_OVERVIEW_V2_LOG) << "OverviewEffectV2: blur render pass create failed";
+            return false;
+        }
+    }
+    auto makeMod = [&](const uint32_t *code, size_t bytes) -> VkShaderModule {
+        VkShaderModuleCreateInfo si{};
+        si.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        si.codeSize = bytes;
+        si.pCode = code;
+        VkShaderModule mod = VK_NULL_HANDLE;
+        vkCreateShaderModule(device, &si, nullptr, &mod);
+        return mod;
+    };
+    VkShaderModule vertMod = makeMod(OverviewEffectV2Shaders::kBlurVertSpv,
+                                     sizeof(OverviewEffectV2Shaders::kBlurVertSpv));
+    VkShaderModule dsMod = makeMod(OverviewEffectV2Shaders::kBlurDsFragSpv,
+                                   sizeof(OverviewEffectV2Shaders::kBlurDsFragSpv));
+    VkShaderModule usMod = makeMod(OverviewEffectV2Shaders::kBlurUsFragSpv,
+                                   sizeof(OverviewEffectV2Shaders::kBlurUsFragSpv));
+    if (!vertMod || !dsMod || !usMod) {
+        if (vertMod) {
+            vkDestroyShaderModule(device, vertMod, nullptr);
+        }
+        if (dsMod) {
+            vkDestroyShaderModule(device, dsMod, nullptr);
+        }
+        if (usMod) {
+            vkDestroyShaderModule(device, usMod, nullptr);
+        }
+        qCWarning(KWIN_OVERVIEW_V2_LOG) << "OverviewEffectV2: blur shader module create failed";
+        return false;
+    }
+    auto buildPipeline = [&](VkShaderModule frag, VkPipeline *out) -> bool {
+        VkPipelineShaderStageCreateInfo stages[2]{};
+        stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+        stages[0].module = vertMod;
+        stages[0].pName = "main";
+        stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        stages[1].module = frag;
+        stages[1].pName = "main";
+        VkPipelineVertexInputStateCreateInfo vi{};
+        vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+        VkPipelineInputAssemblyStateCreateInfo ia{};
+        ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        VkPipelineViewportStateCreateInfo vp{};
+        vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+        vp.viewportCount = 1;
+        vp.scissorCount = 1;
+        VkPipelineRasterizationStateCreateInfo rs{};
+        rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        rs.polygonMode = VK_POLYGON_MODE_FILL;
+        rs.cullMode = VK_CULL_MODE_NONE;
+        rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        rs.lineWidth = 1.0f;
+        VkPipelineMultisampleStateCreateInfo ms{};
+        ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        VkPipelineColorBlendAttachmentState att{};
+        att.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+            | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        VkPipelineColorBlendStateCreateInfo cb{};
+        cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+        cb.attachmentCount = 1;
+        cb.pAttachments = &att;
+        VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+        VkPipelineDynamicStateCreateInfo dyni{};
+        dyni.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+        dyni.dynamicStateCount = 2;
+        dyni.pDynamicStates = dyn;
+        VkGraphicsPipelineCreateInfo gp{};
+        gp.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        gp.stageCount = 2;
+        gp.pStages = stages;
+        gp.pVertexInputState = &vi;
+        gp.pInputAssemblyState = &ia;
+        gp.pViewportState = &vp;
+        gp.pRasterizationState = &rs;
+        gp.pMultisampleState = &ms;
+        gp.pColorBlendState = &cb;
+        gp.pDynamicState = &dyni;
+        gp.layout = m_blurPipelineLayout;
+        gp.renderPass = m_blurRenderPass->renderPass();
+        gp.subpass = 0;
+        return vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &gp,
+                                         nullptr, out)
+            == VK_SUCCESS;
+    };
+    const bool ok = buildPipeline(dsMod, &m_blurDownsamplePipeline)
+        && buildPipeline(usMod, &m_blurUpsamplePipeline);
+    vkDestroyShaderModule(device, vertMod, nullptr);
+    vkDestroyShaderModule(device, dsMod, nullptr);
+    vkDestroyShaderModule(device, usMod, nullptr);
+    if (!ok) {
+        qCWarning(KWIN_OVERVIEW_V2_LOG) << "OverviewEffectV2: blur graphics pipeline create failed";
+    }
+    return ok;
+}
+
+bool OverviewEffectV2::ensureBlurScratch(const QSize &screenSize)
+{
+    if (screenSize.isEmpty() || !m_vulkanCtx || !m_blurRenderPass) {
+        return false;
+    }
+    if (m_blurScratchScreenSize == screenSize && m_blurScratchLevels.size() == 2) {
+        return true;
+    }
+    m_blurScratchLevels.clear();
+    static constexpr VkFormat kBlurFmt = VK_FORMAT_R8G8B8A8_UNORM;
+    // Two shared scratch levels at screen/8 and /16. The per-VD result
+    // texture serves as level /4 (input to first downsample + final
+    // destination of the last upsample), so we don't need a shared /4.
+    for (int divisor : {8, 16}) {
+        BlurLevel lvl;
+        lvl.size = QSize(std::max(1, screenSize.width() / divisor),
+                         std::max(1, screenSize.height() / divisor));
+        lvl.texture = VulkanTexture::createRenderTarget(m_vulkanCtx, lvl.size, kBlurFmt);
+        if (!lvl.texture || !lvl.texture->isValid()) {
+            qCWarning(KWIN_OVERVIEW_V2_LOG)
+                << "OverviewEffectV2: blur scratch level texture failed at" << lvl.size;
+            m_blurScratchLevels.clear();
+            return false;
+        }
+        lvl.view = lvl.texture->imageView();
+        lvl.framebuffer = VulkanFramebuffer::create(m_vulkanCtx, m_blurRenderPass.get(),
+                                                    lvl.view, lvl.size);
+        if (!lvl.framebuffer) {
+            qCWarning(KWIN_OVERVIEW_V2_LOG)
+                << "OverviewEffectV2: blur scratch level framebuffer failed at" << lvl.size;
+            m_blurScratchLevels.clear();
+            return false;
+        }
+        m_blurScratchLevels.push_back(std::move(lvl));
+    }
+    m_blurScratchScreenSize = screenSize;
+    return true;
+}
+
+bool OverviewEffectV2::blurWallpaperSlot(VkCommandBuffer cmd, Window *handle,
+                                         const VulkanThumbnailAtlas::Slot &slot)
+{
+    // One-shot per overview activation per wallpaper handle. The atlas
+    // slot stores the sharp source; we (1) blit-copy + downscale it to
+    // a per-VD /4 texture, (2) run kawase downsample /4→/8 and /8→/16
+    // through shared scratch, then (3) run kawase upsample /16→/8 and
+    // /8→/4 back into the per-VD texture. Final state of the per-VD
+    // texture is the blurred wallpaper, in GENERAL, ready to be
+    // sampled by drawWallpaperBackground in subsequent frames.
+    if (!handle || !slot.isValid() || slot.isFallback) {
+        return false;
+    }
+    if (!ensureBlurPipelines() || !m_vulkanCtx) {
+        return false;
+    }
+    if (!effects) {
+        return false;
+    }
+    const QRect virtualScreen = effects->virtualScreenGeometry();
+    if (virtualScreen.isEmpty()) {
+        return false;
+    }
+    if (!ensureBlurScratch(virtualScreen.size())) {
+        return false;
+    }
+    static constexpr VkFormat kBlurFmt = VK_FORMAT_R8G8B8A8_UNORM;
+
+    auto &entry = m_wallpaperBlurByHandle[handle];
+    if (entry.generated && entry.texture && entry.texture->isValid()) {
+        return true; // already blurred this activation
+    }
+
+    // Allocate the per-VD result texture on first use. Sized to /4 of
+    // the screen — wallpaper backdrop is heavy blur, finer levels add
+    // nothing visible.
+    if (!entry.texture) {
+        entry.size = QSize(std::max(1, virtualScreen.width() / 4),
+                           std::max(1, virtualScreen.height() / 4));
+        entry.texture = VulkanTexture::createRenderTarget(m_vulkanCtx, entry.size, kBlurFmt);
+        if (!entry.texture || !entry.texture->isValid()) {
+            qCWarning(KWIN_OVERVIEW_V2_LOG)
+                << "OverviewEffectV2: wallpaper blur result texture failed at" << entry.size;
+            return false;
+        }
+        entry.view = entry.texture->imageView();
+        entry.framebuffer = VulkanFramebuffer::create(m_vulkanCtx, m_blurRenderPass.get(),
+                                                      entry.view, entry.size);
+        if (!entry.framebuffer) {
+            qCWarning(KWIN_OVERVIEW_V2_LOG)
+                << "OverviewEffectV2: wallpaper blur framebuffer failed";
+            entry.texture.reset();
+            return false;
+        }
+    }
+
+    auto *backend = m_vulkanCtx->backend();
+    auto pushDescriptor = backend->cmdPushDescriptorSetKHR();
+    if (!pushDescriptor) {
+        return false;
+    }
+
+    auto undefinedToGeneral = [&](VkImage img) {
+        VkImageMemoryBarrier b{};
+        b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        b.srcAccessMask = 0;
+        b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT
+            | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = img;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT
+                                 | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                                 | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &b);
+    };
+    // First use: bring the per-VD result image and scratch images from
+    // UNDEFINED to GENERAL. The scratch transition only needs to happen
+    // the first time the scratch chain exists in this activation;
+    // ensureBlurScratch leaves them undefined on fresh alloc.
+    undefinedToGeneral(entry.texture->image());
+    if (!m_blurScratchInitialised) {
+        for (auto &lvl : m_blurScratchLevels) {
+            undefinedToGeneral(lvl.texture->image());
+        }
+        m_blurScratchInitialised = true;
+    }
+
+    // Barrier so the atlas-pass writes to the slot are visible to the
+    // transfer that blits out of the atlas image.
+    {
+        VkMemoryBarrier mb{};
+        mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    }
+
+    // Step 1: vkCmdBlitImage(atlas slot rect) -> entry.texture (/4).
+    {
+        VkImageBlit blit{};
+        blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        blit.srcOffsets[0] = {slot.rect.x(), slot.rect.y(), 0};
+        blit.srcOffsets[1] = {slot.rect.x() + slot.rect.width(),
+                              slot.rect.y() + slot.rect.height(), 1};
+        blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        blit.dstOffsets[0] = {0, 0, 0};
+        blit.dstOffsets[1] = {entry.size.width(), entry.size.height(), 1};
+        vkCmdBlitImage(cmd, slot.image, VK_IMAGE_LAYOUT_GENERAL,
+                       entry.texture->image(), VK_IMAGE_LAYOUT_GENERAL,
+                       1, &blit, VK_FILTER_LINEAR);
+    }
+
+    // Memory barrier between each render pass: previous write (transfer
+    // or color attachment) must be visible to the next pass's shader
+    // read of that texture.
+    auto passBarrier = [&]() {
+        VkMemoryBarrier mb{};
+        mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT
+                                 | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             0, 1, &mb, 0, nullptr, 0, nullptr);
+    };
+
+    // Common record helper for one kawase pass: bind pipeline + push
+    // descriptor for srcView, viewport+scissor sized to dst, push the
+    // {halfpixel, offset} constants, begin render pass on dstFb, draw
+    // 3 verts (full-screen tri), end.
+    auto recordPass = [&](VkPipeline pipeline, VkImageView srcView, const QSize &srcSize,
+                          VulkanFramebuffer *dstFb, const QSize &dstSize) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+
+        VkDescriptorImageInfo ii{};
+        ii.sampler = VK_NULL_HANDLE; // immutable in the DS layout
+        ii.imageView = srcView;
+        ii.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkWriteDescriptorSet w{};
+        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w.dstBinding = 0;
+        w.descriptorCount = 1;
+        w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        w.pImageInfo = &ii;
+        pushDescriptor(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_blurPipelineLayout, 0, 1, &w);
+
+        struct
+        {
+            float halfpixel[2];
+            float offset;
+        } pc{};
+        pc.halfpixel[0] = 0.5f / float(std::max(1, srcSize.width()));
+        pc.halfpixel[1] = 0.5f / float(std::max(1, srcSize.height()));
+        pc.offset = 1.0f;
+        vkCmdPushConstants(cmd, m_blurPipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT,
+                           0, sizeof(pc), &pc);
+
+        VkViewport vp{0.0f, 0.0f, float(dstSize.width()), float(dstSize.height()), 0.0f, 1.0f};
+        vkCmdSetViewport(cmd, 0, 1, &vp);
+        VkRect2D sc{{0, 0}, {uint32_t(dstSize.width()), uint32_t(dstSize.height())}};
+        vkCmdSetScissor(cmd, 0, 1, &sc);
+
+        const VkRect2D area{{0, 0}, {uint32_t(dstSize.width()), uint32_t(dstSize.height())}};
+        m_blurRenderPass->begin(cmd, dstFb->framebuffer(), area, nullptr, 0);
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+        m_blurRenderPass->end(cmd);
+    };
+
+    BlurLevel &l8 = m_blurScratchLevels[0]; // /8
+    BlurLevel &l16 = m_blurScratchLevels[1]; // /16
+
+    // Downsample chain: /4 -> /8 -> /16.
+    passBarrier();
+    recordPass(m_blurDownsamplePipeline, entry.view, entry.size,
+               l8.framebuffer.get(), l8.size);
+    passBarrier();
+    recordPass(m_blurDownsamplePipeline, l8.view, l8.size,
+               l16.framebuffer.get(), l16.size);
+
+    // Upsample chain: /16 -> /8 -> /4 (back into the per-VD result).
+    passBarrier();
+    recordPass(m_blurUpsamplePipeline, l16.view, l16.size,
+               l8.framebuffer.get(), l8.size);
+    passBarrier();
+    recordPass(m_blurUpsamplePipeline, l8.view, l8.size,
+               entry.framebuffer.get(), entry.size);
+
+    // Final barrier: the result texture's color-attachment write must
+    // be visible to the next frame's main pipeline that samples it.
+    {
+        VkMemoryBarrier mb{};
+        mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             0, 1, &mb, 0, nullptr, 0, nullptr);
+    }
+
+    entry.generated = true;
+    return true;
 }
 
 void OverviewEffectV2::reserveSlotsForCurrentDesktop()
@@ -988,6 +1451,14 @@ void OverviewEffectV2::releaseAllSlots()
     m_gridCardRects.clear();
     m_wallpaperSlotByHandle.clear();
     m_wallpaperHandleByVd.clear();
+    // Drop the pre-blurred wallpaper textures + scratch chain (per the
+    // V2 active-memory rule). The pipeline objects (sampler, layouts,
+    // render pass, pipelines) stay — they're kwin-lifetime and tiny.
+    m_wallpaperBlurByHandle.clear();
+    m_wallpaperBlurSrcByHandle.clear();
+    m_blurScratchLevels.clear();
+    m_blurScratchScreenSize = QSize();
+    m_blurScratchInitialised = false;
     m_barScrollX = 0.0f;
     m_barStripWidthNdc = 0.0f;
     m_barThumbVisRefs.clear();
@@ -2114,6 +2585,17 @@ void OverviewEffectV2::renderWindowsToAtlas()
         }
     }
 
+    // Pre-blur the wallpapers into per-VD textures so the overview
+    // backdrop samples a true dual-kawase result instead of running an
+    // in-shader Gaussian per fragment. One-shot per slot per
+    // activation (gated by entry.generated); subsequent frames find the
+    // cached result and skip.
+    for (auto &[handle, slot] : m_wallpaperSlotByHandle) {
+        if (handle && slot.isValid() && slot.hasContent && !slot.isFallback) {
+            blurWallpaperSlot(cmd, handle, slot);
+        }
+    }
+
     vkRenderer->popOffscreenSlot();
 
     // Async submit; the wait at the top of the next frame's call
@@ -2158,9 +2640,22 @@ bool OverviewEffectV2::drawWallpaperBackground(VkCommandBuffer cmd, const QSize 
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_vkPipeline);
 
+    // Sample the pre-blurred per-VD result when it has been generated;
+    // otherwise fall back to the sharp atlas slot + in-shader two-LOD
+    // kawase (the bridge path for the first frame after activate before
+    // renderWindowsToAtlas has run, and for fallback wallpaper slots).
+    VkImageView srcView = wp.slot.srgbView;
+    bool useBlurred = false;
+    auto blurIt = m_wallpaperBlurByHandle.find(wp.handle);
+    if (blurIt != m_wallpaperBlurByHandle.end() && blurIt->second.generated
+        && blurIt->second.view != VK_NULL_HANDLE) {
+        srcView = blurIt->second.view;
+        useBlurred = true;
+    }
+
     VkDescriptorImageInfo imgInfo{};
     imgInfo.sampler = m_atlas->sampler();
-    imgInfo.imageView = wp.slot.srgbView;
+    imgInfo.imageView = srcView;
     imgInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     if (imgInfo.sampler == VK_NULL_HANDLE) {
         return false;
@@ -2178,10 +2673,10 @@ bool OverviewEffectV2::drawWallpaperBackground(VkCommandBuffer cmd, const QSize 
     VkRect2D scissor{{0, 0}, {uint32_t(fbSize.width()), uint32_t(fbSize.height())}};
     vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-    // Pass 1: wallpaper texture, fullscreen NDC quad. Atlas-resident
-    // slots sample the slot's sub-rect in atlas-space UVs; fallback
-    // slots have a dedicated image of exactly slot.rect.size, so they
-    // sample the full [0,1] texture range.
+    // Pass 1: wallpaper texture, fullscreen NDC quad. Pre-blurred path
+    // samples the whole per-VD texture ([0,1] UV) and uses the plain
+    // texture() shader path. Sharp-fallback samples the atlas slot's
+    // sub-rect and triggers the in-shader two-LOD kawase via pc.lod.
     const float atlasSize = float(VulkanThumbnailAtlas::kAtlasSize);
     const float factor = float(std::clamp(m_activationFactor, 0.0, 1.0));
     OverviewQuadPushConstants pc{};
@@ -2189,29 +2684,52 @@ bool OverviewEffectV2::drawWallpaperBackground(VkCommandBuffer cmd, const QSize 
     pc.quadRectNdc[1] = -1.0f;
     pc.quadRectNdc[2] = 2.0f;
     pc.quadRectNdc[3] = 2.0f;
-    if (wp.slot.isFallback) {
+    if (useBlurred) {
         pc.atlasSlotUv[0] = 0.0f;
         pc.atlasSlotUv[1] = 0.0f;
         pc.atlasSlotUv[2] = 1.0f;
         pc.atlasSlotUv[3] = 1.0f;
+        pc.lod = 0.0f; // pre-blurred — take the plain-sample path
+    } else if (wp.slot.isFallback) {
+        pc.atlasSlotUv[0] = 0.0f;
+        pc.atlasSlotUv[1] = 0.0f;
+        pc.atlasSlotUv[2] = 1.0f;
+        pc.atlasSlotUv[3] = 1.0f;
+        pc.lod = 1.0f;
     } else {
         pc.atlasSlotUv[0] = float(wp.slot.rect.x()) / atlasSize;
         pc.atlasSlotUv[1] = float(wp.slot.rect.y()) / atlasSize;
         pc.atlasSlotUv[2] = float(wp.slot.rect.width()) / atlasSize;
         pc.atlasSlotUv[3] = float(wp.slot.rect.height()) / atlasSize;
+        pc.lod = 1.0f;
     }
-    // LOD for the 9-tap Gaussian-ish blur in
-    // overview_quad.frag::wallpaperBlur. Lower mip than the previous
-    // multi-LOD blend (which sampled mips 1-5 and showed blocky
-    // aliasing between levels). Mip 1 = 2x downsample, then the
-    // shader spreads 9 samples at 4-texel offsets to widen the blur
-    // without resorting to higher mips.
-    pc.lod = 1.0f;
-    pc.opacity = factor;
+    // Backdrop is always fully opaque while m_visible. The cards (Pass 3
+    // in Overview, the grid in Grid View) keep their own opacity = factor
+    // and animate-on-top, but the wallpaper fully covers the scene from
+    // activation through deactivation. Without this clamp, the backdrop
+    // fades with `factor` and the underlying real desktop bleeds through
+    // during the zoom-in/-out animation — visible as flicker, especially
+    // at slow animation speeds. The reveal of the real desktop happens
+    // only at m_visible = false (instant cutoff at the very end of the
+    // deactivation animation).
+    pc.opacity = 1.0f;
     vkCmdPushConstants(cmd, m_vkPipelineLayout,
                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                        0, sizeof(pc), &pc);
     vkCmdDraw(cmd, 4, 1, 0, 0);
+
+    // Backdrop done. Rebind the descriptor back to the sharp atlas
+    // view before any further passes (sharp wallpaper card in Overview
+    // mode, the per-VD wallpaper cards in Grid View, and the grid-card
+    // window thumbnails). All of those push atlas-space UVs at the
+    // bound descriptor — without this rebind they'd sample those UVs
+    // out of the blurred per-VD texture and read garbage (a tiny corner
+    // of the blurred wallpaper rendered through every card). Only the
+    // bottom backdrop should be blurred.
+    if (useBlurred) {
+        imgInfo.imageView = wp.slot.srgbView;
+        pushDescriptor(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_vkPipelineLayout, 0, 1, &write);
+    }
 
     // Pass 2 (theme wash) intentionally dropped. The earlier wash was
     // there to compensate for the mip-based blur's blockiness and
@@ -2293,7 +2811,29 @@ bool OverviewEffectV2::drawWallpaperBackground(VkCommandBuffer cmd, const QSize 
         const float pitch = 2.0f / float(gridSize);
         const float side = pitch * (1.0f - kCardGapFrac);
         m_gridCardRects.clear();
+        // Draw the current desktop last so its wallpaper wins the
+        // stack at factor = 0 — the moment of activation start /
+        // deactivation end, when all cards have lerped to the full
+        // screen and pile on top of each other. Matching the
+        // current desktop's wallpaper there means the cross-fade
+        // into / out of the real desktop is seamless (no pop from a
+        // different VD's wallpaper showing on the last frame of the
+        // overlay).
+        VirtualDesktop *currentDesktop = effects->currentDesktop();
+        std::vector<int> drawOrder;
+        drawOrder.reserve(desktopList.size());
+        int currentIdx = -1;
         for (int i = 0; i < int(desktopList.size()) && i < rows * cols; ++i) {
+            if (desktopList[i] == currentDesktop) {
+                currentIdx = i;
+            } else {
+                drawOrder.push_back(i);
+            }
+        }
+        if (currentIdx >= 0) {
+            drawOrder.push_back(currentIdx);
+        }
+        for (int i : drawOrder) {
             VirtualDesktop *vd = desktopList[i];
             const int row = i / cols;
             const int col = i % cols;
@@ -2345,7 +2885,13 @@ bool OverviewEffectV2::drawWallpaperBackground(VkCommandBuffer cmd, const QSize 
                 cell.tintRgba[2] = 0.35f;
                 cell.tintRgba[3] = 1.0f;
             }
-            cell.opacity = factor;
+            // Cards stay fully opaque while they lerp from full-screen
+            // (factor = 0) to their settled cells (factor = 1). The
+            // motion is the dominant animation, not a fade. At factor = 0
+            // the current VD's card (drawn last) covers the screen with
+            // the current wallpaper, so the cross-fade into the real
+            // desktop on the very next frame is a no-op visually.
+            cell.opacity = 1.0f;
             setCornerRadiusUv(cell, fbSize, roundedRadiusPx(kRoundedRadiusCardFrac));
             vkCmdPushConstants(cmd, m_vkPipelineLayout,
                                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -2426,7 +2972,14 @@ bool OverviewEffectV2::drawWallpaperBackground(VkCommandBuffer cmd, const QSize 
                 w.atlasSlotUv[1] = (float(g.slot.rect.y()) + float(g.slot.rect.height()) * iyT) / atlasSize;
                 w.atlasSlotUv[2] = float(g.slot.rect.width()) * (1.0f - ixL - ixR) / atlasSize;
                 w.atlasSlotUv[3] = float(g.slot.rect.height()) * (1.0f - iyT - iyB) / atlasSize;
-                w.opacity = factor;
+                // The current desktop's windows stay fully opaque
+                // throughout the lerp so the very last post-pass frame
+                // (factor → 0, card filling the screen, windows at their
+                // real positions) matches what kwin reveals on
+                // m_visible = false — no pop-in of windows when the
+                // overlay disappears. Non-current desktops' windows
+                // fade with factor as their cards shrink / grow.
+                w.opacity = (vd == currentDesktop) ? 1.0f : factor;
                 setCornerRadiusUv(w, fbSize, roundedRadiusPx(kRoundedRadiusMiniFrac));
                 vkCmdPushConstants(cmd, m_vkPipelineLayout,
                                    VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,

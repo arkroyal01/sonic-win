@@ -538,6 +538,77 @@ private:
     std::unordered_map<VirtualDesktop *, Window *> m_wallpaperHandleByVd;
     std::unordered_map<Window *, VulkanThumbnailAtlas::Slot> m_wallpaperSlotByHandle;
 
+    /// Pre-blurred wallpaper for the overview backdrop. The atlas slot
+    /// stores the sharp wallpaper; this map holds a per-handle dual-
+    /// kawase blur generated once per overview activation and sampled
+    /// by drawWallpaperBackground in place of the in-shader blur path.
+    /// Keyed by the same Window* as m_wallpaperSlotByHandle; freed in
+    /// releaseAllSlots.
+    struct WallpaperBlurEntry
+    {
+        std::unique_ptr<VulkanTexture> texture;
+        std::unique_ptr<VulkanFramebuffer> framebuffer;
+        VkImageView view = VK_NULL_HANDLE;
+        QSize size;
+        bool generated = false;
+    };
+    std::unordered_map<Window *, WallpaperBlurEntry> m_wallpaperBlurByHandle;
+
+    /// Shared scratch chain for the dual-kawase passes. Three levels at
+    /// /4, /8, /16 of the screen — starting the chain already at /4
+    /// keeps VRAM small (~1 MB total) and the wallpaper backdrop is
+    /// heavy-blur so finer levels add nothing. Allocated lazily on the
+    /// first blur of an activation, released in releaseAllSlots.
+    struct BlurLevel
+    {
+        std::unique_ptr<VulkanTexture> texture;
+        std::unique_ptr<VulkanFramebuffer> framebuffer;
+        VkImageView view = VK_NULL_HANDLE;
+        QSize size;
+    };
+    std::vector<BlurLevel> m_blurScratchLevels;
+    QSize m_blurScratchScreenSize; // size the current scratch was allocated for
+    bool m_blurScratchInitialised = false; // GPU has transitioned scratch images to GENERAL
+
+    /// Per-handle "blur source" texture: the atlas slot's contents
+    /// copied out via vkCmdBlitImage so the kawase chain reads from
+    /// a full-extent texture rather than a sub-rect of the atlas. Same
+    /// resolution as the slot. Freed alongside the blur result.
+    struct BlurSrcEntry
+    {
+        std::unique_ptr<VulkanTexture> texture;
+        VkImageView view = VK_NULL_HANDLE;
+        QSize size;
+    };
+    std::unordered_map<Window *, BlurSrcEntry> m_wallpaperBlurSrcByHandle;
+
+    /// Lazy-built Vulkan blur pipeline objects (sampler / descriptor +
+    /// pipeline layout / render pass / two pipelines). Built on first
+    /// blur, kept for the V2 plugin's lifetime, torn down in the dtor.
+    VkSampler m_blurSampler = VK_NULL_HANDLE;
+    VkDescriptorSetLayout m_blurDsLayout = VK_NULL_HANDLE;
+    VkPipelineLayout m_blurPipelineLayout = VK_NULL_HANDLE;
+    std::unique_ptr<VulkanRenderPass> m_blurRenderPass;
+    VkPipeline m_blurDownsamplePipeline = VK_NULL_HANDLE;
+    VkPipeline m_blurUpsamplePipeline = VK_NULL_HANDLE;
+    VulkanContext *m_blurCtx = nullptr; // ctx the pipelines belong to (for cleanup)
+
+    /// Lazy-build the dual-kawase pipeline objects. Returns true on
+    /// success and is a no-op on subsequent calls. Mirrors blur.cpp.
+    bool ensureBlurPipelines();
+    /// Tear down the lazy-built blur pipeline objects. Called from the
+    /// dtor — per-activation textures are freed separately by
+    /// releaseAllSlots.
+    void destroyBlurPipelines();
+    /// (Re)allocate the shared scratch level chain for @p screenSize.
+    /// No-op if it already matches.
+    bool ensureBlurScratch(const QSize &screenSize);
+    /// Record the dual-kawase blur for one wallpaper slot into @p cmd,
+    /// producing or refreshing the matching m_wallpaperBlurByHandle
+    /// entry. Caller manages the command buffer (begin/end + submit).
+    bool blurWallpaperSlot(VkCommandBuffer cmd, Window *handle,
+                           const VulkanThumbnailAtlas::Slot &slot);
+
     /// Per-off-desktop-window visibility refs, held for the entire
     /// overview lifetime. Without these, WindowItem::computeVisibility
     /// returns false for off-desktop windows and renderItem writes
