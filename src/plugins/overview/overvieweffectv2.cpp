@@ -1668,6 +1668,12 @@ void OverviewEffectV2::updateSearchTexture()
     const int gridUnitPx = QFontMetrics(qApp->font()).height();
     const int kWidth = 20 * gridUnitPx;
     const int kHeight = 2 * gridUnitPx;
+    // Spacing tracks the font (≈ Kirigami.Units.smallSpacing), same
+    // formula the tile labels use, so the field's internal proportions
+    // hold at any DPI / font size. Corner radius + border weight stay
+    // fixed small values, matching Kirigami's cornerRadius / border
+    // (those are device-pixel units, not font-scaled).
+    const int kSmallSpacing = std::max(2, gridUnitPx / 4);
     const QSize size(kWidth, kHeight);
 
     QImage img(size, QImage::Format_RGBA8888_Premultiplied);
@@ -1725,7 +1731,7 @@ void OverviewEffectV2::updateSearchTexture()
 
     const QFontMetrics fm(font);
     const int textBaseline = (kHeight + fm.ascent() - fm.descent()) / 2;
-    const int textX = kIconX + kIconSize + 6;
+    const int textX = kIconX + kIconSize + 2 * kSmallSpacing;
     if (m_searchText.isEmpty()) {
         // Empty state: icon only, no caret. V1 shows a "Search…"
         // placeholder string from Plasma's i18n catalog; reusing it
@@ -1737,12 +1743,13 @@ void OverviewEffectV2::updateSearchTexture()
         p.setPen(QColor(255, 255, 255, 240));
         // Elide-left so the cursor (right edge) stays visible.
         const QString display = fm.elidedText(m_searchText,
-                                              Qt::ElideLeft, kWidth - textX - 8);
+                                              Qt::ElideLeft, kWidth - textX - 2 * kSmallSpacing);
         p.drawText(textX, textBaseline, display);
         // Caret: thin vertical line at the right edge of rendered text.
-        const int caretX = textX + fm.horizontalAdvance(display) + 2;
-        if (caretX < kWidth - 8) {
-            p.fillRect(QRect(caretX, 6, 2, kHeight - 12),
+        const int caretX = textX + fm.horizontalAdvance(display) + kSmallSpacing;
+        if (caretX < kWidth - 2 * kSmallSpacing) {
+            p.fillRect(QRect(caretX, 2 * kSmallSpacing, std::max(2, kSmallSpacing - 1),
+                             kHeight - 4 * kSmallSpacing),
                        QColor(255, 255, 255, 220));
         }
     }
