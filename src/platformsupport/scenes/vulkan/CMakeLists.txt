@@ -103,6 +103,9 @@ target_sources(kwin PRIVATE
 
     # Shared mipmapped atlas for the WindowThumbnail Vulkan pipeline.
     vulkanthumbnailatlas.cpp
+
+    # Reusable dual-kawase blur (blur effect + overview wallpaper backdrop).
+    vulkankawaseblur.cpp
 )
 
 target_link_libraries(kwin PRIVATE
