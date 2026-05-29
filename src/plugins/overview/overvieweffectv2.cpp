@@ -3050,7 +3050,14 @@ bool OverviewEffectV2::drawWallpaperBackground(VkCommandBuffer cmd, const QSize 
         card.atlasSlotUv[2] = float(wp.slot.rect.width()) / atlasSize;
         card.atlasSlotUv[3] = float(wp.slot.rect.height()) / atlasSize;
     }
-    card.opacity = factor;
+    // Sharp wallpaper card is opaque throughout. It grows from full-
+    // screen (factor = 0) to the grid area (factor = 1); at factor = 0
+    // it fully covers the opaque blurred backdrop with the sharp
+    // wallpaper, so the overlay's first/last frame matches the live
+    // desktop exactly. Fading it with factor instead would double-
+    // expose it against the backdrop and reintroduce the entry/exit
+    // flicker this stage removes.
+    card.opacity = 1.0f;
     // lod stays 0 — the card uses the sharp wallpaper, not the
     // blurred mip cascade.
     setCornerRadiusUv(card, fbSize, roundedRadiusPx(kRoundedRadiusCardFrac));
@@ -3291,7 +3298,17 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
         pc.atlasSlotUv[1] = uvY + uvH * iyT;
         pc.atlasSlotUv[2] = uvW * (1.0f - ixL - ixR);
         pc.atlasSlotUv[3] = uvH * (1.0f - iyT - iyB);
-        pc.opacity = factor;
+        // Heap tiles stay fully opaque and only lerp their position
+        // (realNdc -> gridNdc), so each window visibly travels from
+        // its real on-screen rect into its grid cell on entry and back
+        // out on exit instead of cross-fading. At factor = 0 the tiles
+        // sit at their real positions over the full-screen sharp
+        // wallpaper card, matching the live desktop the overlay
+        // covers/reveals — the desktop is only ever swapped at the
+        // animation endpoints (m_visible flip), so there's no fade or
+        // bleed-through during the zoom. Mirrors the Grid View
+        // treatment (cards/windows clamp opacity, lerp position only).
+        pc.opacity = 1.0f;
         vkCmdPushConstants(cmd, m_vkPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                            0, sizeof(pc), &pc);
         vkCmdDraw(cmd, 4, 1, 0, 0);
