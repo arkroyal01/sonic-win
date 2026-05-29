@@ -64,8 +64,13 @@ WindowViewEffect::WindowViewEffect()
 
     m_exposeClassAction->setObjectName(QStringLiteral("ExposeClass"));
     m_exposeClassAction->setText(i18n("Toggle Present Windows (Window class)"));
-    KGlobalAccel::self()->setDefaultShortcut(m_exposeClassAction, QList<QKeySequence>() << (Qt::CTRL | Qt::Key_F7));
-    KGlobalAccel::self()->setShortcut(m_exposeClassAction, QList<QKeySequence>() << (Qt::CTRL | Qt::Key_F7));
+    // Ctrl+F7 is owned by OverviewEffectV2's WindowClass mode on this fork
+    // (Vulkan grid + search-bar reimplementation of present-windows-by-class).
+    // Leave this action registered but unbound so the two effects don't fight
+    // over the global shortcut; users can still rebind it if they prefer the
+    // QML windowview variant.
+    KGlobalAccel::self()->setDefaultShortcut(m_exposeClassAction, QList<QKeySequence>());
+    KGlobalAccel::self()->setShortcut(m_exposeClassAction, QList<QKeySequence>(), KGlobalAccel::NoAutoloading);
     m_shortcutClass = KGlobalAccel::self()->shortcut(m_exposeClassAction);
     connect(m_exposeClassAction, &QAction::triggered, this, [this]() {
         toggleMode(ModeWindowClass);
