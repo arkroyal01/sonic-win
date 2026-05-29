@@ -25,6 +25,7 @@ class VulkanTexture;
 class VulkanContext;
 class VulkanRenderPass;
 class VulkanFramebuffer;
+class VulkanKawaseBlur;
 }
 #endif
 
@@ -117,14 +118,12 @@ private:
     bool initVulkanResources();
     VkRenderPass m_vulkanResumePass = VK_NULL_HANDLE;
     VulkanContext *m_vulkanCtx = nullptr;
-    std::unique_ptr<VulkanRenderPass> m_vulkanBlurPass;
-    VkDescriptorSetLayout m_vulkanBlurDsLayout = VK_NULL_HANDLE;
-    VkPipelineLayout m_vulkanBlurPipelineLayout = VK_NULL_HANDLE;
-    VkPipeline m_vulkanDownsamplePipeline = VK_NULL_HANDLE;
-    VkPipeline m_vulkanUpsamplePipeline = VK_NULL_HANDLE;
+    // Shared dual-kawase blur: owns the sampler / descriptor + pipeline
+    // layout / intermediate render pass / down+up pipelines. The composite
+    // pipeline below binds the same descriptor set + pipeline layout.
+    std::unique_ptr<VulkanKawaseBlur> m_kawaseBlur;
     VkPipeline m_vulkanCompositePipeline = VK_NULL_HANDLE;
     VkRenderPass m_vulkanCompositePass = VK_NULL_HANDLE;
-    VkSampler m_vulkanBlurSampler = VK_NULL_HANDLE;
 #endif
 
 private:
