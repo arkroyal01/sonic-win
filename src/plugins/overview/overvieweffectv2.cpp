@@ -239,6 +239,17 @@ OverviewEffectV2::OverviewEffectV2()
         if (m_animation.direction() == QVariantAnimation::Backward) {
             m_visible = false;
 #if HAVE_VULKAN
+            // Stop scheduling atlas writes. Deactivate() used to do
+            // this at the START of the slide-out, but that froze the
+            // window thumbnails for the duration of the animation —
+            // the atlas slots stopped re-rendering, so any window
+            // showing live content (video, animation, terminal cursor)
+            // turned static the moment the user triggered exit. Keep
+            // preFrameRender connected through the lerp; disconnect it
+            // here, the instant the animation completes, alongside the
+            // post-pass unregister + slot release.
+            QObject::disconnect(m_preFrameConnection);
+            m_preFrameConnection = {};
             // Stop drawing tiles, then release atlas slots. Order
             // matters: as long as the post-pass is registered, the
             // renderer will try to sample from the atlas slots, so
@@ -3964,11 +3975,14 @@ void OverviewEffectV2::deactivate()
         return;
     }
 #if HAVE_VULKAN
-    // Stop scheduling atlas writes as soon as deactivation starts; the
-    // slot resources are released only after the slide-out animation
-    // completes (the existing m_animation.finished slot handles that).
-    QObject::disconnect(m_preFrameConnection);
-    m_preFrameConnection = {};
+    // Activity-change tracking is no longer needed while we slide out;
+    // the slot release at animation-finished handles the cleanup. The
+    // preFrameRender connection deliberately stays live for the
+    // duration of the slide-out so window thumbnails keep re-rendering
+    // (live video, animated cursors, terminal output) instead of
+    // freezing to a stale snapshot the instant exit is triggered.
+    // m_preFrameConnection is disconnected in the m_animation.finished
+    // handler alongside the post-pass unregister + slot release.
     QObject::disconnect(m_activityConnection);
     m_activityConnection = {};
 #endif
