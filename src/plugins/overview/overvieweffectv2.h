@@ -91,7 +91,27 @@ public:
                       // resourceClass, across all virtual desktops, in a
                       // plain uniform grid with the search bar (Ctrl+F7).
                       // No desktop bar, no wallpaper card.
-                      WindowClass };
+                      WindowClass,
+                      // Present all windows on the current virtual desktop
+                      // in the same plain Expose grid (Ctrl+F9). Same UI as
+                      // WindowClass, current-desktop collection instead of a
+                      // class filter.
+                      WindowsCurrentDesktop,
+                      // Present every window on every virtual desktop in the
+                      // same plain Expose grid (Ctrl+F10). No desktop/class
+                      // filter at all.
+                      WindowsAllDesktops };
+
+    /// True for the plain "Expose" presentations (WindowClass +
+    /// WindowsCurrentDesktop + WindowsAllDesktops): a uniform window grid +
+    /// top search bar over the blurred backdrop, with no desktop bar and no
+    /// wallpaper card. Overview / GridView keep the full chrome.
+    bool isPlainExposeMode() const
+    {
+        return m_mode == Mode::WindowClass
+            || m_mode == Mode::WindowsCurrentDesktop
+            || m_mode == Mode::WindowsAllDesktops;
+    }
 
     /// Activate the effect: starts the slide-in animation.
     /// Defaults to Mode::Overview to preserve existing call sites
@@ -400,6 +420,16 @@ private:
     /// so V2 owns the shortcut. Uses a distinct object name to avoid a
     /// KGlobalAccel action-name collision with windowview.
     QAction *m_exposeClassAction = nullptr;
+    /// Toggle for the WindowsCurrentDesktop mode (default Ctrl+F9). Mirrors
+    /// the stock windowview "Expose" action, which this fork unbinds so V2
+    /// owns the shortcut. Distinct object name to avoid a KGlobalAccel
+    /// collision with windowview.
+    QAction *m_exposeCurrentDesktopAction = nullptr;
+    /// Toggle for the WindowsAllDesktops mode (default Ctrl+F10). Mirrors the
+    /// stock windowview "ExposeAll" action, which this fork unbinds so V2
+    /// owns the shortcut. Distinct object name to avoid a KGlobalAccel
+    /// collision with windowview.
+    QAction *m_exposeAllAction = nullptr;
 
     /// Active window's resourceClass captured at WindowClass-mode
     /// activation; reserveSlotsForCurrentDesktop filters every VD's

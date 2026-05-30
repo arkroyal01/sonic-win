@@ -345,6 +345,48 @@ OverviewEffectV2::OverviewEffectV2()
         }
     });
 
+    // WindowsCurrentDesktop mode (default Ctrl+F9) — present all windows on
+    // the current desktop in the same plain Expose grid as Ctrl+F7. Takes
+    // over the stock windowview "Expose"/Ctrl+F9 binding (unbound in
+    // windowvieweffect.cpp). Same NoAutoloading rationale as the WindowClass
+    // action above: forced so the alphabetical-load conflict with windowview
+    // doesn't poison the binding with an empty shortcut.
+    m_exposeCurrentDesktopAction = new QAction(this);
+    m_exposeCurrentDesktopAction->setObjectName(QStringLiteral("OverviewExpose"));
+    m_exposeCurrentDesktopAction->setText(i18nc("@action", "Toggle Present Windows (Current Desktop)"));
+    m_exposeCurrentDesktopAction->setAutoRepeat(false);
+    const QKeySequence exposeShortcut = Qt::CTRL | Qt::Key_F9;
+    KGlobalAccel::self()->setDefaultShortcut(m_exposeCurrentDesktopAction, {exposeShortcut});
+    KGlobalAccel::self()->setShortcut(m_exposeCurrentDesktopAction, {exposeShortcut},
+                                      KGlobalAccel::NoAutoloading);
+    connect(m_exposeCurrentDesktopAction, &QAction::triggered, this, [this]() {
+        if (m_visible && m_mode == Mode::WindowsCurrentDesktop) {
+            deactivate();
+        } else {
+            activate(Mode::WindowsCurrentDesktop);
+        }
+    });
+
+    // WindowsAllDesktops mode (default Ctrl+F10) — present every window on
+    // every desktop in the plain Expose grid. Takes over the stock windowview
+    // "ExposeAll"/Ctrl+F10 binding (unbound in windowvieweffect.cpp). Same
+    // NoAutoloading rationale as the other Expose actions.
+    m_exposeAllAction = new QAction(this);
+    m_exposeAllAction->setObjectName(QStringLiteral("OverviewExposeAll"));
+    m_exposeAllAction->setText(i18nc("@action", "Toggle Present Windows (All Desktops)"));
+    m_exposeAllAction->setAutoRepeat(false);
+    const QKeySequence exposeAllShortcut = Qt::CTRL | Qt::Key_F10;
+    KGlobalAccel::self()->setDefaultShortcut(m_exposeAllAction, {exposeAllShortcut});
+    KGlobalAccel::self()->setShortcut(m_exposeAllAction, {exposeAllShortcut},
+                                      KGlobalAccel::NoAutoloading);
+    connect(m_exposeAllAction, &QAction::triggered, this, [this]() {
+        if (m_visible && m_mode == Mode::WindowsAllDesktops) {
+            deactivate();
+        } else {
+            activate(Mode::WindowsAllDesktops);
+        }
+    });
+
     // Touchpad + touchscreen gesture activation. V1 binds 4-finger
     // touchpad swipe up and 3-finger touchscreen swipe up to
     // activate the overview, with the opposite direction to
@@ -385,6 +427,12 @@ OverviewEffectV2::~OverviewEffectV2()
     }
     if (m_exposeClassAction) {
         KGlobalAccel::self()->removeAllShortcuts(m_exposeClassAction);
+    }
+    if (m_exposeCurrentDesktopAction) {
+        KGlobalAccel::self()->removeAllShortcuts(m_exposeCurrentDesktopAction);
+    }
+    if (m_exposeAllAction) {
+        KGlobalAccel::self()->removeAllShortcuts(m_exposeAllAction);
     }
     for (const ElectricBorder &border : std::as_const(m_borderActivate)) {
         effects->unreserveElectricBorder(border, this);
@@ -890,12 +938,15 @@ void OverviewEffectV2::reserveSlotsForCurrentDesktop()
         //  - WindowClass (Ctrl+F7): every VD's windows whose resourceClass
         //    matches the active window captured at activation. An empty
         //    filter (no active window / no class) matches nothing.
-        //  - Overview: current-desktop windows only.
+        //  - WindowsAllDesktops (Ctrl+F10): every window, no filter.
+        //  - Overview / WindowsCurrentDesktop (Ctrl+F9): current desktop only.
         if (m_mode == Mode::WindowClass) {
             if (m_windowClassFilter.isEmpty()
                 || handle->resourceClass() != m_windowClassFilter) {
                 continue;
             }
+        } else if (m_mode == Mode::WindowsAllDesktops) {
+            // No desktop/class gate — every window across all VDs.
         } else if (!currentDesktop || !ew->isOnDesktop(currentDesktop)) {
             continue;
         }
@@ -1102,9 +1153,10 @@ void OverviewEffectV2::reserveBarThumbs()
     if (!effects || !m_atlas || !m_vulkanCtx) {
         return;
     }
-    // WindowClass mode draws no desktop bar and no per-VD grid cards, so it
-    // needs none of the bar mini-thumbnails this reserves.
-    if (m_mode == Mode::WindowClass) {
+    // Plain Expose modes (WindowClass / WindowsCurrentDesktop) draw no
+    // desktop bar and no per-VD grid cards, so they need none of the bar
+    // mini-thumbnails this reserves.
+    if (isPlainExposeMode()) {
         return;
     }
     auto *currentDesktop = effects->currentDesktop();
@@ -1386,10 +1438,20 @@ void OverviewEffectV2::rebuildTileLayout(const QSize &fbSize)
     // gives ~85% × 85% which closes most of the gap. kGridTop stays
     // below the search bar's quad bottom (-0.72) so the search
     // strip fits between the desktop bar and the grid top.
-    constexpr float kGridTop = -0.72f;
     constexpr float kGridBottom = 0.98f;
     const float screenW = std::max(1.0f, float(fbSize.width()));
     const float screenH = std::max(1.0f, float(fbSize.height()));
+    // Grid top. Overview/GridView leave room for the desktop bar + search
+    // strip (-0.72). The plain Expose modes have no bar, so the grid reclaims
+    // that vertical space and starts just below the top search field: the
+    // field sits at -1 + gridUnit (top margin) and is 2*gridUnit tall (see
+    // updateSearchTexture: kHeight = 2*gridUnitPx), so its bottom is at
+    // -1 + 3*gridUnit; one more gridUnit of gap puts the grid at -1 + 4*gridUnit.
+    float kGridTop = -0.72f;
+    if (isPlainExposeMode()) {
+        const float gridUnitNdcY = 2.0f * float(QFontMetrics(qApp->font()).height()) / screenH;
+        kGridTop = -1.0f + gridUnitNdcY * 4.0f;
+    }
     // Match the wallpaper card's settled rect (drawWallpaperBackground
     // computes the same formula). V1's QML positions the window heap
     // *inside* the per-VD card; without this match the cells were
@@ -1463,9 +1525,9 @@ void OverviewEffectV2::rebuildBarLayout(const QSize &fbSize)
     if (!effects) {
         return;
     }
-    // No desktop bar in WindowClass mode — leave the tile list empty so the
-    // post-pass draws only the window grid and the search field.
-    if (m_mode == Mode::WindowClass) {
+    // No desktop bar in the plain Expose modes — leave the tile list empty so
+    // the post-pass draws only the window grid and the search field.
+    if (isPlainExposeMode()) {
         return;
     }
     const auto desktops = effects->desktops();
@@ -2563,10 +2625,10 @@ bool OverviewEffectV2::drawWallpaperBackground(VkCommandBuffer cmd, const QSize 
         return true;
     }
 
-    // WindowClass mode (Ctrl+F7) presents the app's windows over the plain
-    // blurred backdrop — no Overview wallpaper card, no GridView per-VD
+    // Plain Expose modes (Ctrl+F7 / Ctrl+F9) present the windows over the
+    // plain blurred backdrop — no Overview wallpaper card, no GridView per-VD
     // cards. The window grid + search field draw in renderTilesPostPass.
-    if (m_mode == Mode::WindowClass) {
+    if (isPlainExposeMode()) {
         return true;
     }
 
@@ -3494,8 +3556,8 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
         const float gridUnitNdcY = 2.0f * float(QFontMetrics(qApp->font()).height())
             / screenH;
         float ndcY;
-        if (m_mode == Mode::WindowClass) {
-            // No desktop bar in this mode, so anchor the search field one
+        if (isPlainExposeMode()) {
+            // No desktop bar in these modes, so anchor the search field one
             // gridUnit below the screen top — matching windowview's
             // ColumnLayout, where the SearchField uses
             // Layout.topMargin = Kirigami.Units.gridUnit.
@@ -3583,7 +3645,13 @@ void OverviewEffectV2::renderTilesPostPass(VkCommandBuffer cmd, const QSize &fbS
             const float barBottomPx = float(screen.y()) + 0.10f * float(screen.height());
             const float localPress = std::max(1.0f, float(m_dragPressGlobal.y()) - barBottomPx);
             const float localPos = float(m_dragCurrentGlobal.y()) - barBottomPx;
-            dragScale = std::clamp(localPos / localPress, 0.1f, 1.0f);
+            // The drag-toward-bar shrink is a drop-onto-desktop affordance.
+            // The plain Expose modes (Ctrl+F7 / Ctrl+F9) have no desktop bar,
+            // so keep the dragged tile at full size instead of shrinking it
+            // as it moves up.
+            if (!isPlainExposeMode()) {
+                dragScale = std::clamp(localPos / localPress, 0.1f, 1.0f);
+            }
             cursorNdcX = -1.0f + 2.0f * float(m_dragCurrentGlobal.x() - screen.x()) / screenW;
             cursorNdcY = -1.0f + 2.0f * float(m_dragCurrentGlobal.y() - screen.y()) / screenH;
             pressXNdc = -1.0f + 2.0f * float(m_dragPressGlobal.x() - screen.x()) / screenW;
@@ -4078,6 +4146,28 @@ void OverviewEffectV2::grabbedKeyboardEvent(QKeyEvent *event)
             deactivate();
         } else {
             activate(Mode::WindowClass);
+        }
+        return;
+    }
+    // WindowsCurrentDesktop toggle (Ctrl+F9). Same as F7 — must precede the
+    // Ctrl+F1..F12 desktop-switch handler below, which would otherwise treat
+    // Ctrl+F9 as "switch to desktop 9".
+    if (event->key() == Qt::Key_F9 && event->modifiers() == Qt::ControlModifier) {
+        if (m_mode == Mode::WindowsCurrentDesktop) {
+            deactivate();
+        } else {
+            activate(Mode::WindowsCurrentDesktop);
+        }
+        return;
+    }
+    // WindowsAllDesktops toggle (Ctrl+F10). Same as F7/F9 — must precede the
+    // Ctrl+F1..F12 desktop-switch handler below (Ctrl+F10 = "switch to
+    // desktop 10").
+    if (event->key() == Qt::Key_F10 && event->modifiers() == Qt::ControlModifier) {
+        if (m_mode == Mode::WindowsAllDesktops) {
+            deactivate();
+        } else {
+            activate(Mode::WindowsAllDesktops);
         }
         return;
     }
