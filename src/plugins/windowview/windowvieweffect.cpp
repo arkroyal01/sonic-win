@@ -44,10 +44,29 @@ WindowViewEffect::WindowViewEffect()
 
     setSource(QUrl::fromLocalFile(QStandardPaths::locate(QStandardPaths::GenericDataLocation, KWIN_DATADIR + QStringLiteral("/effects/windowview/qml/main.qml"))));
 
+    // OverviewEffectV2 reimplements Expose / ExposeAll / ExposeClass as its
+    // Ctrl+F9 / F10 / F7 modes, but only under the Vulkan backend (its
+    // renderer is Vulkan-only) and only when enabled (KWIN_OVERVIEW_V2 != 0).
+    // When V2 owns those modes we yield the shortcuts to it; otherwise — the
+    // OpenGL backend, or V2 disabled — this QML effect keeps them so the GL
+    // path retains working present-windows. The keep-default keys must match
+    // OverviewEffectV2's so a backend switch is seamless.
+    const bool overviewV2OwnsExpose =
+        qEnvironmentVariable("KWIN_OVERVIEW_V2", QStringLiteral("1")).toInt() != 0
+        && effects && effects->isVulkanCompositing();
+    auto applyExposeShortcut = [overviewV2OwnsExpose](QAction *action, const QList<QKeySequence> &keys) {
+        KGlobalAccel::self()->setDefaultShortcut(action, keys);
+        if (overviewV2OwnsExpose) {
+            // Force-clear so V2 can claim the key without a conflict.
+            KGlobalAccel::self()->setShortcut(action, QList<QKeySequence>(), KGlobalAccel::NoAutoloading);
+        } else {
+            KGlobalAccel::self()->setShortcut(action, keys);
+        }
+    };
+
     m_exposeAction->setObjectName(QStringLiteral("Expose"));
     m_exposeAction->setText(i18n("Toggle Present Windows (Current desktop)"));
-    KGlobalAccel::self()->setDefaultShortcut(m_exposeAction, QList<QKeySequence>() << (Qt::CTRL | Qt::Key_F9));
-    KGlobalAccel::self()->setShortcut(m_exposeAction, QList<QKeySequence>() << (Qt::CTRL | Qt::Key_F9));
+    applyExposeShortcut(m_exposeAction, QList<QKeySequence>() << (Qt::CTRL | Qt::Key_F9));
     m_shortcut = KGlobalAccel::self()->shortcut(m_exposeAction);
     connect(m_exposeAction, &QAction::triggered, this, [this]() {
         toggleMode(ModeCurrentDesktop);
@@ -55,8 +74,7 @@ WindowViewEffect::WindowViewEffect()
 
     m_exposeAllAction->setObjectName(QStringLiteral("ExposeAll"));
     m_exposeAllAction->setText(i18n("Toggle Present Windows (All desktops)"));
-    KGlobalAccel::self()->setDefaultShortcut(m_exposeAllAction, QList<QKeySequence>() << (Qt::CTRL | Qt::Key_F10) << Qt::Key_LaunchC);
-    KGlobalAccel::self()->setShortcut(m_exposeAllAction, QList<QKeySequence>() << (Qt::CTRL | Qt::Key_F10) << Qt::Key_LaunchC);
+    applyExposeShortcut(m_exposeAllAction, QList<QKeySequence>() << (Qt::CTRL | Qt::Key_F10) << Qt::Key_LaunchC);
     m_shortcutAll = KGlobalAccel::self()->shortcut(m_exposeAllAction);
     connect(m_exposeAllAction, &QAction::triggered, this, [this]() {
         toggleMode(ModeAllDesktops);
@@ -64,13 +82,7 @@ WindowViewEffect::WindowViewEffect()
 
     m_exposeClassAction->setObjectName(QStringLiteral("ExposeClass"));
     m_exposeClassAction->setText(i18n("Toggle Present Windows (Window class)"));
-    // Ctrl+F7 is owned by OverviewEffectV2's WindowClass mode on this fork
-    // (Vulkan grid + search-bar reimplementation of present-windows-by-class).
-    // Leave this action registered but unbound so the two effects don't fight
-    // over the global shortcut; users can still rebind it if they prefer the
-    // QML windowview variant.
-    KGlobalAccel::self()->setDefaultShortcut(m_exposeClassAction, QList<QKeySequence>());
-    KGlobalAccel::self()->setShortcut(m_exposeClassAction, QList<QKeySequence>(), KGlobalAccel::NoAutoloading);
+    applyExposeShortcut(m_exposeClassAction, QList<QKeySequence>() << (Qt::CTRL | Qt::Key_F7));
     m_shortcutClass = KGlobalAccel::self()->shortcut(m_exposeClassAction);
     connect(m_exposeClassAction, &QAction::triggered, this, [this]() {
         toggleMode(ModeWindowClass);

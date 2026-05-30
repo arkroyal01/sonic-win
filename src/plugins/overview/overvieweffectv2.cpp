@@ -212,10 +212,13 @@ bool OverviewEffectV2::supported()
     if (qEnvironmentVariable("KWIN_OVERVIEW_V2", QStringLiteral("1")).toInt() == 0) {
         return false;
     }
-    // Compositor check matches the existing plugin's predicate; V2 will
-    // later require Vulkan specifically once the renderer integration
-    // lands, but the skeleton works either way.
-    return effects && (effects->isOpenGLCompositing() || effects->isVulkanCompositing());
+    // Vulkan-only: the V2 renderer (atlas, dual-kawase, post-pass) is entirely
+    // Vulkan, and every render path bails on a non-Vulkan compositor. Loading
+    // under OpenGL would grab the global shortcuts (Meta+W/G, Ctrl+F7/F9/F10)
+    // and draw nothing, so we decline there — the QML OverviewEffect and the
+    // windowview effect keep those bindings on the GL path (see ../main.cpp
+    // and windowvieweffect.cpp).
+    return effects && effects->isVulkanCompositing();
 }
 
 OverviewEffectV2::OverviewEffectV2()
