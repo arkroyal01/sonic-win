@@ -174,6 +174,11 @@ void KWinCompositingKCM::defaults()
 
 void KWinCompositingKCM::save()
 {
+    // Read the on-disk backend before writing, to detect a change below.
+    const QString oldBackend = KConfig(QStringLiteral("kwinrc"), KConfig::NoGlobals)
+                                   .group(QStringLiteral("Compositing"))
+                                   .readEntry("Backend", QStringLiteral("Vulkan"));
+
     if (!isRunningPlasma()) {
         const auto animationDuration = s_animationMultipliers[m_form.animationDurationFactor->value()];
         m_settings->setAnimationDurationFactor(animationDuration);
@@ -185,11 +190,30 @@ void KWinCompositingKCM::save()
     // This clears up old entries that are now migrated to kdeglobals
     KConfig("kwinrc", KConfig::NoGlobals).group(QStringLiteral("KDE")).revertToDefault("AnimationDurationFactor");
 
-    // Send signal to all kwin instances
-    QDBusMessage message = QDBusMessage::createSignal(QStringLiteral("/Compositor"),
-                                                      QStringLiteral("org.kde.kwin.Compositing"),
-                                                      QStringLiteral("reinit"));
-    QDBusConnection::sessionBus().send(message);
+    const QString newBackend = KConfig(QStringLiteral("kwinrc"), KConfig::NoGlobals)
+                                   .group(QStringLiteral("Compositing"))
+                                   .readEntry("Backend", QStringLiteral("Vulkan"));
+
+    if (oldBackend != newBackend) {
+        // Switching the rendering backend (OpenGL <-> Vulkan) needs kwin to
+        // re-read its config and recreate the compositor with the new
+        // compositingMode. The bare "reinit" signal below restarts the
+        // compositor WITHOUT reparsing kwinrc, so it would not pick up the new
+        // backend. Go through the standard reconfigure instead: it reparses the
+        // config and runs Options::updateSettings(), whose configChanged signal
+        // drives X11Compositor::reinitialize() with the new backend.
+        QDBusMessage message = QDBusMessage::createMethodCall(QStringLiteral("org.kde.KWin"),
+                                                              QStringLiteral("/KWin"),
+                                                              QStringLiteral("org.kde.KWin"),
+                                                              QStringLiteral("reconfigure"));
+        QDBusConnection::sessionBus().asyncCall(message);
+    } else {
+        // Other compositing settings: restart the compositor as before.
+        QDBusMessage message = QDBusMessage::createSignal(QStringLiteral("/Compositor"),
+                                                          QStringLiteral("org.kde.kwin.Compositing"),
+                                                          QStringLiteral("reinit"));
+        QDBusConnection::sessionBus().send(message);
+    }
 }
 
 K_PLUGIN_FACTORY_WITH_JSON(KWinCompositingConfigFactory, "kwincompositing.json",

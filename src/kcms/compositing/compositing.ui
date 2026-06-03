@@ -56,6 +56,30 @@ you can reset this protection but be aware that this might result in an immediat
      </item>
     </layout>
    </item>
+   <item row="1" column="0">
+    <widget class="QLabel" name="label_Backend">
+     <property name="text">
+      <string>Rendering backend:</string>
+     </property>
+    </widget>
+   </item>
+   <item row="1" column="1">
+    <widget class="QComboBox" name="kcfg_Backend">
+     <property name="toolTip">
+      <string>The graphics API used to composite the screen. Vulkan is the default; OpenGL is the fallback. Changing this restarts compositing immediately.</string>
+     </property>
+     <item>
+      <property name="text">
+       <string>OpenGL</string>
+      </property>
+     </item>
+     <item>
+      <property name="text">
+       <string>Vulkan</string>
+      </property>
+     </item>
+    </widget>
+   </item>
    <item row="2" column="0">
     <widget class="QLabel" name="compositingLabel">
      <property name="text">

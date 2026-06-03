@@ -13,6 +13,14 @@
 
    <group name="Compositing">
 
+       <entry name="Backend" type="Enum">
+           <default>Vulkan</default>
+           <choices>
+               <choice name="OpenGL"/>
+               <choice name="Vulkan"/>
+           </choices>
+       </entry>
+
        <entry name="HiddenPreviews" type="Enum">
            <default>Shown</default>
            <choices>
