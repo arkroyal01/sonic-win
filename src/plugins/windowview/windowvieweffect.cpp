@@ -56,12 +56,16 @@ WindowViewEffect::WindowViewEffect()
         && effects && effects->isVulkanCompositing();
     auto applyExposeShortcut = [overviewV2OwnsExpose](QAction *action, const QList<QKeySequence> &keys) {
         KGlobalAccel::self()->setDefaultShortcut(action, keys);
-        if (overviewV2OwnsExpose) {
-            // Force-clear so V2 can claim the key without a conflict.
-            KGlobalAccel::self()->setShortcut(action, QList<QKeySequence>(), KGlobalAccel::NoAutoloading);
-        } else {
-            KGlobalAccel::self()->setShortcut(action, keys);
-        }
+        // Both branches force the value with NoAutoloading. A previous run on
+        // the other backend persists either an empty active shortcut (yield,
+        // under Vulkan) or the keys (claim, under GL); plain autoloading would
+        // honour whichever is on disk and ignore what we pass — so on GL it
+        // would keep the stale empty value from a prior Vulkan session and
+        // leave Ctrl+F7/F9/F10 unbound. Forcing makes the current backend
+        // authoritative either way.
+        KGlobalAccel::self()->setShortcut(action,
+                                          overviewV2OwnsExpose ? QList<QKeySequence>() : keys,
+                                          KGlobalAccel::NoAutoloading);
     };
 
     m_exposeAction->setObjectName(QStringLiteral("Expose"));
