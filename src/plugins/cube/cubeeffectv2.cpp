@@ -53,23 +53,24 @@ constexpr qreal kWheelRadiusFactor = 0.12;
 
 bool CubeEffectV2::supported()
 {
-    // Same env-var gate as Overview V2. The existing scripted
-    // CubeEffect needs a matching `supported()` predicate that
-    // refuses to load when this var is set; that wiring is in the
-    // cube package main.qml (see the Phase 1b TODO).
-    if (qEnvironmentVariableIntValue("KWIN_CUBE_V2") == 0) {
-        return false;
-    }
-    return effects && (effects->isOpenGLCompositing() || effects->isVulkanCompositing());
+    // Vulkan-only: the V2 renderer (atlas, Vulkan pipeline, post-pass —
+    // Phase 3+) bails on a non-Vulkan compositor, so loading under OpenGL
+    // would grab input and draw nothing. Off by default
+    // (EnabledByDefault=false in v2/metadata.json) and with a distinct name +
+    // shortcut (see the ctor), so it coexists with the scripted V1 cube
+    // without colliding; enable "Desktop Cube (V2)" in Desktop Effects to use
+    // it. No env-var gate — that made supported() answer differently in the
+    // KCM process (no env) than in kwin, hiding V2 from Desktop Effects while
+    // the hot-corner KCM (which keys off enabled-state) still showed it.
+    return effects && effects->isVulkanCompositing();
 }
 
 CubeEffectV2::CubeEffectV2()
 {
-    // One-shot startup log so silence != "is the env var set?".
-    // Same pattern Overview V2 uses ([[feedback_env_var_logging]]).
+    // One-shot startup log so it's obvious which cube is active.
     qCWarning(KWIN_CUBE_V2_LOG)
-        << "CubeEffectV2: enabled (KWIN_CUBE_V2=1). C++ rewrite of "
-           "the scripted cube effect — Phase 1 (lifecycle only).";
+        << "CubeEffectV2: loaded (Vulkan, opt-in via Desktop Effects). C++ "
+           "rewrite of the scripted cube effect — Phase 1 (lifecycle only).";
 
     m_animation.setDuration(m_animationDuration);
     m_animation.setEasingCurve(QEasingCurve::OutCubic);
@@ -94,15 +95,16 @@ CubeEffectV2::CubeEffectV2()
         }
     });
 
-    // Global toggle. Same `Cube` object name as the scripted effect's
-    // ShortcutHandler so the user's saved binding (default Meta+C)
-    // carries over. With supported() gating, the scripted CubeEffect
-    // is the one that won't load, so there's no double-registration.
+    // Global toggle. Distinct object name + default key from the scripted V1
+    // cube ("Cube" / Meta+C) so the two never collide while both are present
+    // during the staged rewrite — V1 keeps Meta+C, V2 takes Meta+Shift+C.
+    // (At final cutover, when V1 is removed, V2 can reclaim the "Cube" name
+    // and Meta+C so saved bindings carry over.)
     m_toggleAction = new QAction(this);
-    m_toggleAction->setObjectName(QStringLiteral("Cube"));
-    m_toggleAction->setText(i18nc("@action Cube is the name of a Kwin effect", "Toggle Cube"));
+    m_toggleAction->setObjectName(QStringLiteral("CubeV2"));
+    m_toggleAction->setText(i18nc("@action", "Toggle Desktop Cube (V2)"));
     m_toggleAction->setAutoRepeat(false);
-    const QKeySequence defaultShortcut = Qt::META | Qt::Key_C;
+    const QKeySequence defaultShortcut = Qt::META | Qt::SHIFT | Qt::Key_C;
     KGlobalAccel::self()->setDefaultShortcut(m_toggleAction, {defaultShortcut});
     KGlobalAccel::self()->setShortcut(m_toggleAction, {defaultShortcut});
     connect(m_toggleAction, &QAction::triggered, this, [this]() {

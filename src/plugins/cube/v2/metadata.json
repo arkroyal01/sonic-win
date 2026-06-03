@@ -1,10 +1,10 @@
 {
     "KPlugin": {
         "Category": "Window Management",
-        "Description": "C++ rewrite of the QML cube effect (volcanic). Opt in with KWIN_CUBE_V2=1.",
-        "EnabledByDefault": true,
+        "Description": "C++/Vulkan rewrite of the desktop cube effect (volcanic).",
+        "EnabledByDefault": false,
         "License": "GPL",
-        "Name": "Desktop Cube"
+        "Name": "Desktop Cube (V2)"
     },
     "X-KDE-ConfigModule": "kwin_cube_config",
     "X-KWin-Border-Activate": true
