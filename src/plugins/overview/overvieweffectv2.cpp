@@ -3777,11 +3777,38 @@ void OverviewEffectV2::activate(Mode mode)
     // Capture the target window class up-front, before the keyboard grab
     // below steals focus from the active window. WindowClass mode presents
     // every window sharing this resourceClass across all virtual desktops.
+    //
+    // Use the active window only when it's an eligible heap window; otherwise
+    // fall back to the topmost eligible window in stacking order. On the first
+    // trigger after a (re)start the active window is often null (nothing
+    // focused yet) or a non-heap window (the plasmashell desktop), which would
+    // capture an empty / unmatchable class and show an empty grid — the user
+    // then has to focus a real window and re-invoke. The fallback makes the
+    // first trigger pick a sensible target on its own.
     if (mode == Mode::WindowClass) {
-        EffectWindow *active = effects ? effects->activeWindow() : nullptr;
-        m_windowClassFilter = (active && active->window())
-            ? active->window()->resourceClass()
-            : QString();
+        auto eligible = [](Window *h) {
+            return h && h->isClient() && h->isNormalWindow() && !h->skipSwitcher()
+                && !h->isOnScreenDisplay() && !h->isNotification()
+                && !h->isCriticalNotification() && !h->isTooltip() && !h->isComboBox()
+                && !h->isDNDIcon() && !h->isPopupWindow() && h->readyForPainting()
+                && !h->resourceClass().isEmpty();
+        };
+        Window *ref = nullptr;
+        if (effects) {
+            EffectWindow *active = effects->activeWindow();
+            if (active && eligible(active->window())) {
+                ref = active->window();
+            } else {
+                const auto stack = effects->stackingOrder();
+                for (auto it = stack.crbegin(); it != stack.crend(); ++it) {
+                    if (*it && eligible((*it)->window())) {
+                        ref = (*it)->window();
+                        break;
+                    }
+                }
+            }
+        }
+        m_windowClassFilter = ref ? ref->resourceClass() : QString();
     }
 
     // Mode change while already showing: just flip m_mode and request
