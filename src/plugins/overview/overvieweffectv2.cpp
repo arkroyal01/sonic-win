@@ -45,6 +45,7 @@
 #include <QPainter>
 #include <QPalette>
 #include <QPixmap>
+#include <QTimer>
 
 namespace KWin
 {
@@ -326,17 +327,10 @@ OverviewEffectV2::OverviewEffectV2()
     m_exposeClassAction->setObjectName(QStringLiteral("OverviewWindowClass"));
     m_exposeClassAction->setText(i18nc("@action", "Toggle Present Windows (Current Application)"));
     m_exposeClassAction->setAutoRepeat(false);
-    const QKeySequence classShortcut = Qt::CTRL | Qt::Key_F7;
-    KGlobalAccel::self()->setDefaultShortcut(m_exposeClassAction, {classShortcut});
-    // NoAutoloading: force Ctrl+F7 onto this action regardless of the saved
-    // config. Effects load alphabetically, so this ("overviewv2") registers
-    // before windowview clears its ExposeClass binding — with plain
-    // autoloading KGlobalAccel sees ExposeClass still holding Ctrl+F7,
-    // assigns us an empty shortcut and *persists* the empty, so the binding
-    // silently dies on every start. Forcing it steals the key from the
-    // (about-to-be-cleared) ExposeClass and overwrites the poisoned entry.
-    KGlobalAccel::self()->setShortcut(m_exposeClassAction, {classShortcut},
-                                      KGlobalAccel::NoAutoloading);
+    KGlobalAccel::self()->setDefaultShortcut(m_exposeClassAction,
+                                             {QKeySequence(Qt::CTRL | Qt::Key_F7)});
+    // The active shortcut is forced later in a deferred callback (see below) to
+    // dodge the load-order conflict with windowview.
     connect(m_exposeClassAction, &QAction::triggered, this, [this]() {
         if (m_visible && m_mode == Mode::WindowClass) {
             deactivate();
@@ -348,17 +342,13 @@ OverviewEffectV2::OverviewEffectV2()
     // WindowsCurrentDesktop mode (default Ctrl+F9) — present all windows on
     // the current desktop in the same plain Expose grid as Ctrl+F7. Takes
     // over the stock windowview "Expose"/Ctrl+F9 binding (unbound in
-    // windowvieweffect.cpp). Same NoAutoloading rationale as the WindowClass
-    // action above: forced so the alphabetical-load conflict with windowview
-    // doesn't poison the binding with an empty shortcut.
+    // windowvieweffect.cpp). Active shortcut forced in the deferred block below.
     m_exposeCurrentDesktopAction = new QAction(this);
     m_exposeCurrentDesktopAction->setObjectName(QStringLiteral("OverviewExpose"));
     m_exposeCurrentDesktopAction->setText(i18nc("@action", "Toggle Present Windows (Current Desktop)"));
     m_exposeCurrentDesktopAction->setAutoRepeat(false);
-    const QKeySequence exposeShortcut = Qt::CTRL | Qt::Key_F9;
-    KGlobalAccel::self()->setDefaultShortcut(m_exposeCurrentDesktopAction, {exposeShortcut});
-    KGlobalAccel::self()->setShortcut(m_exposeCurrentDesktopAction, {exposeShortcut},
-                                      KGlobalAccel::NoAutoloading);
+    KGlobalAccel::self()->setDefaultShortcut(m_exposeCurrentDesktopAction,
+                                             {QKeySequence(Qt::CTRL | Qt::Key_F9)});
     connect(m_exposeCurrentDesktopAction, &QAction::triggered, this, [this]() {
         if (m_visible && m_mode == Mode::WindowsCurrentDesktop) {
             deactivate();
@@ -369,22 +359,45 @@ OverviewEffectV2::OverviewEffectV2()
 
     // WindowsAllDesktops mode (default Ctrl+F10) — present every window on
     // every desktop in the plain Expose grid. Takes over the stock windowview
-    // "ExposeAll"/Ctrl+F10 binding (unbound in windowvieweffect.cpp). Same
-    // NoAutoloading rationale as the other Expose actions.
+    // "ExposeAll"/Ctrl+F10 binding (unbound in windowvieweffect.cpp). Active
+    // shortcut forced in the deferred block below.
     m_exposeAllAction = new QAction(this);
     m_exposeAllAction->setObjectName(QStringLiteral("OverviewExposeAll"));
     m_exposeAllAction->setText(i18nc("@action", "Toggle Present Windows (All Desktops)"));
     m_exposeAllAction->setAutoRepeat(false);
-    const QKeySequence exposeAllShortcut = Qt::CTRL | Qt::Key_F10;
-    KGlobalAccel::self()->setDefaultShortcut(m_exposeAllAction, {exposeAllShortcut});
-    KGlobalAccel::self()->setShortcut(m_exposeAllAction, {exposeAllShortcut},
-                                      KGlobalAccel::NoAutoloading);
+    KGlobalAccel::self()->setDefaultShortcut(m_exposeAllAction,
+                                             {QKeySequence(Qt::CTRL | Qt::Key_F10)});
     connect(m_exposeAllAction, &QAction::triggered, this, [this]() {
         if (m_visible && m_mode == Mode::WindowsAllDesktops) {
             deactivate();
         } else {
             activate(Mode::WindowsAllDesktops);
         }
+    });
+
+    // Force the active Ctrl+F7/F9/F10 bindings on a queued (0 ms) callback,
+    // not inline. Effects are constructed synchronously during compositor
+    // start(), so this runs only after every effect ctor has finished — in
+    // particular after windowview has cleared its Expose/ExposeAll/ExposeClass
+    // bindings (it yields them to V2 under Vulkan). Inline, this would run
+    // while windowview still holds those keys (effects load alphabetically, so
+    // "overviewv2" precedes "windowview"); KGlobalAccel would see the conflict,
+    // assign an empty shortcut and *persist* it, leaving the key dead until a
+    // second restart. Deferring removes the load-order race — on a live backend
+    // switch (no "second restart" available) as well as on first boot.
+    // NoAutoloading forces the key over any stale/poisoned saved entry; the
+    // `this` context object cancels the callback if the effect is torn down
+    // before it fires.
+    QTimer::singleShot(0, this, [this]() {
+        KGlobalAccel::self()->setShortcut(m_exposeClassAction,
+                                          {QKeySequence(Qt::CTRL | Qt::Key_F7)},
+                                          KGlobalAccel::NoAutoloading);
+        KGlobalAccel::self()->setShortcut(m_exposeCurrentDesktopAction,
+                                          {QKeySequence(Qt::CTRL | Qt::Key_F9)},
+                                          KGlobalAccel::NoAutoloading);
+        KGlobalAccel::self()->setShortcut(m_exposeAllAction,
+                                          {QKeySequence(Qt::CTRL | Qt::Key_F10)},
+                                          KGlobalAccel::NoAutoloading);
     });
 
     // Touchpad + touchscreen gesture activation. V1 binds 4-finger
