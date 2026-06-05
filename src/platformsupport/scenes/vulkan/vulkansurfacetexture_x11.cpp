@@ -254,6 +254,15 @@ bool VulkanSurfaceTextureX11::createWithDmaBuf()
     attributes.height = reply->height;
     attributes.planeCount = reply->nfd;
 
+    // The fds returned in the reply are owned by us; take ownership immediately
+    // into RAII FileDescriptors so they are closed on every return path. (free()
+    // on the reply does not close them, so anything else leaks an fd per import.)
+    for (int i = 0; i < reply->nfd && i < 4; i++) {
+        attributes.fd[i] = FileDescriptor(fds[i]);
+        attributes.offset[i] = 0; // X11 DRI3 doesn't provide offsets
+        attributes.pitch[i] = reply->stride;
+    }
+
     // Determine DRM format from depth and bpp
     // X11 pixmaps are typically XRGB8888 or ARGB8888
     if (reply->depth == 24 && reply->bpp == 32) {
@@ -264,24 +273,6 @@ bool VulkanSurfaceTextureX11::createWithDmaBuf()
         qCWarning(KWIN_VULKAN) << "[DMA-BUF] Unsupported depth/bpp:" << reply->depth << "/" << reply->bpp;
         free(reply);
         return false;
-    }
-
-    // Set up plane attributes
-    for (int i = 0; i < reply->nfd && i < 4; i++) {
-        // Duplicate the fd since we don't own it
-        int fd = dup(fds[i]);
-        if (fd < 0) {
-            qCWarning(KWIN_VULKAN) << "[DMA-BUF] Failed to duplicate fd for plane" << i;
-            // Clean up already duplicated fds
-            for (int j = 0; j < i; j++) {
-                close(attributes.fd[j].get());
-            }
-            free(reply);
-            return false;
-        }
-        attributes.fd[i] = FileDescriptor(fd);
-        attributes.offset[i] = 0; // X11 DRI3 doesn't provide offsets
-        attributes.pitch[i] = reply->stride;
     }
 
     // Modifier is typically DRM_FORMAT_MOD_INVALID for X11 pixmaps
